@@ -111,7 +111,7 @@ def process_single_page(args):
             uri = link.get("uri") or link.get("page")
             all_elements.append(f'[LINK] "{uri}" bbox=({x0},{y0},{x1},{y1}) conf=100.0')
 
-        # 2. TABLEAUX (Multi-stratégies)
+        # 2. TABLEAUX (Multi-stratégies avec formatage Markdown)
         for strategy in ["lines", "lines_strict", "text"]:
             try:
                 tabs = page_data.find_tables(strategy=strategy)
@@ -120,10 +120,20 @@ def process_single_page(args):
                         b = tab.bbox
                         x0, y0, x1, y1 = int(b[0]*scale_x), int(b[1]*scale_y), int(b[2]*scale_x), int(b[3]*scale_y)
                         table_data = tab.extract()
-                        rows = [" | ".join([str(c).replace("\n", " ") if c else "" for c in r]) for r in table_data]
-                        content = " [ROW] ".join(rows)
-                        all_elements.append(f'[TABLE] "{content}" bbox=({x0},{y0},{x1},{y1}) conf=100.0')
-                    break # On s'arrête dès qu'une stratégie trouve des tables
+                        if not table_data: continue
+                        
+                        # Génération du Markdown
+                        md_rows = []
+                        for idx, row in enumerate(table_data):
+                            clean_row = [str(c).replace("\n", " ").strip() if c else "" for c in row]
+                            md_rows.append("| " + " | ".join(clean_row) + " |")
+                            # Ajouter la ligne de séparation après l'en-tête
+                            if idx == 0:
+                                md_rows.append("| " + " | ".join(["---"] * len(row)) + " |")
+                        
+                        markdown_table = "\n".join(md_rows)
+                        all_elements.append(f'[TABLE]\n{markdown_table}\nbbox=({x0},{y0},{x1},{y1}) conf=100.0')
+                    break 
             except: continue
 
         # 3. DESSINS VECTORIELS & GRAPHISMES

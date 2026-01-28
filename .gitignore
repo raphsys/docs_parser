@@ -1,0 +1,70 @@
+# Environments
+.docs-parser/
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.flakes/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Logs
+*.log
+server_debug.log
+server_final.log
+server.log
+
+# Project specific directories
+uploads/
+tests/
+ocr_results/
+converted_pages/
+ai_models/
+
+# Context files
+contexte*.md
+
+# Test files and samples
+test*
+test_florence_standalone.py
+test_sample.jpg
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Flutter / Dart specific (if not handled by flutter_ocr_app/.gitignore)
+flutter_ocr_app/build/
+flutter_ocr_app/.dart_tool/
+flutter_ocr_app/.flutter-plugins
+flutter_ocr_app/.flutter-plugins-dependencies
+flutter_ocr_app/.metadata
+flutter_ocr_app/pubspec.lock
+
+# OS
+.DS_Store
+Thumbs.db

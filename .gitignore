@@ -1,12 +1,13 @@
-# Environments
+# Environments & Virtual Envs
 .docs-parser/
+pyvenv.cfg
 .env
 .venv
 env/
 venv/
 ENV/
 
-# Python
+# Python cache & build
 __pycache__/
 *.py[cod]
 *$py.class
@@ -36,35 +37,39 @@ server_debug.log
 server_final.log
 server.log
 
-# Project specific directories
+# Project specific data & results
 uploads/
-tests/
 ocr_results/
 converted_pages/
 ai_models/
 
-# Context files
+# Documentation & Context (User requested to ignore all .md)
 contexte*.md
+elements*.md
+extraction*.md
 
-# Test files and samples
+# Test files, samples & reproduction scripts
+tests/
 test*
-test_florence_standalone.py
+reproduce_issue.py
 test_sample.jpg
 
-# IDEs
+# IDEs & Editor configs
 .idea/
 .vscode/
 *.swp
 *.swo
+*.iml
 
-# Flutter / Dart specific (if not handled by flutter_ocr_app/.gitignore)
+# Flutter / Dart specific
 flutter_ocr_app/build/
 flutter_ocr_app/.dart_tool/
 flutter_ocr_app/.flutter-plugins
 flutter_ocr_app/.flutter-plugins-dependencies
 flutter_ocr_app/.metadata
 flutter_ocr_app/pubspec.lock
+flutter_ocr_app/.idea/
 
-# OS
+# OS specific
 .DS_Store
 Thumbs.db

@@ -52,32 +52,44 @@ from concurrent.futures import ThreadPoolExecutor
 import re
 
 def draw_bboxes(pil_img, content, output_path):
-    """Dessine les bboxes sur l'image avec un parseur plus robuste (Regex)"""
+    """Dessine les bboxes avec un code couleur par type d'objet"""
     draw = ImageDraw.Draw(pil_img)
     lines = content.split('\n')
     drawn_count = 0
     
-    # Regex pour capturer (x0, y0, x1, y1) de manière flexible
+    # Couleurs par type
+    colors = {
+        '[TABLE]': 'green',
+        '[TEXT]': 'blue',
+        '[AI_TEXT]': 'red',
+        '[LINK]': 'cyan',
+        '[IMAGE]': 'orange',
+        '[GRAPHIC': 'orange', # Capture [GRAPHIC/DRAWING]
+    }
+    
     bbox_pattern = re.compile(r'bbox=\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)')
     
     for line in lines:
         match = bbox_pattern.search(line)
         if match:
             try:
-                x0, y0, x1, y1 = map(int, match.groups())
-                # S'assurer que les coordonnées sont dans le bon ordre pour PIL
-                left, top = min(x0, x1), min(y0, y1)
-                right, bottom = max(x0, x1), max(y0, y1)
+                # Déterminer la couleur selon le tag au début de la ligne
+                color = 'red' # Par défaut
+                for tag, col in colors.items():
+                    if tag in line:
+                        color = col
+                        break
                 
-                # Vérifier que la box a une surface
+                x0, y0, x1, y1 = map(int, match.groups())
+                left, top, right, bottom = min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+                
                 if right > left and bottom > top:
-                    draw.rectangle([left, top, right, bottom], outline="red", width=3)
+                    draw.rectangle([left, top, right, bottom], outline=color, width=3)
                     drawn_count += 1
-            except Exception as e:
-                print(f"Erreur dessin bbox sur ligne : {line} -> {e}")
+            except: continue
     
     pil_img.save(output_path)
-    print(f"Image sauvegardée : {output_path} ({drawn_count} bboxes dessinées)")
+    print(f"Visualisation : {drawn_count} objets marqués sur {output_path}")
 
 def process_single_page(args):
     """Extracteur Universel d'Objets : Texte, Tables, Dessins, Liens, Images, Formules"""

@@ -4,12 +4,12 @@ import os
 class DocumentReconstructor:
     """
     Reconstruit un document PDF à partir d'une structure JSON riche.
-    Gère la conversion Pixels (120 DPI) vers Points (72 DPI).
+    Gère la conversion Pixels (200 DPI) vers Points (72 DPI).
     """
     
     def __init__(self):
-        # Facteur de conversion : 72 / 120 = 0.6
-        self.pixel_to_point = 72.0 / 120.0
+        # Facteur de conversion : 72 / 200 = 0.36
+        self.pixel_to_point = 72.0 / 200.0
 
     def reconstruct(self, structure, output_path):
         doc = fitz.open()

@@ -1,235 +1,610 @@
 import os
 import shutil
-import torch
-import uvicorn
+import re
+import uuid
+import glob
 import subprocess
-import fitz  # PyMuPDF
+import uvicorn
+import fitz
+import cv2
+import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageDraw, ImageEnhance
-from transformers import AutoProcessor, AutoModelForCausalLM
-import re
+from PIL import Image, ImageDraw
+from rapidocr_onnxruntime import RapidOCR
 from structure_extractor import DocumentParser
 from reconstructor import DocumentReconstructor
-
-# --- Optimisation CPU Haute Performance ---
-# On utilise tous les coeurs disponibles
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 4)
-torch.set_num_threads(os.cpu_count() or 4)
+from remove_text_generic import inpaint_opencv
+from layout_optimizer import LayoutOptimizer
+from font_ai_matcher import FontAIMatcher
+from text_removal_strategy import TextRemovalStrategy
+from native_pdf_extractor import NativePDFExtractor
 
 # --- Configuration ---
-MODEL_PATH = './ai_models/florence2-base'
+MODEL_TEXT_PATH = './ai_models/gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf'
 UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'uploads', 'converted_pages', 'ocr_results'
-TARGET_DPI = 200  # Résolution de rendu pour une précision maximale
+TARGET_DPI = 150 
+FONT_AI_ENABLED = os.getenv("FONT_AI_ENABLED", "1") == "1"
+FONT_AI_SCORE_THRESHOLD = float(os.getenv("FONT_AI_SCORE_THRESHOLD", "0.45"))
+FONT_AI_AUDIT_DEFAULT = os.getenv("FONT_AI_AUDIT", "0") == "1"
+OFFICE_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".odt", ".odp"}
 
-app = FastAPI(title="IA Document WYSIWYG")
+app = FastAPI(title="IA Document OCR - Stable Precision")
 app.mount("/results", StaticFiles(directory=RESULTS_DIR), name="results")
 
 for d in [UPLOAD_DIR, CONV_DIR, RESULTS_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
-# Chargement du modèle avec Optimisation Int8
-try:
-    print(f">>> Chargement du modèle depuis {MODEL_PATH}...")
-    import transformers.modeling_utils
-    transformers.modeling_utils.PreTrainedModel._supports_sdpa = False
-    
-    processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    _model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, trust_remote_code=True, torch_dtype=torch.float32, attn_implementation="eager"
-    )
-    # ACCÉLÉRATION CPU : Divise le temps par 2
-    model = torch.quantization.quantize_dynamic(_model, {torch.nn.Linear}, dtype=torch.qint8).eval()
-    print(">>> [SUCCÈS] Modèle IA chargé et optimisé (Int8). <<<")
-except Exception as e:
-    print(f"Erreur chargement modèle: {e}")
-    model = None
+engine_ocr = RapidOCR()
+parser = DocumentParser()
+layout_optimizer = LayoutOptimizer()
+font_ai_matcher = FontAIMatcher() if FONT_AI_ENABLED else None
+text_removal_strategy = TextRemovalStrategy()
+native_pdf_extractor = NativePDFExtractor()
+_translator_instance = None
 
-def draw_bboxes(pil_img, content, output_path):
-    draw = ImageDraw.Draw(pil_img)
-    colors = {'[TABLE]': 'green', '[TEXT]': 'blue', '[AI_TEXT]': 'red', '[LINK]': 'cyan'}
-    bbox_pattern = re.compile(r'bbox=\((\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)')
-    for line in content.split('\n'):
-        match = bbox_pattern.search(line)
-        if match:
-            try:
-                color = 'red'
-                for tag, col in colors.items():
-                    if tag in line: color = col; break
-                x0, y0, x1, y1 = map(int, match.groups())
-                draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
-            except: continue
-    pil_img.save(output_path)
 
-def reconstruct_legacy_content(structure):
-    lines = []
-    dim, lay = structure.get("dimensions", {}), structure.get("layout", {})
-    m = lay.get("margins", {"top":0, "bottom":0, "left":0, "right":0})
-    lines.append(f'[PAGE_INFO] num={structure.get("page_number")} size={dim.get("width")}x{dim.get("height")} rot={lay.get("rotation")} margins={m}')
-    for link in structure.get("links", []):
-        b = [int(c) for c in link["bbox"]]; lines.append(f'[LINK] "{link.get("uri")}" bbox=({b[0]},{b[1]},{b[2]},{b[3]})')
-    for table in structure.get("tables", []):
-        b = [int(c) for c in table["bbox"]]; lines.append(f'[TABLE]\n{table.get("markdown")}\nbbox=({b[0]},{b[1]},{b[2]},{b[3]})')
-    for block in structure.get("blocks", []):
-        if block.get("in_table") or block["type"] != "text": continue
-        source = block.get("source", "native")
-        tag = "AI_TEXT" if source == "ai" else "TEXT"
-        role = block.get("role", "paragraph")
+def get_translator():
+    global _translator_instance
+    if _translator_instance is not None:
+        return _translator_instance
+    try:
+        from translator import DocumentTranslator
+    except Exception as e:
+        raise RuntimeError(f"Impossible de charger le module de traduction: {e}") from e
+    _translator_instance = DocumentTranslator(MODEL_TEXT_PATH)
+    return _translator_instance
+
+
+def _find_office_binary():
+    for cand in ("soffice", "libreoffice"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    return None
+
+
+def _convert_office_to_pdf(input_path):
+    office_bin = _find_office_binary()
+    if not office_bin:
+        raise RuntimeError("Conversion Office indisponible: binaire 'soffice/libreoffice' introuvable")
+
+    convert_dir = os.path.join(CONV_DIR, uuid.uuid4().hex)
+    os.makedirs(convert_dir, exist_ok=True)
+    profile_dir = os.path.join("/tmp", f"lo_profile_{uuid.uuid4().hex}")
+    os.makedirs(profile_dir, exist_ok=True)
+    cmd = [
+        office_bin,
+        "--headless",
+        f"-env:UserInstallation=file://{profile_dir}",
+        "--convert-to",
+        "pdf:writer_pdf_Export",
+        "--outdir",
+        convert_dir,
+        input_path,
+    ]
+    env = dict(os.environ)
+    env.setdefault("HOME", "/tmp")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    expected = os.path.join(convert_dir, f"{base}.pdf")
+    if os.path.exists(expected):
+        return expected
+    # LibreOffice peut normaliser légèrement le nom de sortie.
+    candidates = sorted(glob.glob(os.path.join(convert_dir, "*.pdf")))
+    if candidates:
+        return candidates[0]
+
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    details = stderr or stdout or "aucun détail"
+    if proc.returncode != 0:
+        raise RuntimeError(f"Echec conversion Office->PDF: aucun PDF généré ({details})")
+    raise RuntimeError(f"Echec conversion Office->PDF: aucun PDF généré ({details})")
+
+
+def _norm_text(s):
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _token_set(s):
+    s = _norm_text(s)
+    return {t for t in re.split(r"[^a-z0-9]+", s) if t}
+
+def _text_sim(a, b):
+    ta = _token_set(a)
+    tb = _token_set(b)
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / max(1, union)
+
+
+def _block_text(block):
+    parts = []
+    for line in block.get("lines", []):
+        for phrase in line.get("phrases", []):
+            t = (phrase.get("texte") or "").strip()
+            if t:
+                parts.append(t)
+    return _norm_text(" ".join(parts))
+
+
+def _bbox_overlap_ratio(b1, b2):
+    r1 = fitz.Rect(b1)
+    r2 = fitz.Rect(b2)
+    inter = (r1 & r2).get_area()
+    if inter <= 0:
+        return 0.0
+    return inter / max(1e-9, min(r1.get_area(), r2.get_area()))
+
+
+def _dedupe_final_blocks(native_blocks, ocr_blocks):
+    if not native_blocks or not ocr_blocks:
+        return native_blocks + ocr_blocks
+    native_texts = [_block_text(nb) for nb in native_blocks]
+    kept_ocr = []
+    for ob in ocr_blocks:
+        ob_text = _block_text(ob)
+        ob_bbox = ob.get("bbox", [0, 0, 0, 0])
+        drop = False
+        for i, nb in enumerate(native_blocks):
+            ov = _bbox_overlap_ratio(ob_bbox, nb.get("bbox", [0, 0, 0, 0]))
+            if ov < 0.35:
+                continue
+            nt = native_texts[i]
+            # Same area + identical/contained content => OCR duplicate of native.
+            if ob_text and nt and (ob_text == nt or ob_text in nt or nt in ob_text):
+                drop = True
+                break
+            if ob_text and nt and _text_sim(ob_text, nt) >= 0.72:
+                drop = True
+                break
+            if ov >= 0.70:
+                drop = True
+                break
+        if not drop:
+            kept_ocr.append(ob)
+    return native_blocks + kept_ocr
+
+
+def _infer_alignment(bbox, content_bbox, page_w):
+    x0, _, x1, _ = bbox
+    c0, _, c1, _ = content_bbox
+    content_w = max(1.0, c1 - c0)
+    block_w = max(1.0, x1 - x0)
+    left_gap = max(0.0, x0 - c0)
+    right_gap = max(0.0, c1 - x1)
+    near_tol = max(8.0, content_w * 0.03)
+    center_tol = max(10.0, content_w * 0.06)
+
+    if block_w >= content_w * 0.88 and left_gap <= near_tol and right_gap <= near_tol:
+        return "justify", left_gap
+    if abs(left_gap - right_gap) <= center_tol and block_w < content_w * 0.88:
+        return "center", left_gap
+    if right_gap <= near_tol and left_gap > near_tol:
+        return "right", left_gap
+    return "left", left_gap
+
+
+def _annotate_layout(blocks, img_w, img_h):
+    valid = []
+    for b in blocks:
+        bb = b.get("bbox", [0, 0, 0, 0])
+        if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+            continue
+        x0, y0, x1, y1 = [float(v) for v in bb]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        valid.append([x0, y0, x1, y1])
+
+    if valid:
+        content_bbox = [
+            int(min(v[0] for v in valid)),
+            int(min(v[1] for v in valid)),
+            int(max(v[2] for v in valid)),
+            int(max(v[3] for v in valid)),
+        ]
+    else:
+        content_bbox = [0, 0, int(img_w), int(img_h)]
+
+    margins = {
+        "left": int(max(0, content_bbox[0])),
+        "right": int(max(0, img_w - content_bbox[2])),
+        "top": int(max(0, content_bbox[1])),
+        "bottom": int(max(0, img_h - content_bbox[3])),
+    }
+    top_band_h = max(24, int(img_h * 0.10))
+    bottom_band_h = max(24, int(img_h * 0.10))
+    header_band = [0, min(int(img_h), top_band_h)]
+    footer_band = [max(0, int(img_h) - bottom_band_h), int(img_h)]
+
+    for block in blocks:
+        bb = block.get("bbox", [0, 0, 0, 0])
+        if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+            continue
+        x0, y0, x1, y1 = [float(v) for v in bb]
+        cy = (y0 + y1) / 2.0
+        bw = max(1.0, x1 - x0)
+        text = _block_text(block)
+        is_short = len(text) <= 140
+
+        role = "body"
+        text_l = (text or "").lower()
+        has_section_pattern = bool(re.match(r"^\s*(\d+(\.\d+)+)\b", text_l))
+        is_figure_caption = bool(re.match(r"^\s*(figure|fig\.?)\s*\d+", text_l))
+        is_short_title = is_short and (len(text.split()) <= 12)
+        if y1 <= header_band[1] and is_short:
+            role = "header"
+        elif y0 >= footer_band[0] and is_short:
+            role = "footer"
+        elif y1 <= header_band[1] and bw < (content_bbox[2] - content_bbox[0]) * 0.8:
+            role = "header"
+        elif y0 >= footer_band[0] and bw < (content_bbox[2] - content_bbox[0]) * 0.8:
+            role = "footer"
+        elif cy <= header_band[1] and is_short:
+            role = "header"
+        elif cy >= footer_band[0] and is_short:
+            role = "footer"
+        elif is_figure_caption:
+            role = "figure_caption"
+        elif has_section_pattern:
+            role = "section_heading"
+        elif is_short_title and bw < (content_bbox[2] - content_bbox[0]) * 0.8:
+            role = "title"
+
+        align, indent_px = _infer_alignment([x0, y0, x1, y1], content_bbox, img_w)
+        block["role"] = role
+        block["alignment"] = align
+        block["indent_px"] = float(max(0.0, indent_px))
+
         for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            txt = "".join([s["text"] for s in spans]).strip()
-            if not txt: continue
-            lb = [int(c) for c in line["bbox"]]
-            st = spans[0].get("style", {})
-            style_str = f" role={role} lang={line.get('alignment')} style={{font:{st.get('font')}, size:{st.get('size',0):.1f}, color:{st.get('color')}}}"
-            lines.append(f'[{tag}] "{txt}" bbox=({lb[0]},{lb[1]},{lb[2]},{lb[3]}){style_str}')
-    return "\n".join(lines)
+            lb = line.get("bbox", bb)
+            if isinstance(lb, (list, tuple)) and len(lb) == 4:
+                l_align, l_indent = _infer_alignment([float(v) for v in lb], content_bbox, img_w)
+            else:
+                l_align, l_indent = align, indent_px
+            line["alignment"] = l_align
+            line["indent_px"] = float(max(0.0, l_indent))
+            line["role"] = role
+            for phrase in line.get("phrases", []):
+                pb = phrase.get("bbox", lb)
+                if isinstance(pb, (list, tuple)) and len(pb) == 4:
+                    p_align, p_indent = _infer_alignment([float(v) for v in pb], content_bbox, img_w)
+                else:
+                    p_align, p_indent = l_align, l_indent
+                phrase["alignment"] = p_align
+                phrase["indent_px"] = float(max(0.0, p_indent))
+                phrase["role"] = role
 
-def run_pro_ocr(pil_image):
-    if not model: return []
-    
-    # 0. Amélioration de l'image (Précision Stabilisée)
-    pil_image = ImageEnhance.Sharpness(pil_image).enhance(1.5)
-    pil_image = ImageEnhance.Contrast(pil_image).enhance(1.1)
-    
-    w_orig, h_orig = pil_image.size
-    image_batch, offsets, scales = [], [], []
-    
-    # 1. Global (2048px : Ultra-Précision)
-    max_dim_g = 2048
-    s_g = max_dim_g / max(w_orig, h_orig) if max(w_orig, h_orig) > max_dim_g else 1.0
-    img_g = pil_image.resize((int(w_orig*s_g), int(h_orig*s_g)), Image.Resampling.BILINEAR) if s_g < 1.0 else pil_image
-    image_batch.append(img_g); offsets.append((0, 0)); scales.append(s_g)
-    
-    # 2. Tuiles 2x2 (1024px avec recouvrement)
-    if max(w_orig, h_orig) > 1200:
-        max_dim_t = 1024
-        hw, hh, ov = w_orig // 2, h_orig // 2, 100
-        coords = [(0,0,hw+ov,hh+ov), (hw-ov,0,w_orig,hh+ov), (0,hh-ov,hw+ov,h_orig), (hw-ov,hh-ov,w_orig,h_orig)]
-        for x1, y1, x2, y2 in coords:
-            tile = pil_image.crop((x1, y1, x2, y2))
-            s_t = max_dim_t / max(tile.size) if max(tile.size) > max_dim_t else 1.0
-            if s_t < 1.0: tile = tile.resize((int(tile.width*s_t), int(tile.height*s_t)), Image.Resampling.BILINEAR)
-            image_batch.append(tile); offsets.append((x1, y1)); scales.append(s_t)
+    return {
+        "margins": margins,
+        "content_bbox": content_bbox,
+        "header_band": header_band,
+        "footer_band": footer_band,
+    }
 
-    results = []
+
+def apply_ai_font_matching(ocr_blocks, pil_img, enable_audit=False):
+    summary = {
+        "enabled": bool(font_ai_matcher),
+        "ready": bool(font_ai_matcher and font_ai_matcher.is_ready()),
+        "threshold": FONT_AI_SCORE_THRESHOLD,
+        "total_spans": 0,
+        "attempted": 0,
+        "matched": 0,
+        "promoted": 0,
+        "reasons": {},
+    }
+
+    def add_reason(reason):
+        summary["reasons"][reason] = summary["reasons"].get(reason, 0) + 1
+
+    if not font_ai_matcher:
+        add_reason("font_ai_disabled")
+        return summary
+    if not font_ai_matcher.is_ready():
+        add_reason("matcher_not_ready")
+        return summary
+
+    img_w, img_h = pil_img.size
+    for block in ocr_blocks:
+        for line in block.get("lines", []):
+            for phrase in line.get("phrases", []):
+                for span in phrase.get("spans", []):
+                    summary["total_spans"] += 1
+                    txt = (span.get("texte") or "").strip()
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    style = span.setdefault("style", {})
+                    audit = None
+                    if enable_audit:
+                        audit = {
+                            "font_original": style.get("font"),
+                            "font_ai": None,
+                            "score": None,
+                            "selected_font": style.get("font"),
+                            "applied": False,
+                            "reason": "unknown",
+                        }
+                    if len(txt) < 2:
+                        add_reason("text_too_short")
+                        if audit is not None:
+                            audit["reason"] = "text_too_short"
+                            style["font_ai_audit"] = audit
+                        continue
+
+                    x0, y0, x1, y1 = [int(v) for v in bbox]
+                    x0, y0 = max(0, x0), max(0, y0)
+                    x1, y1 = min(img_w, x1), min(img_h, y1)
+                    if x1 <= x0 or y1 <= y0:
+                        add_reason("invalid_bbox")
+                        if audit is not None:
+                            audit["reason"] = "invalid_bbox"
+                            style["font_ai_audit"] = audit
+                        continue
+                    if (x1 - x0) < 12 or (y1 - y0) < 10:
+                        add_reason("bbox_too_small")
+                        if audit is not None:
+                            audit["reason"] = "bbox_too_small"
+                            style["font_ai_audit"] = audit
+                        continue
+
+                    crop = pil_img.crop((x0, y0, x1, y1))
+                    summary["attempted"] += 1
+                    match = font_ai_matcher.match_crop(crop)
+                    if not match:
+                        add_reason("no_match")
+                        if audit is not None:
+                            audit["reason"] = "no_match"
+                            style["font_ai_audit"] = audit
+                        continue
+
+                    summary["matched"] += 1
+                    style["font_ai"] = match.font_name
+                    style["font_ai_score"] = round(match.score, 4)
+                    style["font_ai_path"] = match.font_path
+
+                    # Promote AI-predicted font if confidence is acceptable.
+                    if match.score >= FONT_AI_SCORE_THRESHOLD:
+                        style["font"] = match.font_name
+                        summary["promoted"] += 1
+                        add_reason("threshold_passed")
+                        flags = style.setdefault("flags", {})
+                        for k, v in match.flags.items():
+                            if k not in flags:
+                                flags[k] = v
+                        if audit is not None:
+                            audit["font_ai"] = match.font_name
+                            audit["score"] = round(match.score, 4)
+                            audit["selected_font"] = style.get("font")
+                            audit["applied"] = True
+                            audit["reason"] = "threshold_passed"
+                            style["font_ai_audit"] = audit
+                    else:
+                        add_reason("threshold_not_met")
+                        if audit is not None:
+                            audit["font_ai"] = match.font_name
+                            audit["score"] = round(match.score, 4)
+                            audit["selected_font"] = style.get("font")
+                            audit["applied"] = False
+                            audit["reason"] = "threshold_not_met"
+                            style["font_ai_audit"] = audit
+
+    return summary
+
+def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default"):
+    sx = img.width / pdf_page.rect.width if pdf_page else 1.0
+    sy = img.height / pdf_page.rect.height if pdf_page else 1.0
+    
+    # 1. Extraction du Texte Natif
+    native_blocks = []
+    non_text_zones = []
+    native_images = []
+    native_drawings = []
+    if pdf_page and not force_ai:
+        native = native_pdf_extractor.extract_page(pdf_page, sx=sx, sy=sy)
+        native_blocks = native.get("blocks", [])
+        non_text_zones = native.get("non_text_zones", [])
+        native_images = native.get("images", [])
+        native_drawings = native.get("drawings", [])
+
+    # 2. OCR pour le reste
+    result, _ = engine_ocr(np.array(img))
+    raw_ocr = []
+    if result:
+        for res in result:
+            b, txt, s = res
+            bbox = [int(min([p[0] for p in b])), int(min([p[1] for p in b])), int(max([p[0] for p in b])), int(max([p[1] for p in b]))]
+            # Filtre : ne pas ajouter si déjà couvert par du texte natif
+            r_fitz = fitz.Rect(bbox)
+            r_area = r_fitz.get_area()
+            if r_area <= 0:
+                continue
+            if not any((r_fitz & fitz.Rect(nb["bbox"])).get_area() / r_area > 0.5 for nb in native_blocks):
+                raw_ocr.append({"label": txt, "bbox": bbox, "score": float(s)})
+    
+    ocr_structure = parser.parse(raw_ocr, img) if raw_ocr else []
+    font_ai_summary = {
+        "enabled": bool(font_ai_matcher),
+        "ready": bool(font_ai_matcher and font_ai_matcher.is_ready()),
+        "threshold": FONT_AI_SCORE_THRESHOLD,
+        "total_spans": 0,
+        "attempted": 0,
+        "matched": 0,
+        "promoted": 0,
+        "reasons": {},
+    }
+    if ocr_structure:
+        font_ai_summary = apply_ai_font_matching(ocr_structure, img, enable_audit=font_ai_audit)
+    final_blocks = _dedupe_final_blocks(native_blocks, ocr_structure)
+
+    layout_meta = _annotate_layout(final_blocks, img.width, img.height)
+
+    # 3. GÉNERATION DU FOND MAÎTRE NETTOYÉ (Workflow Inpainting IA)
+    bg_master_path = ""
+    mask_master_path = ""
+    text_removal_debug = {}
     try:
-        task = '<OCR_WITH_REGION>'
-        inputs = processor(text=[task]*len(image_batch), images=image_batch, return_tensors="pt", padding=True)
-        with torch.inference_mode():
-            ids = model.generate(**inputs, max_new_tokens=1024, num_beams=1, do_sample=False, use_cache=False)
-        texts = processor.batch_decode(ids, skip_special_tokens=False)
-        
-        for idx, gen_text in enumerate(texts):
-            parsed = processor.post_process_generation(gen_text, task=task, image_size=image_batch[idx].size)
-            raw = parsed.get(task, {})
-            off_x, off_y = offsets[idx]
-            s = scales[idx]
-            boxes = raw.get('quad_boxes') or raw.get('bboxes')
-            labels = raw.get('labels')
-            if boxes and labels:
-                for box, label in zip(boxes, labels):
-                    txt = label.replace("</s>","").replace("<s>","").strip()
-                    if not txt: continue
-                    b = [int(min(box[0::2])), int(min(box[1::2])), int(max(box[0::2])), int(max(box[1::2]))] if len(box)==8 else [int(c) for c in box]
-                    real_bbox = [int(b[0]/s)+off_x, int(b[1]/s)+off_y, int(b[2]/s)+off_x, int(b[3]/s)+off_y]
-                    results.append({"label": txt, "bbox": real_bbox})
-    except Exception as e: print(f"Erreur IA : {e}")
-    
-    # NMS Avancé : Supprime les doublons et les sous-chaînes parasites (ex: 'ems' vs 'systems')
-    final = []
-    # On trie par longueur décroissante pour garder les mots complets
-    results.sort(key=lambda x: len(x['label']), reverse=True)
-    for cand in results:
-        is_dup = False
-        cb = cand['bbox']
-        c_area = float((cb[2]-cb[0])*(cb[3]-cb[1]))
-        if c_area <= 0: continue
-        for ex in final:
-            eb = ex['bbox']
-            inter = max(0, min(eb[2],cb[2])-max(eb[0],cb[0])) * max(0, min(eb[3],cb[3])-max(eb[1],cb[1]))
-            # Si recouvrement majeur (>60%)
-            if inter / c_area > 0.6:
-                # Si c'est une sous-chaîne d'un texte déjà retenu (plus long)
-                if cand['label'].lower() in ex['label'].lower():
-                    is_dup = True; break
-        if not is_dup: final.append(cand)
-    return final
+        text_regions = []
+        for b in final_blocks:
+            bb = b.get("bbox", [0, 0, 0, 0])
+            if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                text_regions.append([int(v) for v in bb])
+        clean_bgr, mask, text_removal_debug = text_removal_strategy.remove(img, text_regions, mode=text_removal_mode)
+        bg_name = f"bg_master_{filename}_{idx}.png"
+        bg_master_path = os.path.join(RESULTS_DIR, bg_name)
+        cv2.imwrite(bg_master_path, clean_bgr)
+        mask_name = f"mask_master_{filename}_{idx}.png"
+        mask_master_path = os.path.join(RESULTS_DIR, mask_name)
+        cv2.imwrite(mask_master_path, mask)
+    except Exception as e:
+        print(f"Erreur génération fond maître chirurgical : {e}")
 
-def process_single_page(args):
-    i, page_data, force_ai, filename = args
-    parser = DocumentParser()
-    try:
-        print(f"--- Page {i+1} ---")
-        pix = page_data.get_pixmap(dpi=TARGET_DPI)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        sx, sy = pix.width / page_data.rect.width, pix.height / page_data.rect.height
-        structure = parser.parse_page(page_data, i, scale_x=sx, scale_y=sy)
-        
-        # On lance l'IA si forcé ou si peu de texte natif
-        native_len = sum(len(s["text"]) for b in structure["blocks"] if b["type"]=="text" for l in b["lines"] for s in l["spans"])
-        if force_ai or native_len < 600:
-            print(f"  > Inférence IA...")
-            ai_data = run_pro_ocr(img)
-            from structure_extractor import VisualAttributeExtractor
-            ve = VisualAttributeExtractor(); blocks = []
-            for item in ai_data:
-                ai_rect = fitz.Rect(item["bbox"])
-                if ai_rect.get_area() <= 0: continue
-                # Fusion : on n'ajoute que si pas de recouvrement majeur avec du texte natif
-                if not any((ai_rect & r).get_area() / ai_rect.get_area() > 0.5 for r in [fitz.Rect(b["bbox"]) for b in structure["blocks"] if b["type"] == "text"]):
-                    style = ve.analyze(img, item["bbox"])
-                    structure["blocks"].append({"type": "text", "bbox": item["bbox"], "source": "ai", "role": "paragraph",
-                                   "lines": [{"bbox": item["bbox"], "lang": "unknown", "alignment": "left", "spans": [{"text": item["label"], "style": style, "bbox": item["bbox"]}]}]})
-        
-        content = reconstruct_legacy_content(structure)
-        vis_path = os.path.join(RESULTS_DIR, f"vis_{filename}_p{i+1}.jpg")
-        draw_bboxes(img.copy(), content, vis_path)
-        return {"page": i+1, "content": content, "structure": structure, "visual_url": f"/results/vis_{filename}_p{i+1}.jpg", "status": "success"}
-    except Exception as e: 
-        print(f"Erreur Page {i+1}: {e}")
-        return {"page": i+1, "content": f"Erreur: {e}", "status": "error"}
+    # 4. VISUALISATION (Bboxes colorées pour l aperçu)
+    vis_fn = f"vis_{filename}_{idx}.jpg"
+    img_draw = img.copy()
+    draw = ImageDraw.Draw(img_draw)
+    
+    for block in final_blocks:
+        draw.rectangle(block["bbox"], outline="blue", width=3)
+        for line in block["lines"]:
+             draw.rectangle(line["bbox"], outline="green", width=1)
+             for p in line["phrases"]: 
+                draw.rectangle(p["bbox"], outline="red", width=1)
+    img_draw.save(os.path.join(RESULTS_DIR, vis_fn))
+
+    # 5. CONSTRUCTION DU CONTENU DÉTAILLÉ (Pour l affichage Flutter)
+    display_text = f"DOC: {img.width}x{img.height} | DPI: {TARGET_DPI}\n"
+    display_text += f"FONTS: {len(native_blocks)} blocs natifs | OCR: {len(ocr_structure)} blocs IA\n"
+    
+    for block in final_blocks:
+        source_tag = "NATIVE" if block.get("source") == "native" else "OCR"
+        display_text += f"\n[{source_tag} BLOC {block.get('id')} - bbox={block['bbox']}]\n"
+        for line in block["lines"]:
+            for p in line["phrases"]:
+                for span in p.get("spans", []):
+                    s, b = span.get("style", {}), span.get("bbox", [0, 0, 0, 0])
+                    font_name = s.get("font", "Unknown")
+                    font_size = float(s.get("size", 12.0))
+                    color = s.get("color", "#000000")
+                    # On affiche le nom de la font et la couleur
+                    display_text += f"  - [{font_name} {font_size:.1f}pt {color}] {span.get('texte', '')}\n"
+                    if font_ai_audit and "font_ai_audit" in s:
+                        audit = s["font_ai_audit"]
+                        display_text += (
+                            "    font_ai_audit: "
+                            f"candidate={audit.get('font_ai')} score={audit.get('score')} "
+                            f"selected={audit.get('selected_font')} reason={audit.get('reason')}\n"
+                        )
+
+    return {
+        "page": idx + 1, 
+        "content": display_text,
+        "structure": {
+            "blocks": final_blocks, 
+            "background_path": bg_master_path,
+            "mask_master_path": mask_master_path,
+            "text_removal_debug": text_removal_debug,
+            "non_text_zones": non_text_zones,
+            "images": native_images,
+            "drawings": native_drawings,
+            "layout": layout_meta,
+            "font_ai_summary": font_ai_summary,
+            "layout_version": "v3_layout_roles_alignment_margins",
+            "dimensions": {"width": img.width, "height": img.height}
+        },
+        "visual_url": f"/results/{vis_fn}"
+    }
+
+def json_serializable(obj):
+    if isinstance(obj, (np.integer, np.int64, np.int32)): return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)): return float(obj)
+    if isinstance(obj, (np.bool_, bool)): return bool(obj)
+    if isinstance(obj, np.ndarray): return obj.tolist()
+    if isinstance(obj, dict): return {str(k): json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [json_serializable(i) for i in obj]
+    return obj
 
 @app.post("/ocr")
-async def perform_ocr(file: UploadFile = File(...), force_ai: bool = False):
-    save_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(save_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    ext = os.path.splitext(file.filename)[1].lower()
-    print(f"\n[REQUEST] {file.filename} | Force AI: {force_ai}")
+async def perform_ocr(file: UploadFile = File(...), force_ai: bool = False, font_ai_audit: bool = FONT_AI_AUDIT_DEFAULT, text_removal_mode: str = "default"):
     try:
-        if ext in ['.docx', '.doc', '.pptx', '.ppt']:
-            subprocess.run(['libreoffice', '--headless', '--convert-to', 'pdf', '--outdir', CONV_DIR, save_path], check=True)
-            save_path = os.path.join(CONV_DIR, os.path.splitext(file.filename)[0] + ".pdf"); ext = '.pdf'
-        if ext == '.pdf':
+        base_name = os.path.basename(file.filename or "upload.bin")
+        safe_name = f"{uuid.uuid4().hex}_{base_name}"
+        save_path = os.path.join(UPLOAD_DIR, safe_name)
+        with open(save_path, "wb") as b: shutil.copyfileobj(file.file, b)
+        pages_results = []
+        ext = os.path.splitext(base_name.lower())[1]
+        if ext in OFFICE_EXTENSIONS:
+            converted_pdf = _convert_office_to_pdf(save_path)
+            doc = fitz.open(converted_pdf)
+            for i in range(len(doc)):
+                pix = doc[i].get_pixmap(dpi=TARGET_DPI)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                pages_results.append(
+                    process_page(
+                        img,
+                        i,
+                        base_name,
+                        pdf_page=doc[i],
+                        force_ai=force_ai,
+                        font_ai_audit=font_ai_audit,
+                        text_removal_mode=text_removal_mode,
+                    )
+                )
+            doc.close()
+        elif ext == '.pdf':
             doc = fitz.open(save_path)
-            # SÉQUENTIEL pour éviter Timeout
-            results = [process_single_page((i, doc[i], force_ai, file.filename)) for i in range(len(doc))]
-            return JSONResponse(content={"results": results, "status": "success"})
+            for i in range(len(doc)):
+                pix = doc[i].get_pixmap(dpi=TARGET_DPI)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                # On passe l'objet page PDF original pour l'extraction multimédia
+                pages_results.append(
+                    process_page(
+                        img,
+                        i,
+                        base_name,
+                        pdf_page=doc[i],
+                        force_ai=force_ai,
+                        font_ai_audit=font_ai_audit,
+                        text_removal_mode=text_removal_mode,
+                    )
+                )
+            doc.close()
         else:
             img = Image.open(save_path).convert("RGB")
-            ai_data = run_pro_ocr(img)
-            from structure_extractor import VisualAttributeExtractor
-            ve = VisualAttributeExtractor(); blocks = []
-            for item in ai_data:
-                style = ve.analyze(img, item["bbox"])
-                blocks.append({"type": "text", "bbox": item["bbox"], "source": "ai", "role": "paragraph",
-                               "lines": [{"bbox": item["bbox"], "lang": "unknown", "alignment": "left", "spans": [{"text": item["label"], "style": style, "bbox": item["bbox"]}]}]})
-            structure = {"page_number": 1, "dimensions": {"width": img.width, "height": img.height}, "layout": {"rotation": 0, "margins": {"top":0,"bottom":0,"left":0,"right":0}}, "source": "image_ai", "blocks": blocks}
-            content = reconstruct_legacy_content(structure)
-            vis_fn = f"vis_{file.filename}.jpg"
-            vis_path = os.path.join(RESULTS_DIR, vis_fn)
-            draw_bboxes(img.copy(), content, vis_path)
-            return JSONResponse(content={"results": [{"page": 1, "content": content, "structure": structure, "visual_url": f"/results/{vis_fn}"}], "status": "success"})
-    except Exception as e: return JSONResponse(content={"error": str(e)}, status_code=500)
+            pages_results.append(process_page(img, 0, base_name, force_ai=force_ai, font_ai_audit=font_ai_audit, text_removal_mode=text_removal_mode))
+        
+        # Nettoyage récursif des types numpy avant envoi
+        cleaned_results = json_serializable(pages_results)
+        return JSONResponse(content={"status": "success", "results": cleaned_results})
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/reconstruct")
-async def reconstruct_document(data: dict):
+async def reconstruct_document(data: dict, target_lang: str = None):
     try:
-        recon = DocumentReconstructor(); output_path = os.path.join(RESULTS_DIR, "reconstructed_output.pdf")
-        recon.reconstruct(data, output_path)
-        return JSONResponse(content={"status": "success", "pdf_url": f"/results/reconstructed_output.pdf"})
-    except Exception as e: return JSONResponse(content={"error": str(e)}, status_code=500)
+        pages = data.get("pages", [])
+        if target_lang:
+            print(f"  [Pipeline] Traduction vers {target_lang} activée...")
+            translator = get_translator()
+            for idx, page in enumerate(pages):
+                # 1. Traduction par bloc
+                page = translator.translate_page(page, target_lang=target_lang)
+                # 2. Réajustement géométrique des blocs pour limiter les collisions
+                page = layout_optimizer.adjust_layout(page)
+                pages[idx] = page
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        recon = DocumentReconstructor()
+        output_path = os.path.join(RESULTS_DIR, "reconstructed_output.pdf")
+        recon.reconstruct({"pages": pages}, output_path)
+        return JSONResponse(content={"status": "success", "pdf_url": f"/results/reconstructed_output.pdf"})
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8001)

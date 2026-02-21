@@ -1,75 +1,81 @@
-# Environments & Virtual Envs
-.docs-parser/
-pyvenv.cfg
-.env
-.venv
-env/
-venv/
-ENV/
+# OS files
+.DS_Store
+Thumbs.db
 
-# Python cache & build
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.flakes/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Logs
-*.log
-server_debug.log
-server_final.log
-server.log
-
-# Project specific data & results
-uploads/
-ocr_results/
-converted_pages/
-ai_models/
-
-# Documentation & Context
-*.md
-attributs_extraction_wysiwyg.md
-contexte*.md
-
-# Test files, samples & reproduction scripts
-tests/
-test*
-reproduce_issue.py
-test_sample.jpg
-
-# IDEs & Editor configs
+# Editors and IDEs
 .idea/
 .vscode/
 *.swp
 *.swo
 *.iml
 
-# Flutter / Dart specific
-flutter_ocr_app/build/
+# Python environments and local config
+.docs-parser/
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+pyvenv.cfg
+.python-version
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+downloads/
+eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Logs and runtime temp files
+*.log
+logs/
+*.tmp
+tmp/
+
+# OCR / document processing generated outputs
+uploads/
+ocr_results/
+converted_pages/
+
+# ML data, models and experiment outputs
+datasets/
+models/
+ai_models/
+checkpoints/
+runs/
+wandb/
+
+# Large model/binary files
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.bin
+*.h5
+*.tflite
+*.npz
+
+# Flutter / Android generated files
 flutter_ocr_app/.dart_tool/
+flutter_ocr_app/build/
 flutter_ocr_app/.flutter-plugins
 flutter_ocr_app/.flutter-plugins-dependencies
-flutter_ocr_app/.metadata
-flutter_ocr_app/pubspec.lock
 flutter_ocr_app/.idea/
-
-# OS specific
-.DS_Store
-Thumbs.db
+flutter_ocr_app/android/.gradle/
+flutter_ocr_app/android/app/build/

@@ -51,6 +51,9 @@ tmp/
 uploads/
 ocr_results/
 converted_pages/
+tests/output/
+*.bak_xml
+*.crdownload
 
 # ML data, models and experiment outputs
 datasets/

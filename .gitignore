@@ -52,16 +52,17 @@ uploads/
 ocr_results/
 converted_pages/
 tests/output/
+*.bak
 *.bak_xml
 *.crdownload
 
-# ML data, models and experiment outputs
-datasets/
-models/
-ai_models/
+# Local model / data caches and experiment outputs
 checkpoints/
 runs/
 wandb/
+models/
+ai_models/translation/
+datasets/terminology_sources/
 
 # Large model/binary files
 *.pt
@@ -73,12 +74,3 @@ wandb/
 *.h5
 *.tflite
 *.npz
-
-# Flutter / Android generated files
-flutter_ocr_app/.dart_tool/
-flutter_ocr_app/build/
-flutter_ocr_app/.flutter-plugins
-flutter_ocr_app/.flutter-plugins-dependencies
-flutter_ocr_app/.idea/
-flutter_ocr_app/android/.gradle/
-flutter_ocr_app/android/app/build/

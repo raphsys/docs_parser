@@ -5,6 +5,7 @@ import uuid
 import glob
 import subprocess
 import json
+import copy
 import xml.etree.ElementTree as ET
 import uvicorn
 import fitz
@@ -15,24 +16,22 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from rapidocr_onnxruntime import RapidOCR
-from structure_extractor import DocumentParser
+from structure_extractor import DocumentParser, LayoutV2Builder
 from reconstructor import DocumentReconstructor
 from remove_text_generic import inpaint_opencv
 from layout_optimizer import LayoutOptimizer
-from font_ai_matcher import FontAIMatcher
 from text_removal_strategy import TextRemovalStrategy
 from native_pdf_extractor import NativePDFExtractor
 from style_profiler import build_page_style_profile
 from visual_compare import compare_reconstruction
 from html_exporter import HtmlStyleExporter
+from coverage_validator import analyze_document_coverage, analyze_rendered_text_coverage
+from publication_qa import publication_qa
 
 # --- Configuration ---
-MODEL_TEXT_PATH = './ai_models/gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf'
 UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'uploads', 'converted_pages', 'ocr_results'
 TARGET_DPI = 150 
-FONT_AI_ENABLED = os.getenv("FONT_AI_ENABLED", "1") == "1"
-FONT_AI_SCORE_THRESHOLD = float(os.getenv("FONT_AI_SCORE_THRESHOLD", "0.45"))
-FONT_AI_AUDIT_DEFAULT = os.getenv("FONT_AI_AUDIT", "0") == "1"
+FONT_AI_AUDIT_DEFAULT = False
 LAYOUT_OPTIMIZER_ON_TRANSLATION = os.getenv("LAYOUT_OPTIMIZER_ON_TRANSLATION", "0") == "1"
 OFFICE_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".odt", ".odp"}
 
@@ -44,8 +43,8 @@ for d in [UPLOAD_DIR, CONV_DIR, RESULTS_DIR]:
 
 engine_ocr = RapidOCR()
 parser = DocumentParser()
+layout_v2_builder = LayoutV2Builder()
 layout_optimizer = LayoutOptimizer()
-font_ai_matcher = FontAIMatcher() if FONT_AI_ENABLED else None
 text_removal_strategy = TextRemovalStrategy()
 native_pdf_extractor = NativePDFExtractor()
 html_exporter = HtmlStyleExporter()
@@ -180,6 +179,8 @@ def _contains_greek_or_symbol(text):
 def _is_immutable_inline_text(text):
     s = _norm_text(text or "")
     if not s:
+        return False
+    if re.fullmatch(r"[a-z]+-score", s, flags=re.IGNORECASE):
         return False
     # Preserve visual list markers / numbering exactly from source.
     if re.fullmatch(r"[•▪◦·\-\*]", s):
@@ -602,6 +603,76 @@ def _postprocess_blocks(blocks, img_w, img_h):
     return grouped
 
 
+def _annotate_translation_contracts(blocks):
+    def classify_text(text, role, source_kind):
+        txt = _normalize_spaces(text)
+        role = (role or "body").strip().lower()
+        source_kind = (source_kind or "").strip().lower()
+        if not txt:
+            return False, "ignore", "optional"
+        if role in {"equation_inline", "diagram_label"}:
+            return False, "exact_preserve", "strict"
+        if role in {"header", "footer"} and re.fullmatch(r"\d{1,4}|[ivxlcdm]+", txt, flags=re.I):
+            return False, "exact_preserve", "strict"
+        if re.fullmatch(r"[•▪◦·\-\*]", txt):
+            return False, "exact_preserve", "strict"
+        if re.fullmatch(r"\d{1,4}([.)]|)", txt):
+            return False, "exact_preserve", "strict"
+        if re.fullmatch(r"[A-Z]{2,5}", txt):
+            return False, "exact_preserve", "strict"
+        if role in {"title", "section_heading", "figure_caption", "diagram_text_label"}:
+            return True, "layout_constrained", "strict"
+        if source_kind in {"native_span", "native_phrase"} and len(txt.split()) <= 10:
+            return True, "layout_constrained", "strict"
+        return True, "semantic_reflow", "strict"
+
+    for b_idx, block in enumerate(blocks or []):
+        role = block.get("role", "body")
+        source = block.get("source", "ocr")
+        source_kind = block.get("source_kind") or ("native_block" if source == "native" else "ocr_block")
+        text = block.get("text") or _block_text(block)
+        translatable, strategy, coverage = classify_text(text, role, source_kind)
+        block["unit_id"] = block.get("id") or f"blk_{b_idx}"
+        block["source_kind"] = source_kind
+        block["text"] = text
+        block["text_normalized"] = _normalize_spaces(text)
+        block["translatable"] = bool(translatable)
+        block["translation_strategy"] = strategy
+        block["coverage_required"] = coverage
+        for l_idx, line in enumerate(block.get("lines", []) or []):
+            l_txt = line.get("line_text") or _line_phrase_text(line)
+            l_kind = line.get("source_kind") or ("native_line" if source == "native" else "ocr_line")
+            l_translatable, l_strategy, l_coverage = classify_text(l_txt, role, l_kind)
+            line["unit_id"] = f"{block['unit_id']}:line:{l_idx}"
+            line["source_kind"] = l_kind
+            line["text"] = l_txt
+            line["text_normalized"] = _normalize_spaces(l_txt)
+            line["translatable"] = bool(l_translatable)
+            line["translation_strategy"] = l_strategy
+            line["coverage_required"] = l_coverage
+            for p_idx, phrase in enumerate(line.get("phrases", []) or []):
+                p_txt = _phrase_render_text(phrase)
+                p_kind = phrase.get("source_kind") or ("native_phrase" if source == "native" else "ocr_phrase")
+                p_translatable, p_strategy, p_coverage = classify_text(p_txt, role, p_kind)
+                phrase["unit_id"] = f"{line['unit_id']}:phrase:{p_idx}"
+                phrase["source_kind"] = p_kind
+                phrase["text"] = p_txt
+                phrase["text_normalized"] = _normalize_spaces(p_txt)
+                phrase["translatable"] = bool(p_translatable)
+                phrase["translation_strategy"] = p_strategy
+                phrase["coverage_required"] = p_coverage
+                for s_idx, span in enumerate(phrase.get("spans", []) or []):
+                    s_txt = _normalize_spaces(span.get("texte", ""))
+                    s_kind = span.get("source_kind") or ("native_span" if source == "native" else "ocr_span")
+                    s_translatable, s_strategy, s_coverage = classify_text(s_txt, role, s_kind)
+                    span["unit_id"] = f"{phrase['unit_id']}:span:{s_idx}"
+                    span["source_kind"] = s_kind
+                    span["text_normalized"] = s_txt
+                    span["translatable"] = bool(s_translatable)
+                    span["translation_strategy"] = s_strategy
+                    span["coverage_required"] = s_coverage
+
+
 def _detect_leading_marker(text):
     s = (text or "").lstrip()
     if not s:
@@ -914,111 +985,16 @@ def _annotate_layout(blocks, img_w, img_h):
 
 
 def apply_ai_font_matching(ocr_blocks, pil_img, enable_audit=False):
-    summary = {
-        "enabled": bool(font_ai_matcher),
-        "ready": bool(font_ai_matcher and font_ai_matcher.is_ready()),
-        "threshold": FONT_AI_SCORE_THRESHOLD,
+    return {
+        "enabled": False,
+        "ready": False,
+        "threshold": None,
         "total_spans": 0,
         "attempted": 0,
         "matched": 0,
         "promoted": 0,
-        "reasons": {},
+        "reasons": {"font_ai_removed": 1},
     }
-
-    def add_reason(reason):
-        summary["reasons"][reason] = summary["reasons"].get(reason, 0) + 1
-
-    if not font_ai_matcher:
-        add_reason("font_ai_disabled")
-        return summary
-    if not font_ai_matcher.is_ready():
-        add_reason("matcher_not_ready")
-        return summary
-
-    img_w, img_h = pil_img.size
-    for block in ocr_blocks:
-        for line in block.get("lines", []):
-            for phrase in line.get("phrases", []):
-                for span in phrase.get("spans", []):
-                    summary["total_spans"] += 1
-                    txt = (span.get("texte") or "").strip()
-                    bbox = span.get("bbox", [0, 0, 0, 0])
-                    style = span.setdefault("style", {})
-                    audit = None
-                    if enable_audit:
-                        audit = {
-                            "font_original": style.get("font"),
-                            "font_ai": None,
-                            "score": None,
-                            "selected_font": style.get("font"),
-                            "applied": False,
-                            "reason": "unknown",
-                        }
-                    if len(txt) < 2:
-                        add_reason("text_too_short")
-                        if audit is not None:
-                            audit["reason"] = "text_too_short"
-                            style["font_ai_audit"] = audit
-                        continue
-
-                    x0, y0, x1, y1 = [int(v) for v in bbox]
-                    x0, y0 = max(0, x0), max(0, y0)
-                    x1, y1 = min(img_w, x1), min(img_h, y1)
-                    if x1 <= x0 or y1 <= y0:
-                        add_reason("invalid_bbox")
-                        if audit is not None:
-                            audit["reason"] = "invalid_bbox"
-                            style["font_ai_audit"] = audit
-                        continue
-                    if (x1 - x0) < 12 or (y1 - y0) < 10:
-                        add_reason("bbox_too_small")
-                        if audit is not None:
-                            audit["reason"] = "bbox_too_small"
-                            style["font_ai_audit"] = audit
-                        continue
-
-                    crop = pil_img.crop((x0, y0, x1, y1))
-                    summary["attempted"] += 1
-                    match = font_ai_matcher.match_crop(crop)
-                    if not match:
-                        add_reason("no_match")
-                        if audit is not None:
-                            audit["reason"] = "no_match"
-                            style["font_ai_audit"] = audit
-                        continue
-
-                    summary["matched"] += 1
-                    style["font_ai"] = match.font_name
-                    style["font_ai_score"] = round(match.score, 4)
-                    style["font_ai_path"] = match.font_path
-
-                    # Promote AI-predicted font if confidence is acceptable.
-                    if match.score >= FONT_AI_SCORE_THRESHOLD:
-                        style["font"] = match.font_name
-                        summary["promoted"] += 1
-                        add_reason("threshold_passed")
-                        flags = style.setdefault("flags", {})
-                        for k, v in match.flags.items():
-                            if k not in flags:
-                                flags[k] = v
-                        if audit is not None:
-                            audit["font_ai"] = match.font_name
-                            audit["score"] = round(match.score, 4)
-                            audit["selected_font"] = style.get("font")
-                            audit["applied"] = True
-                            audit["reason"] = "threshold_passed"
-                            style["font_ai_audit"] = audit
-                    else:
-                        add_reason("threshold_not_met")
-                        if audit is not None:
-                            audit["font_ai"] = match.font_name
-                            audit["score"] = round(match.score, 4)
-                            audit["selected_font"] = style.get("font")
-                            audit["applied"] = False
-                            audit["reason"] = "threshold_not_met"
-                            style["font_ai_audit"] = audit
-
-    return summary
 
 
 def _normalize_spaces(text):
@@ -1337,7 +1313,7 @@ def _build_fidelity_layout_export(blocks):
                 "line_text": line.get("line_text", ""),
                 "leading_marker": marker,
                 "leading_marker_norm": marker_norm,
-                "leading_marker_code": (f"U+{ord(marker):04X}" if marker else ""),
+                "leading_marker_code": (" ".join(f"U+{ord(ch):04X}" for ch in str(marker)) if marker else ""),
                 "indent_px": float(line.get("indent_px", 0.0) or 0.0),
                 "hard_break_before": bool(line.get("hard_break_before", False)),
                 "line_break_after": bool(line.get("line_break_after", True)),
@@ -1501,19 +1477,20 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     
     ocr_structure = parser.parse(raw_ocr, img) if raw_ocr else []
     font_ai_summary = {
-        "enabled": bool(font_ai_matcher),
-        "ready": bool(font_ai_matcher and font_ai_matcher.is_ready()),
-        "threshold": FONT_AI_SCORE_THRESHOLD,
+        "enabled": False,
+        "ready": False,
+        "threshold": None,
         "total_spans": 0,
         "attempted": 0,
         "matched": 0,
         "promoted": 0,
-        "reasons": {},
+        "reasons": {"font_ai_removed": 1},
     }
     if ocr_structure:
         font_ai_summary = apply_ai_font_matching(ocr_structure, img, enable_audit=font_ai_audit)
     final_blocks = _dedupe_final_blocks(native_blocks, ocr_structure)
     final_blocks = _postprocess_blocks(final_blocks, img.width, img.height)
+    _annotate_translation_contracts(final_blocks)
     immutable_overlays = _extract_immutable_overlays(final_blocks, img, filename, idx)
 
     layout_meta = _annotate_layout(final_blocks, img.width, img.height)
@@ -1573,7 +1550,10 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         for line in block["lines"]:
             line_txt = _line_phrase_text(line)
             marker = (line.get("leading_marker") or "")
-            marker_code = f"U+{ord(marker):04X}" if marker else ""
+            if marker:
+                marker_code = " ".join(f"U+{ord(ch):04X}" for ch in str(marker))
+            else:
+                marker_code = ""
             marker_norm = "•" if marker in {"", "▪", "◦", "·", "*"} else marker
             indent_px = float(line.get("indent_px", 0.0) or 0.0)
             hard_break = bool(line.get("hard_break_before", False))
@@ -1628,29 +1608,36 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         for i, s in enumerate(hierarchical_extraction.get("phrases", []), start=1):
             display_text += f"  {i}. {s}\n"
 
+    page_structure = {
+        "blocks": final_blocks,
+        "background_path": bg_master_path,
+        "source_image_path": source_path,
+        "source_image_url": f"/results/{source_fn}" if source_path else "",
+        "mask_master_path": mask_master_path,
+        "immutable_overlays": immutable_overlays,
+        "text_removal_debug": text_removal_debug,
+        "non_text_zones": non_text_zones,
+        "images": native_images,
+        "drawings": native_drawings,
+        "layout": layout_meta,
+        "layout_xml_path": layout_xml_path,
+        "style_profile": style_profile,
+        "font_ai_summary": font_ai_summary,
+        "layout_version": "v4_layout_roles_alignment_style_profile",
+        "dimensions": {"width": img.width, "height": img.height},
+    }
+    try:
+        # Canonical structure enrichment for stable translation/reconstruction.
+        page_structure = layout_v2_builder.build(page_structure)
+    except Exception as e:
+        print(f"Erreur LayoutV2Builder: {e}")
+
     return {
         "page": idx + 1, 
         "content": display_text,
         "hierarchical_extraction": hierarchical_extraction,
         "fidelity_layout": fidelity_layout,
-        "structure": {
-            "blocks": final_blocks, 
-            "background_path": bg_master_path,
-            "source_image_path": source_path,
-            "source_image_url": f"/results/{source_fn}" if source_path else "",
-            "mask_master_path": mask_master_path,
-            "immutable_overlays": immutable_overlays,
-            "text_removal_debug": text_removal_debug,
-            "non_text_zones": non_text_zones,
-            "images": native_images,
-            "drawings": native_drawings,
-            "layout": layout_meta,
-            "layout_xml_path": layout_xml_path,
-            "style_profile": style_profile,
-            "font_ai_summary": font_ai_summary,
-            "layout_version": "v4_layout_roles_alignment_style_profile",
-            "dimensions": {"width": img.width, "height": img.height}
-        },
+        "structure": page_structure,
         "visual_url": f"/results/{vis_fn}"
     }
 
@@ -1726,6 +1713,7 @@ def json_serializable(obj):
     if isinstance(obj, dict): return {str(k): json_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list): return [json_serializable(i) for i in obj]
     return obj
+
 
 @app.post("/ocr")
 async def perform_ocr(file: UploadFile = File(...), force_ai: bool = False, font_ai_audit: bool = FONT_AI_AUDIT_DEFAULT, text_removal_mode: str = "default"):
@@ -1819,10 +1807,58 @@ async def translate_units(data: dict):
         import traceback; print(traceback.format_exc())
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
+@app.post("/translate")
+async def translate_structure_endpoint(data: dict, target_lang: str = "French"):
+    try:
+        structure = data
+        if isinstance(structure, dict) and "structure" in structure:
+            structure = structure["structure"]
+
+        translator = get_translator()
+        if (
+            isinstance(structure, dict)
+            and structure.get("schema_version") == "layout.v2"
+            and structure.get("page_role") == "toc"
+        ):
+            translated = translator.translate_layout_v2(structure, target_lang=target_lang)
+            return JSONResponse(content={"status": "success", "structure": json_serializable(translated)})
+
+        if isinstance(structure, dict) and isinstance(structure.get("pages"), list):
+            pages = []
+            for page in structure.get("pages", []):
+                if (
+                    isinstance(page, dict)
+                    and page.get("schema_version") == "layout.v2"
+                    and page.get("page_role") == "toc"
+                ):
+                    pages.append(translator.translate_layout_v2(page, target_lang=target_lang))
+                else:
+                    pages.append(translator.translate_page(page, target_lang=target_lang) if isinstance(page, dict) else page)
+            return JSONResponse(content={"status": "success", "structure": json_serializable({"pages": pages})})
+
+        if isinstance(structure, dict):
+            translated = translator.translate_page(structure, target_lang=target_lang)
+            return JSONResponse(content={"status": "success", "structure": json_serializable(translated)})
+
+        return JSONResponse(content={"error": "Invalid payload: expected dict structure"}, status_code=400)
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 @app.post("/reconstruct")
 async def reconstruct_document(data: dict, target_lang: str = None, debug_compare: bool = False, export_html: bool = False):
     try:
-        raw_pages = data.get("pages", [])
+        if isinstance(data, dict) and "structure" in data:
+            data = data["structure"]
+
+        raw_pages = []
+        if isinstance(data, dict) and isinstance(data.get("pages"), list):
+            raw_pages = data.get("pages", [])
+        elif isinstance(data, list):
+            raw_pages = data
+        elif isinstance(data, dict):
+            raw_pages = [data]
+
         pages = []
         for page in raw_pages:
             if isinstance(page, dict):
@@ -1831,12 +1867,20 @@ async def reconstruct_document(data: dict, target_lang: str = None, debug_compar
                     pages.append(structure)
                     continue
             pages.append(page)
+        source_pages_for_qa = copy.deepcopy(pages)
         if target_lang:
             print(f"  [Pipeline] Traduction vers {target_lang} activée...")
             translator = get_translator()
             for idx, page in enumerate(pages):
-                # 1. Traduction par bloc
-                page = translator.translate_page(page, target_lang=target_lang)
+                if (
+                    isinstance(page, dict)
+                    and page.get("schema_version") == "layout.v2"
+                    and page.get("page_role") == "toc"
+                ):
+                    page = translator.translate_layout_v2(page, target_lang=target_lang)
+                else:
+                    # 1. Traduction par bloc
+                    page = translator.translate_page(page, target_lang=target_lang)
                 # 2. Réajustement géométrique optionnel (désactivé par défaut pour préserver les positions source).
                 if LAYOUT_OPTIMIZER_ON_TRANSLATION:
                     page = layout_optimizer.adjust_layout(page)
@@ -1847,8 +1891,30 @@ async def reconstruct_document(data: dict, target_lang: str = None, debug_compar
         recon.reconstruct({"pages": pages}, output_path)
 
         response = {"status": "success", "pdf_url": f"/results/reconstructed_output.pdf"}
+        original_paths = [((p.get("source_image_path") if isinstance(p, dict) else "") or "") for p in source_pages_for_qa]
+        if target_lang:
+            coverage_report = analyze_document_coverage(
+                source_pages_for_qa,
+                pages,
+                target_lang=(target_lang or "fr"),
+            )
+            rendered_text_report = analyze_rendered_text_coverage(
+                source_pages_for_qa,
+                pages,
+                output_path,
+                target_lang=(target_lang or "fr"),
+            )
+            coverage_report["rendered_text_report"] = rendered_text_report
+            response["coverage_report"] = coverage_report
+            response["publication_qa"] = publication_qa(
+                source_pages_for_qa,
+                pages,
+                output_path,
+                coverage_report=coverage_report,
+                target_lang=(target_lang or "fr"),
+                original_image_paths=original_paths,
+            )
         if debug_compare:
-            original_paths = [((p.get("source_image_path") if isinstance(p, dict) else "") or "") for p in pages]
             if any(original_paths):
                 response["visual_compare"] = compare_reconstruction(original_paths, output_path, dpi=TARGET_DPI)
             else:

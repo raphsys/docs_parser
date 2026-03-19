@@ -41,7 +41,19 @@ class TextComposer:
         opts = options or ComposeOptions()
         words = [w for w in (text or "").split() if w]
         if not words:
-            return {"font_size": base_font_pt, "line_height": base_font_pt * line_height_factor, "lines": [], "overflow": ""}
+            return {
+                "font_size": base_font_pt,
+                "line_height": base_font_pt * line_height_factor,
+                "lines": [],
+                "overflow": "",
+                "alignment": alignment,
+                "line_widths": [],
+                "max_line_width": 0.0,
+                "box_width": float(box_w),
+                "box_height": float(box_h),
+                "fits": True,
+                "overflow_ratio": 0.0,
+            }
 
         fs = float(base_font_pt)
         while fs >= max(opts.min_font_pt, base_font_pt - opts.max_font_shrink):
@@ -49,12 +61,19 @@ class TextComposer:
             line_h = max(1.0, fs * line_height_factor)
             max_lines = max(1, int(box_h / line_h))
             if len(lines) <= max_lines:
+                line_widths = [float(measure_fn(line, fs)) for line in lines]
                 return {
                     "font_size": fs,
                     "line_height": line_h,
                     "lines": lines,
                     "overflow": "",
                     "alignment": alignment,
+                    "line_widths": line_widths,
+                    "max_line_width": max(line_widths, default=0.0),
+                    "box_width": float(box_w),
+                    "box_height": float(box_h),
+                    "fits": True,
+                    "overflow_ratio": 0.0,
                 }
             fs -= max(0.05, opts.step_pt)
 
@@ -65,7 +84,24 @@ class TextComposer:
         max_lines = max(1, int(box_h / line_h))
         kept = lines[:max_lines]
         overflow = " ".join(lines[max_lines:]).strip()
-        return {"font_size": fs, "line_height": line_h, "lines": kept, "overflow": overflow, "alignment": alignment}
+        line_widths = [float(measure_fn(line, fs)) for line in kept]
+        max_line_width = max(line_widths, default=0.0)
+        overflow_ratio = 0.0
+        if box_w > 0:
+            overflow_ratio = max(0.0, (max_line_width - float(box_w)) / float(box_w))
+        return {
+            "font_size": fs,
+            "line_height": line_h,
+            "lines": kept,
+            "overflow": overflow,
+            "alignment": alignment,
+            "line_widths": line_widths,
+            "max_line_width": max_line_width,
+            "box_width": float(box_w),
+            "box_height": float(box_h),
+            "fits": False,
+            "overflow_ratio": overflow_ratio,
+        }
 
     def _wrap_words(self, words: List[str], max_w: float, fs: float, measure_fn: Callable[[str, float], float], hyphenate: bool, lang: str) -> List[str]:
         out = []

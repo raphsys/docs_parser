@@ -1,6 +1,8 @@
 import fitz
 import numpy as np
 import cv2
+import re
+import statistics
 from PIL import Image, ImageOps
 
 class VisualAttributeExtractor:
@@ -479,3 +481,487 @@ class DocumentParser:
         x1 = max([b[2] for b in bboxes])
         y1 = max([b[3] for b in bboxes])
         return [int(x0), int(y0), int(x1), int(y1)]
+
+
+# =============================================================================
+# Layout V2 Builder (canonical structure for translator/reconstructor)
+# =============================================================================
+class LayoutV2Builder:
+    """
+    Build a canonical page layout representation (layout.v2) suitable for:
+    - stable translation that does not destroy structure (TOC, lists)
+    - stable reconstruction with appropriate render modes (tabbed layout for TOC)
+    """
+
+    SCHEMA_VERSION = "layout.v2"
+
+    def __init__(self):
+        pass
+
+    def build(self, page_data):
+        """
+        Input: page_data as produced by the current pipeline (blocks/lines/phrases),
+               typically coming from native extraction or OCR.
+        Output: same page_data augmented with:
+          - schema_version
+          - page_role
+          - layout (margins, columns, tab_stops)
+          - toc (toc_rows) when detected
+          - indent_level injected per line
+        """
+        if not isinstance(page_data, dict):
+            return page_data
+
+        page_data.setdefault("schema_version", self.SCHEMA_VERSION)
+
+        dims = page_data.get("dimensions") or {}
+        page_w = float(dims.get("width", 0.0) or 0.0)
+        page_h = float(dims.get("height", 0.0) or 0.0)
+
+        all_lines = self._iter_lines(page_data)
+        margins = self._infer_margins(all_lines, page_w, page_h)
+        columns = self._infer_columns(all_lines, margins, page_w)
+        page_data.setdefault("layout", {})
+        page_data["layout"]["margins"] = margins
+        page_data["layout"]["columns"] = columns
+
+        page_role = self._detect_page_role(page_data, all_lines)
+        page_data["page_role"] = page_role
+        page_family = self._detect_page_family(page_data, all_lines, page_role=page_role)
+        page_data["page_family"] = page_family
+        page_data["layout"]["page_family"] = page_family
+
+        self._inject_indent_levels(page_data, columns, margins)
+
+        if page_role == "toc":
+            toc_rows, tab_stops = self._build_toc_rows(page_data, columns, margins)
+            page_data["toc"] = {
+                "toc_rows": toc_rows,
+                "tab_stops": tab_stops,
+            }
+        return page_data
+
+    def _iter_lines(self, page_data):
+        lines = []
+        for b in (page_data.get("blocks") or []):
+            for ln in (b.get("lines") or []):
+                bb = ln.get("bbox")
+                if not bb or len(bb) != 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = map(float, bb)
+                except Exception:
+                    continue
+                lines.append({"bbox": [x0, y0, x1, y1], "block": b, "line": ln})
+        return lines
+
+    def _infer_margins(self, lines, page_w, page_h):
+        if not lines or page_w <= 0 or page_h <= 0:
+            return {"left": 0.0, "right": page_w, "top": 0.0, "bottom": page_h}
+        xs0 = sorted([l["bbox"][0] for l in lines])
+        xs1 = sorted([l["bbox"][2] for l in lines])
+        ys0 = sorted([l["bbox"][1] for l in lines])
+        ys1 = sorted([l["bbox"][3] for l in lines])
+
+        def pct(arr, p):
+            if not arr:
+                return 0.0
+            k = int(round((len(arr) - 1) * p))
+            return float(arr[max(0, min(len(arr) - 1, k))])
+
+        left = pct(xs0, 0.03)
+        right = pct(xs1, 0.97)
+        top = pct(ys0, 0.03)
+        bottom = pct(ys1, 0.97)
+        left = max(0.0, min(left, page_w))
+        right = max(left + 1.0, min(right, page_w))
+        top = max(0.0, min(top, page_h))
+        bottom = max(top + 1.0, min(bottom, page_h))
+        return {"left": left, "right": right, "top": top, "bottom": bottom}
+
+    def _infer_columns(self, lines, margins, page_w):
+        if not lines:
+            return [{"id": 0, "x0": margins["left"], "x1": margins["right"]}]
+        x0s = sorted([l["bbox"][0] for l in lines])
+        if len(x0s) < 10:
+            return [{"id": 0, "x0": margins["left"], "x1": margins["right"]}]
+
+        diffs = [x0s[i + 1] - x0s[i] for i in range(len(x0s) - 1)]
+        if not diffs:
+            return [{"id": 0, "x0": margins["left"], "x1": margins["right"]}]
+
+        max_gap = max(diffs)
+        gap_i = diffs.index(max_gap)
+        if max_gap > max(40.0, (margins["right"] - margins["left"]) * 0.12):
+            split_x = (x0s[gap_i] + x0s[gap_i + 1]) / 2.0
+            split_x = max(margins["left"] + 50.0, min(split_x, margins["right"] - 50.0))
+            return [
+                {"id": 0, "x0": margins["left"], "x1": split_x},
+                {"id": 1, "x0": split_x, "x1": margins["right"]},
+            ]
+        return [{"id": 0, "x0": margins["left"], "x1": margins["right"]}]
+
+    def _detect_page_role(self, page_data, lines):
+        blocks = page_data.get("blocks") or []
+        dims = page_data.get("dimensions") or {}
+        page_h = float(dims.get("height", 1.0) or 1.0)
+
+        top_title = False
+        toc_like = 0
+        total = 0
+        page_marker_lines = 0
+        label_lines = 0
+        paired_rows = 0
+        flat_lines = []
+
+        for b in blocks:
+            bb = b.get("bbox") or [0, 0, 0, 0]
+            try:
+                by0 = float(bb[1])
+            except Exception:
+                by0 = 1e9
+            if by0 < page_h * 0.18:
+                t = (b.get("text") or b.get("translated_text") or "").strip()
+                if re.search(r"\b(CONTENTS|SOMMAIRE|TABLE\s+OF\s+CONTENTS)\b", t, flags=re.I):
+                    top_title = True
+            for ln in (b.get("lines") or []):
+                total += 1
+                lt = (ln.get("line_text") or ln.get("translated_text") or "").strip()
+                if not lt:
+                    parts = []
+                    for ph in (ln.get("phrases") or []):
+                        tx = (ph.get("text") or ph.get("translated_text") or ph.get("texte") or "").strip()
+                        if tx:
+                            parts.append(tx)
+                    lt = " ".join(parts).strip()
+                if not lt:
+                    continue
+                flat_lines.append((lt, ln))
+                if re.search(r"^\s*\d+(?:\.\d+)*\s+.+\s+\d{1,3}\s*$", lt):
+                    toc_like += 1
+                elif re.search(r"^[A-Za-z].+\s+\d{1,3}\s*$", lt) and len(lt) <= 100:
+                    toc_like += 1
+                elif re.search(r"^[ivxlcdm]+\s*$", lt, flags=re.I):
+                    toc_like += 1
+                if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", lt, flags=re.I):
+                    page_marker_lines += 1
+                elif len(lt) <= 120:
+                    label_lines += 1
+
+        for idx in range(len(flat_lines) - 1):
+            cur, cur_ln = flat_lines[idx]
+            nxt, nxt_ln = flat_lines[idx + 1]
+            if not re.fullmatch(r"\d{1,3}|[ivxlcdm]+", nxt, flags=re.I):
+                continue
+            if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", cur, flags=re.I):
+                continue
+            if len(cur) > 140:
+                continue
+            try:
+                cy0 = float((cur_ln.get("bbox") or [0, 0, 0, 0])[1])
+                ny0 = float((nxt_ln.get("bbox") or [0, 0, 0, 0])[1])
+            except Exception:
+                cy0, ny0 = 0.0, 0.0
+            if abs(ny0 - cy0) <= 120.0:
+                paired_rows += 1
+
+        if top_title and toc_like >= 6:
+            return "toc"
+        if top_title and paired_rows >= 8 and page_marker_lines >= 8 and label_lines >= 8:
+            return "toc"
+        if toc_like >= 10 and total >= 12:
+            return "toc"
+        return "body"
+
+    def _detect_page_family(self, page_data, lines, page_role="body"):
+        role = str(page_role or "body").strip().lower()
+        if role == "toc":
+            return "toc"
+
+        blocks = page_data.get("blocks") or []
+        images = page_data.get("images") or []
+        drawings = page_data.get("drawings") or []
+        non_text_zones = page_data.get("non_text_zones") or []
+
+        figure_captions = 0
+        body_blocks = 0
+        short_native_labels = 0
+        diagram_roles = 0
+        tableish_lines = 0
+
+        for block in blocks:
+            block_role = str(block.get("role") or "body").strip().lower()
+            text = (block.get("translated_text") or block.get("text") or "").strip()
+            source = str(block.get("source") or "ocr").strip().lower()
+            line_count = len(block.get("lines") or [])
+
+            if block_role == "figure_caption":
+                figure_captions += 1
+            if block_role == "body":
+                body_blocks += 1
+            if block_role in {"diagram_label", "diagram_text_label", "axis_label", "legend_label"}:
+                diagram_roles += 1
+            if (
+                block_role == "title"
+                and source == "native"
+                and text
+                and len(text) <= 120
+                and line_count <= 3
+            ):
+                short_native_labels += 1
+
+            for line in block.get("lines") or []:
+                line_text = (line.get("translated_text") or line.get("line_text") or "").strip()
+                if not line_text:
+                    continue
+                if (
+                    "|" in line_text
+                    or "\t" in line_text
+                    or len(re.findall(r"\b\d+(?:[.,]\d+)?\b", line_text)) >= 3
+                ):
+                    tableish_lines += 1
+
+        visual_non_text = len(images) + len(drawings) + len(non_text_zones)
+
+        if tableish_lines >= 6:
+            return "table_page"
+        if figure_captions >= 1 and (visual_non_text >= 1 or short_native_labels >= 2):
+            return "body_with_figure"
+        if visual_non_text >= 1 and (diagram_roles >= 1 or short_native_labels >= 3):
+            return "body_with_diagram"
+        if visual_non_text >= 1 and body_blocks >= 1:
+            return "mixed_page"
+        return "body_text"
+
+    def _inject_indent_levels(self, page_data, columns, margins):
+        col0_left = columns[0]["x0"] if columns else margins.get("left", 0.0)
+        indents = []
+        for b in (page_data.get("blocks") or []):
+            for ln in (b.get("lines") or []):
+                bb = ln.get("bbox") or None
+                if not bb:
+                    continue
+                try:
+                    x0 = float(bb[0])
+                except Exception:
+                    continue
+                indents.append(max(0.0, x0 - col0_left))
+        if not indents:
+            return
+
+        rounded = [int(round(v / 10.0) * 10) for v in indents]
+        uniq = sorted(set(rounded))
+        if len(uniq) > 6:
+            qs = statistics.quantiles(rounded, n=4, method="inclusive")
+            cuts = [float(qs[i]) for i in range(3)]
+
+            def level(v):
+                if v <= cuts[0]:
+                    return 0
+                if v <= cuts[1]:
+                    return 1
+                if v <= cuts[2]:
+                    return 2
+                return 3
+        else:
+            mapping = {u: i for i, u in enumerate(uniq)}
+
+            def level(v):
+                return int(mapping.get(int(round(v / 10.0) * 10), 0))
+
+        for b in (page_data.get("blocks") or []):
+            for ln in (b.get("lines") or []):
+                bb = ln.get("bbox") or None
+                if not bb:
+                    continue
+                try:
+                    x0 = float(bb[0])
+                except Exception:
+                    continue
+                indent_px = max(0.0, x0 - col0_left)
+                ln["indent_px"] = float(indent_px)
+                ln["indent_level"] = int(level(indent_px))
+
+    def _build_toc_rows(self, page_data, columns, margins):
+        blocks = page_data.get("blocks") or []
+        col_left = columns[0]["x0"] if columns else margins["left"]
+        col_right = columns[-1]["x1"] if columns else margins["right"]
+
+        def pick_line_style(line, block):
+            for ph in (line.get("phrases") or []):
+                st = ph.get("style") or {}
+                if st:
+                    return dict(st)
+            st = block.get("resolved_style") or block.get("style") or {}
+            return dict(st) if isinstance(st, dict) else {}
+
+        def style_score(style):
+            if not isinstance(style, dict):
+                return -1.0
+            try:
+                size = float(style.get("size") or style.get("font_size_pt") or 0.0)
+            except Exception:
+                size = 0.0
+            flags = style.get("flags") or {}
+            bonus = 0.0
+            if flags.get("bold"):
+                bonus += 0.6
+            if flags.get("italic"):
+                bonus += 0.3
+            return size + bonus
+
+        def infer_toc_role(label_text, marker, indent_level, style, page_value):
+            text = (label_text or "").strip()
+            lower = text.lower()
+            flags = (style or {}).get("flags") or {}
+            try:
+                font_size = float((style or {}).get("size") or (style or {}).get("font_size_pt") or 0.0)
+            except Exception:
+                font_size = 0.0
+            if lower in {"contents", "sommaire", "table of contents"}:
+                return "toc_title"
+            if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", (page_value or "").strip(), flags=re.I) and not text:
+                return "page_marker"
+            if indent_level <= 0 and font_size >= 12.0:
+                return "chapter_title"
+            if indent_level <= 0 and flags.get("bold"):
+                return "section_heading"
+            if marker:
+                return "subentry_marker"
+            if indent_level >= 1:
+                return "subentry"
+            return "section_heading"
+
+        flat_lines = []
+        for b in blocks:
+            for ln in (b.get("lines") or []):
+                bb = ln.get("bbox") or None
+                if not bb:
+                    continue
+                text = (ln.get("line_text") or ln.get("translated_text") or "").strip()
+                if not text:
+                    parts = []
+                    for ph in (ln.get("phrases") or []):
+                        tx = (ph.get("text") or ph.get("translated_text") or ph.get("texte") or "").strip()
+                        if tx:
+                            parts.append(tx)
+                    text = " ".join(parts).strip()
+                if not text:
+                    continue
+                try:
+                    x0, y0, x1, y1 = map(float, bb)
+                except Exception:
+                    continue
+                style = pick_line_style(ln, b)
+                flat_lines.append(
+                    {
+                        "text": text,
+                        "bbox": [x0, y0, x1, y1],
+                        "y": y0,
+                        "indent_level": int(ln.get("indent_level", 0) or 0),
+                        "indent_px": float(ln.get("indent_px", 0.0) or 0.0),
+                        "style": style,
+                    }
+                )
+
+        flat_lines.sort(key=lambda r: (float(r.get("y", 0.0)), float((r.get("bbox") or [0, 0, 0, 0])[0])))
+
+        merged = []
+        page_num_right_x_candidates = []
+        pending = []
+
+        def flush_pending(page_value="", page_bbox=None):
+            nonlocal pending
+            if not pending:
+                return
+            label_text = " ".join((p.get("text") or "").strip() for p in pending if (p.get("text") or "").strip()).strip()
+            marker, label_text = self._extract_leading_marker(label_text)
+            best_style = {}
+            if pending:
+                best_style = max((p.get("style") or {} for p in pending), key=style_score, default={}) or {}
+            role = infer_toc_role(
+                label_text=label_text,
+                marker=marker,
+                indent_level=min(int(p.get("indent_level", 0) or 0) for p in pending),
+                style=best_style,
+                page_value=page_value,
+            )
+            merged.append(
+                {
+                    "y": float(pending[0].get("y", 0.0)),
+                    "indent_level": min(int(p.get("indent_level", 0) or 0) for p in pending),
+                    "indent_px": float(pending[0].get("indent_px", 0.0) or 0.0),
+                    "marker": marker,
+                    "label": label_text.strip(),
+                    "page": (page_value or "").strip(),
+                    "role": role,
+                    "style": best_style,
+                }
+            )
+            if page_bbox:
+                page_num_right_x_candidates.append(float(page_bbox[2]))
+            pending = []
+
+        for entry in flat_lines:
+            text = (entry.get("text") or "").strip()
+            if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", text, flags=re.I):
+                flush_pending(text, page_bbox=entry.get("bbox"))
+                continue
+            pending.append(entry)
+
+        flush_pending("", page_bbox=None)
+
+        if page_num_right_x_candidates:
+            page_num_right_x = float(statistics.median(page_num_right_x_candidates))
+        else:
+            page_num_right_x = col_right
+
+        current_chapter = ""
+        for idx, row in enumerate(merged):
+            label = str(row.get("label") or "").strip()
+            role = str(row.get("role") or "").strip().lower()
+            m = re.match(r"^(\d+)\.\d+\b", label)
+            if m:
+                current_chapter = m.group(1)
+            if role == "chapter_title":
+                if not current_chapter:
+                    for nxt in merged[idx + 1:]:
+                        nm = re.match(r"^(\d+)\.\d+\b", str(nxt.get("label") or "").strip())
+                        if nm:
+                            current_chapter = nm.group(1)
+                            break
+                if current_chapter:
+                    row["chapter_number"] = current_chapter
+
+        tab_stops = {
+            "page_num_right_x": page_num_right_x,
+            "column_left_x": col_left,
+            "column_right_x": col_right,
+        }
+        return merged, tab_stops
+
+    def _join_tokens(self, tokens, skip_text=None):
+        toks = sorted(tokens, key=lambda z: z["bbox"][0])
+        parts = []
+        for t in toks:
+            tx = t.get("text", "").strip()
+            if not tx:
+                continue
+            if skip_text and tx == skip_text:
+                continue
+            parts.append(tx)
+        return " ".join(parts).strip()
+
+    def _choose_style(self, tokens):
+        for t in tokens:
+            st = t.get("style") or {}
+            if st:
+                return st
+        return {}
+
+    def _extract_leading_marker(self, label):
+        s = (label or "").strip()
+        m = re.match(r"^([•■·\-\u2022])\s+(.*)$", s)
+        if m:
+            return m.group(1), m.group(2)
+        return "", s

@@ -4,6 +4,9 @@ import cv2
 import re
 import statistics
 from PIL import Image, ImageOps
+from page_case_classifier import PageCaseClassifier
+from page_family_registry import get_family_config
+from layout_descriptor import LayoutDescriptorBuilder
 
 class VisualAttributeExtractor:
     def analyze(self, pil_image, bbox, text=""):
@@ -496,7 +499,8 @@ class LayoutV2Builder:
     SCHEMA_VERSION = "layout.v2"
 
     def __init__(self):
-        pass
+        self.page_case_classifier = PageCaseClassifier()
+        self.layout_descriptor_builder = LayoutDescriptorBuilder()
 
     def build(self, page_data):
         """
@@ -527,11 +531,49 @@ class LayoutV2Builder:
 
         page_role = self._detect_page_role(page_data, all_lines)
         page_data["page_role"] = page_role
-        page_family = self._detect_page_family(page_data, all_lines, page_role=page_role)
+        page_case = self.page_case_classifier.classify(page_data, all_lines, page_role=page_role)
+        page_family = page_case.get("page_family") or self._detect_page_family(page_data, all_lines, page_role=page_role)
+        page_family_group = page_case.get("page_family_group") or page_family
+        document_type = page_case.get("document_type") or "mixed_unknown"
+        layout_type = page_case.get("layout_type") or "mixed_blocks"
+        style_profile = page_case.get("style_profile") or "mixed_irregular"
         page_data["page_family"] = page_family
+        page_data["page_family_group"] = page_family_group
+        page_data["page_family_guess"] = page_case.get("best_known_family") or page_family
+        page_data["page_case"] = page_case
+        page_data["document_type"] = document_type
+        page_data["layout_type"] = layout_type
+        page_data["style_profile"] = style_profile
+        page_data["regions"] = page_case.get("regions") or []
+        page_data["classification_confidence"] = page_case.get("confidence") or {}
         page_data["layout"]["page_family"] = page_family
+        page_data["layout"]["page_family_group"] = page_family_group
+        page_data["layout"]["page_family_guess"] = page_data["page_family_guess"]
+        page_data["layout"]["page_case"] = page_case
+        page_data["layout"]["document_type"] = document_type
+        page_data["layout"]["layout_type"] = layout_type
+        page_data["layout"]["style_profile"] = style_profile
+        page_data["layout"]["regions"] = page_data["regions"]
+        page_data["layout"]["classification_confidence"] = page_data["classification_confidence"]
+        page_style, page_tone = self._infer_page_translation_profile(
+            page_role,
+            page_family,
+            document_type=document_type,
+            layout_type=layout_type,
+            style_profile=style_profile,
+        )
+        page_data["translation_style"] = page_data.get("translation_style") or page_style
+        page_data["translation_tone"] = page_data.get("translation_tone") or page_tone
+        page_data["layout"]["translation_style"] = page_data["translation_style"]
+        page_data["layout"]["translation_tone"] = page_data["translation_tone"]
+
+        layout_descriptor = self.layout_descriptor_builder.build(page_data)
+        page_data["layout_descriptor"] = layout_descriptor
+        page_data["layout"]["layout_descriptor"] = layout_descriptor
+        page_data["layout"]["descriptor_version"] = layout_descriptor.get("descriptor_version")
 
         self._inject_indent_levels(page_data, columns, margins)
+        self._annotate_block_translation_profiles(page_data)
 
         if page_role == "toc":
             toc_rows, tab_stops = self._build_toc_rows(page_data, columns, margins)
@@ -540,6 +582,54 @@ class LayoutV2Builder:
                 "tab_stops": tab_stops,
             }
         return page_data
+
+    def _infer_page_translation_profile(self, page_role, page_family, document_type="", layout_type="", style_profile=""):
+        role = str(page_role or "body").strip().lower()
+        if role == "toc":
+            return "professionnel", "neutre"
+        document_type = str(document_type or "").strip().lower()
+        layout_type = str(layout_type or "").strip().lower()
+        style_profile = str(style_profile or "").strip().lower()
+        if document_type in {"scientific_paper", "manual_guide"} or style_profile == "academic_dense":
+            return "professionnel", "analytique"
+        if layout_type in {"annotated_page", "table_dominant"} or style_profile in {"tabular_structured", "editorial_visual"}:
+            return "technique", "didactique"
+        if document_type in {"invoice", "receipt", "form", "contract", "administrative_letter"}:
+            return "professionnel", "formel"
+        config = get_family_config(page_family)
+        return (
+            str(config.get("translation_style") or "professionnel"),
+            str(config.get("translation_tone") or "neutre"),
+        )
+
+    def _infer_block_translation_profile(self, block_role, page_style, page_tone):
+        role = str(block_role or "body").strip().lower()
+        if role in {"title", "subtitle", "section_heading"}:
+            return "professionnel", "neutre"
+        if role == "figure_caption":
+            return "scientifique", "analytique"
+        if role in {"diagram_label", "diagram_text_label", "axis_label", "legend_label", "equation_inline", "equation_block"}:
+            return "technique", "neutre"
+        if role in {"header", "footer", "page_number"}:
+            return "professionnel", "formel"
+        if role in {"list_item", "list_marker"}:
+            return "pedagogique", "didactique"
+        return page_style, page_tone
+
+    def _annotate_block_translation_profiles(self, page_data):
+        page_style = page_data.get("translation_style") or "professionnel"
+        page_tone = page_data.get("translation_tone") or "neutre"
+        for block in (page_data.get("blocks") or []):
+            block_role = block.get("role") or "body"
+            block_style, block_tone = self._infer_block_translation_profile(block_role, page_style, page_tone)
+            block["translation_style"] = block.get("translation_style") or block_style
+            block["translation_tone"] = block.get("translation_tone") or block_tone
+            for line in (block.get("lines") or []):
+                line["translation_style"] = line.get("translation_style") or block["translation_style"]
+                line["translation_tone"] = line.get("translation_tone") or block["translation_tone"]
+                for phrase in (line.get("phrases") or []):
+                    phrase["translation_style"] = phrase.get("translation_style") or block["translation_style"]
+                    phrase["translation_tone"] = phrase.get("translation_tone") or block["translation_tone"]
 
     def _iter_lines(self, page_data):
         lines = []
@@ -832,6 +922,18 @@ class LayoutV2Builder:
                 return "subentry"
             return "section_heading"
 
+        def infer_toc_profile(role):
+            role = str(role or "").strip().lower()
+            if role == "toc_title":
+                return "professionnel", "formel"
+            if role == "chapter_title":
+                return "professionnel", "neutre"
+            if role == "section_heading":
+                return "professionnel", "neutre"
+            if role in {"subentry", "subentry_marker"}:
+                return "pedagogique", "didactique"
+            return "professionnel", "neutre"
+
         flat_lines = []
         for b in blocks:
             for ln in (b.get("lines") or []):
@@ -920,6 +1022,9 @@ class LayoutV2Builder:
         for idx, row in enumerate(merged):
             label = str(row.get("label") or "").strip()
             role = str(row.get("role") or "").strip().lower()
+            row_style, row_tone = infer_toc_profile(role)
+            row["translation_style"] = row.get("translation_style") or row_style
+            row["translation_tone"] = row.get("translation_tone") or row_tone
             m = re.match(r"^(\d+)\.\d+\b", label)
             if m:
                 current_chapter = m.group(1)

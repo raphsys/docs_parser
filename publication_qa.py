@@ -35,6 +35,11 @@ def _iter_translated_units(pages):
                         "page_id": page.get("page", 0),
                         "role": phrase.get("role") or role,
                         "strategy": phrase.get("translation_strategy") or block.get("translation_strategy") or "semantic_reflow",
+                        "unit_type": phrase.get("unit_type") or line.get("unit_type") or block.get("unit_type") or "",
+                        "page_family": page.get("page_family") or ((page.get("layout") or {}).get("page_family")) or "",
+                        "translatable": bool(phrase.get("translatable", block.get("translatable", True))),
+                        "render_policy": phrase.get("render_policy") or line.get("render_policy") or block.get("render_policy") or "",
+                        "render_mode": phrase.get("render_mode") or line.get("render_mode") or block.get("render_mode") or "",
                         "source_text": _normalize_spaces(
                             phrase.get("texte_original") or phrase.get("raw_text") or phrase.get("text") or ""
                         ),
@@ -54,6 +59,16 @@ def _english_leak_count(pages, target_lang="fr"):
     flagged = []
     total = 0
     for unit in _iter_translated_units(pages):
+        if not unit.get("translatable", True):
+            continue
+        if (unit.get("strategy") or "").strip().lower() == "exact_preserve":
+            continue
+        if _normalize_spaces(unit.get("unit_type") or "").lower() in {"reference_link", "citation", "code_visible"}:
+            continue
+        if _normalize_spaces(unit.get("render_policy") or "").lower() == "background_only":
+            continue
+        if _normalize_spaces(unit.get("render_mode") or "").lower() == "background_only":
+            continue
         text = unit["translated_text"]
         if not text:
             continue
@@ -85,6 +100,27 @@ def _overlap_ratio(a, b):
     return inter / max(1e-9, min(r1.get_area(), r2.get_area()))
 
 
+def _is_decorative_raster(rect, page_area):
+    if not isinstance(rect, fitz.Rect):
+        rect = fitz.Rect(rect)
+    w = max(0.0, rect.width)
+    h = max(0.0, rect.height)
+    if w <= 0 or h <= 0:
+        return True
+    aspect = max(w / max(1e-9, h), h / max(1e-9, w))
+    area_ratio = rect.get_area() / max(1e-9, page_area)
+    # Ignore tiny chart glyph rasters such as axis ticks or small markers.
+    if area_ratio < 0.0004 and max(w, h) < 18.0:
+        return True
+    if min(w, h) < 10.0 and aspect >= 8.0:
+        return True
+    if min(w, h) < 14.0 and aspect >= 14.0:
+        return True
+    if area_ratio < 0.0008 and aspect >= 10.0:
+        return True
+    return False
+
+
 def _evaluate_layout_pdf(pdf_path, overlap_threshold=0.25, text_image_threshold=0.10, fullpage_area_ratio=0.95):
     doc = fitz.open(pdf_path)
     total_words = 0
@@ -108,7 +144,10 @@ def _evaluate_layout_pdf(pdf_path, overlap_threshold=0.25, text_image_threshold=
         txt = [fitz.Rect(b["bbox"]) for b in d["blocks"] if b.get("type", 0) == 0 and "bbox" in b]
         imgs = [fitz.Rect(b["bbox"]) for b in d["blocks"] if b.get("type", 0) == 1 and "bbox" in b]
         page_area = max(1e-9, page.rect.get_area())
-        imgs = [im for im in imgs if (im.get_area() / page_area) < fullpage_area_ratio]
+        imgs = [
+            im for im in imgs
+            if (im.get_area() / page_area) < fullpage_area_ratio and not _is_decorative_raster(im, page_area)
+        ]
         for t in txt:
             if any(_overlap_ratio(t, im) > text_image_threshold for im in imgs):
                 total_text_img_coll += 1

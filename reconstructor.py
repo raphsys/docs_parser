@@ -38,6 +38,9 @@ class DocumentReconstructor:
         ).strip().lower()
         self.page_overflow_to_next_page = os.getenv("LAYOUT_PAGE_OVERFLOW_TO_NEXT_PAGE", "0") == "1"
         self.style_audit_enabled = os.getenv("LAYOUT_STYLE_AUDIT", "1") == "1"
+        self._restored_background_rects = {}
+        self._prepared_visual_groups = {}
+        self._typography_group_cache = {}
         self.dynamic_equation_overlays = os.getenv("LAYOUT_DYNAMIC_EQUATION_OVERLAYS", "1") == "1"
         self.dynamic_symbol_overlays = os.getenv("LAYOUT_DYNAMIC_SYMBOL_OVERLAYS", "1") == "1"
         self.dynamic_risk_overlays = os.getenv("LAYOUT_DYNAMIC_RISK_OVERLAYS", "1") == "1"
@@ -83,6 +86,59 @@ class DocumentReconstructor:
             flags.update(pref.get("flags", {}))
         out["flags"] = flags
         return out
+
+    def _item_typography_key(self, item):
+        if not isinstance(item, dict):
+            return ("content", "")
+        tclass = str(item.get("descriptor_typographic_class") or "").strip().lower() or "content"
+        gids = item.get("descriptor_group_ids") or {}
+        group_id = (
+            gids.get("annotation_group_id")
+            or gids.get("legend_group_id")
+            or gids.get("axis_group_id")
+            or gids.get("tick_group_id")
+            or gids.get("series_group_id")
+            or gids.get("cell_id")
+            or gids.get("table_row_group_id")
+            or item.get("descriptor_paragraph_id")
+            or item.get("descriptor_section_id")
+            or item.get("descriptor_region_id")
+            or item.get("source_block_id")
+            or item.get("text")
+        )
+        return (tclass, str(group_id or ""))
+
+    def _normalized_style_for_item(self, item):
+        style = dict(item.get("style") or {})
+        cache_key = self._item_typography_key(item)
+        cached = self._typography_group_cache.get(cache_key) or {}
+        font_name = str(style.get("font") or "").strip()
+        if cached.get("font") and not font_name:
+            style["font"] = cached["font"]
+        elif font_name and not cached.get("font"):
+            cached["font"] = font_name
+            self._typography_group_cache[cache_key] = cached
+        flags = style.get("flags") or {}
+        if cached.get("flags") and not flags:
+            style["flags"] = dict(cached["flags"])
+        elif flags and not cached.get("flags"):
+            cached["flags"] = dict(flags)
+            self._typography_group_cache[cache_key] = cached
+        return style
+
+    def _normalized_fontsize_for_item(self, item, style, bbox_h_pt, source):
+        raw_fs = self._get_original_fontsize(style, bbox_h_pt, source)
+        cache_key = self._item_typography_key(item)
+        cached = self._typography_group_cache.get(cache_key) or {}
+        if "font_size" not in cached:
+            cached["font_size"] = float(raw_fs)
+            self._typography_group_cache[cache_key] = cached
+            return float(raw_fs)
+        current = float(cached["font_size"])
+        tclass = str(item.get("descriptor_typographic_class") or "").strip().lower()
+        if tclass in {"editorial_body", "diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label", "figure_caption", "table_header_cell", "table_stub_cell", "table_value_cell"}:
+            return current
+        return current
 
     def _style_from_block(self, block):
         if not isinstance(block, dict):
@@ -170,6 +226,9 @@ class DocumentReconstructor:
                 else self._collect_forbidden_rects(page_data)
             )
             self._rendered_signatures = set()
+            self._restored_background_rects = {}
+            self._prepared_visual_groups = {}
+            self._typography_group_cache = {}
             if has_translated:
                 self._reconstruct_translated_anchored(doc, page, page_data, debug_store, forbidden_rects=forbidden_rects)
             elif self.native_first_mode and self._has_native_blocks(page_data):
@@ -436,6 +495,16 @@ class DocumentReconstructor:
         # should not push whole blocks down.
         rects = []
         page_role = str((page_data or {}).get("page_role", "")).strip().lower()
+        document_type = str((page_data or {}).get("document_type") or ((page_data or {}).get("layout") or {}).get("document_type") or "").strip().lower()
+        page_family = str((page_data or {}).get("page_family") or ((page_data or {}).get("layout") or {}).get("page_family") or "").strip().lower()
+        page_family_group = str((page_data or {}).get("page_family_group") or ((page_data or {}).get("layout") or {}).get("page_family_group") or page_family).strip().lower()
+        layout_type = str((page_data or {}).get("layout_type") or ((page_data or {}).get("layout") or {}).get("layout_type") or "").strip().lower()
+        page_case = (page_data or {}).get("page_case") or {}
+        fallback_policy = str(page_case.get("fallback_policy") or "").strip().lower()
+        mixed_like_page = (
+            layout_type in {"mixed_blocks", "annotated_page"}
+            and document_type not in {"scientific_paper", "book_page", "manual_guide"}
+        ) or page_family in {"mixed_page"} or page_family_group in {"mixed_page"} or fallback_policy == "safe_mixed"
         # NOTE: non_text_zones can be noisy and may overlap paragraph regions.
         # We intentionally ignore them in translated anchored mode.
         for im in page_data.get("images", []):
@@ -460,6 +529,16 @@ class DocumentReconstructor:
                 continue
             x0, y0, x1, y1 = [float(v) * self.pixel_to_point for v in bbox]
             rects.append(fitz.Rect(x0, y0, x1, y1))
+        if mixed_like_page:
+            for zone in page_data.get("non_text_zones", []) or []:
+                bbox = zone.get("bbox") if isinstance(zone, dict) else zone
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                area_px = max(0.0, float(bbox[2]) - float(bbox[0])) * max(0.0, float(bbox[3]) - float(bbox[1]))
+                if area_px < 5000:
+                    continue
+                x0, y0, x1, y1 = [float(v) * self.pixel_to_point for v in bbox]
+                rects.append(fitz.Rect(x0, y0, x1, y1))
         return rects
 
     def _save_style_audit_report(self, output_path):
@@ -619,30 +698,6 @@ class DocumentReconstructor:
             )
             self._append_debug_rects(debug_store, page, blue_rect, used_slots)
 
-        for item in header_items:
-            _, _, blue_rect, used_slots = self._render_block_slots(
-                page=page,
-                item=item,
-                anchor_y=max(top, min(item["bbox"].y0, header_bottom - 8.0)),
-                left=left,
-                right=right,
-                zone_top=top,
-                zone_bottom=max(top + 8.0, min(header_bottom, bottom)),
-            )
-            self._append_debug_rects(debug_store, page, blue_rect, used_slots)
-
-        for item in footer_items:
-            _, _, blue_rect, used_slots = self._render_block_slots(
-                page=page,
-                item=item,
-                anchor_y=max(top, min(item["bbox"].y0, bottom - 8.0)),
-                left=left,
-                right=right,
-                zone_top=max(top, min(footer_top, bottom - 8.0)),
-                zone_bottom=bottom,
-            )
-            self._append_debug_rects(debug_store, page, blue_rect, used_slots)
-
         for item in caption_items:
             _, _, blue_rect, used_slots = self._render_block_slots(
                 page=page,
@@ -657,7 +712,20 @@ class DocumentReconstructor:
 
         # Keep equations/formulas at original location to avoid reflow loss.
         for item in equation_items:
-            self._render_fixed_item(page, item)
+            if self._should_render_equation_as_anchored_text(item):
+                zone_top, zone_bottom = self._anchored_zone_bounds(item, top, bottom)
+                _, _, blue_rect, used_slots = self._render_block_slots(
+                    page=page,
+                    item=item,
+                    anchor_y=max(top, min(item["bbox"].y0, bottom - 8.0)),
+                    left=left,
+                    right=right,
+                    zone_top=zone_top,
+                    zone_bottom=zone_bottom,
+                )
+                self._append_debug_rects(debug_store, page, blue_rect, used_slots)
+            else:
+                self._render_fixed_item(page, item)
         for item in diagram_text_items:
             self._render_fixed_item(page, item)
 
@@ -717,6 +785,36 @@ class DocumentReconstructor:
                 page_forbidden = []
             cursor_y = min(body_bottom, last_bottom + max(4.0, item.get("slot_h_pt", 10.0) * 0.45))
 
+        for item in header_items:
+            descriptor_region_bbox = item.get("descriptor_region_bbox")
+            slot_h = max(8.0, float(item.get("slot_h_pt", 8.0) or 8.0))
+            header_zone_bottom = max(top + 8.0, min(header_bottom, bottom))
+            header_zone_bottom = max(header_zone_bottom, min(bottom, item["bbox"].y1 + max(10.0, slot_h * 2.0)))
+            if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+                header_zone_bottom = max(header_zone_bottom, min(bottom, descriptor_region_bbox.y1))
+            _, _, blue_rect, used_slots = self._render_block_slots(
+                page=page,
+                item=item,
+                anchor_y=max(top, min(item["bbox"].y0, header_bottom - 8.0)),
+                left=left,
+                right=right,
+                zone_top=top,
+                zone_bottom=header_zone_bottom,
+            )
+            self._append_debug_rects(debug_store, page, blue_rect, used_slots)
+
+        for item in footer_items:
+            _, _, blue_rect, used_slots = self._render_block_slots(
+                page=page,
+                item=item,
+                anchor_y=max(top, min(item["bbox"].y0, bottom - 8.0)),
+                left=left,
+                right=right,
+                zone_top=max(top, min(footer_top, bottom - 8.0)),
+                zone_bottom=bottom,
+            )
+            self._append_debug_rects(debug_store, page, blue_rect, used_slots)
+
     def _reconstruct_translated_anchored(self, doc, first_page, page_data, debug_store=None, forbidden_rects=None):
         items = self._extract_block_slot_items(page_data)
         if not items:
@@ -733,7 +831,12 @@ class DocumentReconstructor:
         left = page.rect.x0 + 2.0
         right = page.rect.x1 - 2.0
         page_family = str(page_data.get("page_family") or ((page_data.get("layout") or {}).get("page_family")) or "").strip().lower()
-        anchored_figure_page = page_family in {"body_with_figure", "body_with_diagram"}
+        layout_type = str(page_data.get("layout_type") or ((page_data.get("layout") or {}).get("layout_type")) or "").strip().lower()
+        document_type = str(page_data.get("document_type") or ((page_data.get("layout") or {}).get("document_type")) or "").strip().lower()
+        anchored_figure_page = (
+            layout_type in {"annotated_page", "table_dominant", "image_dominant", "mixed_blocks"}
+            and document_type not in {"scientific_paper", "book_page", "manual_guide"}
+        ) or page_family in {"body_with_figure", "body_with_diagram", "mixed_page", "table_page"}
 
         # --- layout.v2 TOC fast path ---
         if isinstance(page_data, dict) and page_data.get("schema_version") == "layout.v2":
@@ -772,13 +875,60 @@ class DocumentReconstructor:
             or it.get("is_diagram_label")
             or (anchored_figure_page and it.get("role") == "title")
         ]
+        late_fixed_roles = {"header", "footer"}
+        early_fixed_items = [it for it in fixed_items if it.get("role") not in late_fixed_roles]
+        late_fixed_items = [it for it in fixed_items if it.get("role") in late_fixed_roles]
         toc_mode = self._looks_like_toc_page(page_data)
         anchored_slot_roles = {"header", "footer", "figure_caption", "section_heading"}
         if anchored_figure_page:
             anchored_slot_roles.update({"title", "diagram_text_label"})
 
+        visual_groups, non_group_items = self._group_visual_items(items)
+
         # Render fixed/sensitive items first at source location.
-        for item in fixed_items:
+        for group in visual_groups:
+            page = doc[root_page_index]
+            group_items = self._dedupe_visual_group_items(group.get("items") or [])
+            if not group_items:
+                continue
+            group_bbox = group.get("bbox")
+            group_left = max(left, group_bbox.x0) if isinstance(group_bbox, fitz.Rect) else left
+            group_right = min(right, group_bbox.x1) if isinstance(group_bbox, fitz.Rect) else right
+            group_top = max(top, group_bbox.y0) if isinstance(group_bbox, fitz.Rect) else top
+            group_bottom = min(bottom, group_bbox.y1) if isinstance(group_bbox, fitz.Rect) else bottom
+            local_forbidden = []
+            for item in group_items:
+                blue_rect = None
+                used_slots = []
+                zone_top, zone_bottom = self._anchored_zone_bounds(item, group_top, group_bottom)
+                if isinstance(group_bbox, fitz.Rect) and group_bbox.get_area() > 0:
+                    relative_y = max(0.0, item["bbox"].y0 - group_bbox.y0)
+                    group_anchor_y = max(zone_top, min(zone_bottom - 8.0, group_top + relative_y))
+                else:
+                    group_anchor_y = max(top, min(item["bbox"].y0, bottom - 8.0))
+                _, _, blue_rect, used_slots = self._render_block_slots(
+                    page=page,
+                    item=item,
+                    anchor_y=group_anchor_y,
+                    left=group_left,
+                    right=group_right,
+                    zone_top=zone_top,
+                    zone_bottom=zone_bottom,
+                    forbidden_rects=local_forbidden,
+                )
+                self._append_debug_rects(debug_store, page, blue_rect, used_slots)
+                for used in used_slots or []:
+                    if isinstance(used, fitz.Rect) and used.get_area() > 0:
+                        local_forbidden.append(fitz.Rect(used))
+                if isinstance(blue_rect, fitz.Rect) and blue_rect.get_area() > 0:
+                    local_forbidden.append(fitz.Rect(blue_rect))
+
+        grouped_ids = {id(it) for group in visual_groups for it in (group.get("items") or [])}
+        early_fixed_items = [it for it in early_fixed_items if id(it) not in grouped_ids]
+        late_fixed_items = [it for it in late_fixed_items if id(it) not in grouped_ids]
+        body_items = [it for it in body_items if id(it) not in grouped_ids]
+
+        for item in early_fixed_items:
             blue_rect = None
             used_slots = []
             toc_like_fixed = bool(
@@ -797,15 +947,20 @@ class DocumentReconstructor:
                     zone_bottom=min(bottom, item["bbox"].y1 + max(12.0, item.get("slot_h_pt", 8.0) * 1.4)),
                     forbidden_rects=page_forbidden,
                 )
-            elif item.get("role") in anchored_slot_roles or (anchored_figure_page and item.get("is_diagram_label")):
+            elif (
+                item.get("role") in anchored_slot_roles
+                or self._should_render_equation_as_anchored_text(item)
+                or (anchored_figure_page and item.get("is_diagram_label"))
+            ):
+                zone_top, zone_bottom = self._anchored_zone_bounds(item, top, bottom)
                 _, _, blue_rect, used_slots = self._render_block_slots(
                     page=page,
                     item=item,
                     anchor_y=max(top, min(item["bbox"].y0, bottom - 8.0)),
                     left=left,
                     right=right,
-                    zone_top=max(top, item["bbox"].y0 - max(4.0, item.get("slot_h_pt", 8.0) * 0.6)),
-                    zone_bottom=min(bottom, item["bbox"].y1 + max(8.0, item.get("slot_h_pt", 8.0) * 1.2)),
+                    zone_top=zone_top,
+                    zone_bottom=zone_bottom,
                     forbidden_rects=page_forbidden,
                 )
                 self._append_debug_rects(debug_store, page, blue_rect, used_slots)
@@ -815,7 +970,10 @@ class DocumentReconstructor:
             add_forbidden = bool(
                 item.get("is_diagram_label")
                 or item.get("role") in anchored_slot_roles
+                or self._should_render_equation_as_anchored_text(item)
             )
+            if self._is_visual_group_item(item):
+                add_forbidden = False
             if add_forbidden and isinstance(bb, fitz.Rect) and bb.get_area() > 0:
                 page_forbidden.append(fitz.Rect(bb))
             if add_forbidden:
@@ -858,6 +1016,16 @@ class DocumentReconstructor:
             # Adding pages can invalidate previously held page handles in PyMuPDF.
             # Always refresh the root/source page before rendering the next block.
             page = doc[root_page_index]
+            descriptor_region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+            role = str(item.get("role") or "").strip().lower()
+            editorial_text_locked = bool(
+                role == "body"
+                and descriptor_region_type == "text"
+                and item.get("translated_block")
+                and item.get("strict_bbox_mode")
+                and layout_type == "double_column"
+                and document_type in {"manual_guide", "book_page", "scientific_paper"}
+            )
             if (not item.get("paragraph_flow_mode")) and item.get("preserve_linebreaks") and item.get("use_structured_source_lines"):
                 src_lines = [
                     self._clean_text_for_render(x).strip()
@@ -876,12 +1044,16 @@ class DocumentReconstructor:
                 # Strict block conformance requested by user:
                 # translated paragraph must stay inside its source block bbox.
                 next_y = min(bottom, float(item["bbox"].y1) + max(1.0, item.get("slot_h_pt", 8.0) * 0.1))
+            elif editorial_text_locked:
+                next_y = min(bottom, float(item["bbox"].y1) + 1.0)
             elif item.get("strict_bbox_mode") and not item.get("translated_block"):
                 next_y = min(bottom, float(item["bbox"].y1) + 1.0)
             else:
                 next_y = bottom
             if item.get("paragraph_flow_mode"):
                 # Strict anchor: keep original vertical start for translated paragraph blocks.
+                anchor_y = max(top, float(item["bbox"].y0))
+            elif editorial_text_locked:
                 anchor_y = max(top, float(item["bbox"].y0))
             elif item.get("strict_bbox_mode") and not item.get("translated_block"):
                 anchor_y = max(top, float(item["bbox"].y0))
@@ -897,7 +1069,7 @@ class DocumentReconstructor:
                 )
             # Dry-run to avoid placing a translated block over already rendered zones.
             # We simulate wrapping with the current anchor and push downward if needed.
-            if (not item.get("paragraph_flow_mode")) and not (item.get("strict_bbox_mode") and not item.get("translated_block")):
+            if (not editorial_text_locked) and (not item.get("paragraph_flow_mode")) and not (item.get("strict_bbox_mode") and not item.get("translated_block")):
                 for _ in range(8):
                     _, _, probe_blue, _ = self._render_block_slots(
                         page=page,
@@ -951,11 +1123,12 @@ class DocumentReconstructor:
                     forbidden_rects=page_forbidden,
                 )
             self._append_debug_rects(debug_store, page, blue_rect, used_slots)
-            for used in used_slots or []:
-                if isinstance(used, fitz.Rect) and used.get_area() > 0:
-                    page_forbidden.append(fitz.Rect(used))
-            if blue_rect is not None:
-                page_forbidden.append(fitz.Rect(blue_rect))
+            if not self._is_visual_group_item(item):
+                for used in used_slots or []:
+                    if isinstance(used, fitz.Rect) and used.get_area() > 0:
+                        page_forbidden.append(fitz.Rect(used))
+                if blue_rect is not None:
+                    page_forbidden.append(fitz.Rect(blue_rect))
 
             # Overflow continuation pages: keep next source blocks anchored on page 1.
             if remaining and self._should_paginate_on_overflow() and not item.get("strict_bbox_mode"):
@@ -989,6 +1162,28 @@ class DocumentReconstructor:
                     f_left = flow_page.rect.x0 + 2.0
                     f_right = flow_page.rect.x1 - 2.0
                     flow_anchor = f_top
+
+        for item in late_fixed_items:
+            page = doc[root_page_index]
+            blue_rect = None
+            used_slots = []
+            if item.get("role") in anchored_slot_roles:
+                zone_top, zone_bottom = self._anchored_zone_bounds(item, top, bottom)
+                _, _, blue_rect, used_slots = self._render_block_slots(
+                    page=page,
+                    item=item,
+                    anchor_y=max(top, min(item["bbox"].y0, bottom - 8.0)),
+                    left=left,
+                    right=right,
+                    zone_top=zone_top,
+                    zone_bottom=zone_bottom,
+                    forbidden_rects=page_forbidden,
+                )
+                self._append_debug_rects(debug_store, page, blue_rect, used_slots)
+                if (not self._is_visual_group_item(item)) and isinstance(blue_rect, fitz.Rect) and blue_rect.get_area() > 0:
+                    page_forbidden.append(fitz.Rect(blue_rect))
+            else:
+                self._render_fixed_item(page, item)
 
     def _render_toc_rows_v2(self, page, rows, tab_stops, zone_top, zone_bottom, left, right):
         """
@@ -1285,7 +1480,7 @@ class DocumentReconstructor:
         text = self._clean_text_for_render(item.get("text", "")).strip()
         if not text:
             return
-        style = item.get("style", {}) or {}
+        style = self._normalized_style_for_item(item)
         source = item.get("source", "ocr")
         bbox = item.get("bbox")
         if not isinstance(bbox, fitz.Rect):
@@ -1294,15 +1489,424 @@ class DocumentReconstructor:
         fontfile = resolved.get("fontfile")
         builtin = resolved.get("builtin")
         fontname = self._resolve_page_fontname(page, fontfile, builtin)
-        fs = self._get_original_fontsize(style, max(1.0, bbox.height), source)
+        fs = self._normalized_fontsize_for_item(item, style, max(1.0, bbox.height), source)
+        region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+        role = str(item.get("role") or "").strip().lower()
+        typographic_class = str(item.get("descriptor_typographic_class") or "").strip().lower()
+        if role == "header":
+            fs = max(fs, 8.8)
+        elif role in {"title", "section_heading"} or region_type in {"annotation_band", "caption_band", "header_band"}:
+            fs = max(fs, 8.2)
+        if typographic_class in {"diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label"}:
+            fs = max(fs, 7.4)
         try:
             c = style.get("color", "#000000").lstrip("#")
             rgb = tuple(int(c[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
         except Exception:
             rgb = (0, 0, 0)
+        max_w = max(8.0, bbox.width)
+        line_w = self._measure_text_width(text, fs, fontname, fontfile)
+        if line_w > max_w and not self.fixed_font_size:
+            min_fs = max(5.5, min(fs, 7.0))
+            while line_w > max_w and fs > min_fs + 1e-6:
+                fs = max(min_fs, fs - 0.2)
+                line_w = self._measure_text_width(text, fs, fontname, fontfile)
+        align = self._normalize_alignment(item.get("alignment", "left"))
+        draw_x = bbox.x0
+        if align == "center" and line_w < bbox.width:
+            draw_x = bbox.x0 + (bbox.width - line_w) / 2.0
+        elif align == "right" and line_w < bbox.width:
+            draw_x = bbox.x1 - line_w
         br = self._baseline_ratio(style, fs)
         baseline = bbox.y0 + min(max(1.0, fs * br), max(1.0, bbox.height - 0.6))
-        self._safe_insert_text_dedup(page, (bbox.x0, baseline), text, fs, fontname, rgb)
+        if self._should_whiteout_before_render(item):
+            self._whiteout_rect(page, bbox)
+        elif self._should_restore_background_before_render(item):
+            self._restore_background_rect(page, item, bbox, kind="fixed_visual_text_bg_restore")
+        self._safe_insert_text_dedup(page, (draw_x, baseline), text, fs, fontname, rgb)
+
+    def _should_whiteout_before_render(self, item):
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("source") or "").strip().lower() != "native":
+            return False
+        if self._should_whiteout_per_line(item):
+            return False
+        if self._should_restore_background_before_render(item):
+            return False
+        source_text = self._clean_text_for_render(item.get("source_text", "")).strip()
+        rendered_text = self._clean_text_for_render(item.get("text", "")).strip()
+        if not source_text or not rendered_text:
+            return False
+        if source_text == rendered_text:
+            return False
+        role = str(item.get("role") or "").strip().lower()
+        region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+        if role in {"title", "section_heading", "header", "figure_caption", "diagram_label", "diagram_text_label"}:
+            return True
+        if region_type in {"annotation_band", "caption_band", "header_band", "table_cell", "table_row"}:
+            return True
+        return bool(item.get("translated_block"))
+
+    def _should_whiteout_per_line(self, item):
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("source") or "").strip().lower() != "native":
+            return False
+        if self._should_restore_background_before_render(item):
+            return False
+        source_text = self._clean_text_for_render(item.get("source_text", "")).strip()
+        rendered_text = self._clean_text_for_render(item.get("text", "")).strip()
+        if not source_text or not rendered_text or source_text == rendered_text:
+            return False
+        role = str(item.get("role") or "").strip().lower()
+        structural_role = str(item.get("descriptor_structural_role") or "").strip().lower()
+        band_role = str(item.get("descriptor_band_role") or "").strip().lower()
+        if role == "body" and band_role == "text_band":
+            return True
+        if structural_role in {"opening_paragraph", "body_paragraph", "continuation_paragraph"}:
+            return True
+        return False
+
+    def _should_restore_background_before_render(self, item):
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("source") or "").strip().lower() != "native":
+            return False
+        source_text = self._clean_text_for_render(item.get("source_text", "")).strip()
+        rendered_text = self._clean_text_for_render(item.get("text", "")).strip()
+        if not source_text or not rendered_text or source_text == rendered_text:
+            return False
+        visual_text = item.get("descriptor_visual_text") or {}
+        text_embedding_mode = str(visual_text.get("text_embedding_mode") or "").strip().lower()
+        replacement_strategy = str(visual_text.get("background_replacement_strategy") or "").strip().lower()
+        band_role = str(item.get("descriptor_band_role") or "").strip().lower()
+        structural_role = str(item.get("descriptor_structural_role") or "").strip().lower()
+        attachment_target_id = str(item.get("descriptor_attachment_target_id") or "").strip().lower()
+        region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+        ai_region_type = str(item.get("descriptor_ai_region_type") or "").strip().lower()
+        if replacement_strategy in {"crop_restore", "text_erase_then_overlay"}:
+            return True
+        if text_embedding_mode == "embedded_in_visual":
+            return True
+        if band_role in {"annotation_band", "legend_band", "axis_band"}:
+            return True
+        if structural_role in {"diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label"}:
+            return True
+        if attachment_target_id in {"illustration_main", "chart_main"}:
+            return True
+        if region_type in {"annotation_band", "chart_area", "chart_plot_area", "chart_x_axis", "chart_y_axis", "chart_x_ticks", "chart_y_ticks", "chart_legend"}:
+            return True
+        if ai_region_type in {"image", "chart", "figure"}:
+            return True
+        return False
+
+    def _estimate_patch_fill_rgb(self, crop, inner_rect):
+        if crop is None:
+            return (255, 255, 255)
+        x0, y0, x1, y1 = [int(v) for v in inner_rect]
+        w, h = crop.size
+        samples = []
+        pad = 2
+        rx0 = max(0, x0 - pad)
+        ry0 = max(0, y0 - pad)
+        rx1 = min(w, x1 + pad)
+        ry1 = min(h, y1 + pad)
+        px = crop.load()
+        for yy in range(ry0, ry1):
+            for xx in range(rx0, rx1):
+                if x0 <= xx < x1 and y0 <= yy < y1:
+                    continue
+                samples.append(px[xx, yy])
+        if not samples:
+            samples = list(crop.getdata())
+        if not samples:
+            return (255, 255, 255)
+        channels = list(zip(*samples))
+        return tuple(int(sum(ch) / max(1, len(ch))) for ch in channels[:3])
+
+    def _estimate_local_background_image(self, crop, inner_rect):
+        if crop is None:
+            return None
+        x0, y0, x1, y1 = [int(v) for v in inner_rect]
+        inner_w = max(1, x1 - x0)
+        inner_h = max(1, y1 - y0)
+        candidates = []
+        if y0 > 0:
+            candidates.append(crop.crop((x0, 0, x1, y0)))
+        if y1 < crop.height:
+            candidates.append(crop.crop((x0, y1, x1, crop.height)))
+        if x0 > 0:
+            candidates.append(crop.crop((0, y0, x0, y1)))
+        if x1 < crop.width:
+            candidates.append(crop.crop((x1, y0, crop.width, y1)))
+        patches = []
+        for cand in candidates:
+            if cand.width <= 0 or cand.height <= 0:
+                continue
+            patches.append(cand.resize((inner_w, inner_h)))
+        if not patches:
+            fill_rgb = self._estimate_patch_fill_rgb(crop, inner_rect)
+            patch = Image.new("RGB", (inner_w, inner_h), fill_rgb)
+            return patch
+        patch = patches[0]
+        for extra in patches[1:]:
+            patch = Image.blend(patch, extra, 0.5)
+        return patch
+
+    def _save_text_erased_overlay(self, page_data, bbox, kind="visual_text_erase"):
+        source_img = page_data.get("source_image_path")
+        if not source_img or not os.path.exists(source_img):
+            return None
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+        try:
+            x0, y0, x1, y1 = [int(round(float(v))) for v in bbox]
+            pad = max(2, int(self.dynamic_overlay_pad_px) + 2)
+            with Image.open(source_img).convert("RGB") as im:
+                crop_x0 = max(0, x0 - pad)
+                crop_y0 = max(0, y0 - pad)
+                crop_x1 = min(im.width, x1 + pad)
+                crop_y1 = min(im.height, y1 + pad)
+                if crop_x1 <= crop_x0 or crop_y1 <= crop_y0:
+                    return None
+                crop = im.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+                inner = (
+                    max(0, x0 - crop_x0),
+                    max(0, y0 - crop_y0),
+                    min(crop.width, x1 - crop_x0),
+                    min(crop.height, y1 - crop_y0),
+                )
+                patch = self._estimate_local_background_image(crop, inner)
+                if patch is None:
+                    fill_rgb = self._estimate_patch_fill_rgb(crop, inner)
+                    patch = Image.new("RGB", (max(1, inner[2] - inner[0]), max(1, inner[3] - inner[1])), fill_rgb)
+                crop.paste(patch, (inner[0], inner[1]))
+                out_dir = os.path.dirname(page_data.get("background_path", "")) or "ocr_results"
+                os.makedirs(out_dir, exist_ok=True)
+                out_name = f"dynamic_overlay_{kind}_{uuid.uuid4().hex[:12]}.png"
+                out_path = os.path.join(out_dir, out_name)
+                crop.save(out_path)
+                return {"path": out_path, "bbox": [crop_x0, crop_y0, crop_x1, crop_y1], "kind": kind}
+        except Exception:
+            return None
+
+    def _restore_background_rect(self, page, item, rect, kind="background_restore"):
+        if not isinstance(item, dict):
+            return False
+        page_data = item.get("page_data")
+        if not isinstance(page_data, dict):
+            return False
+        try:
+            visual_text = item.get("descriptor_visual_text") or {}
+            replacement_strategy = str(visual_text.get("background_replacement_strategy") or "").strip().lower()
+            if replacement_strategy == "text_erase_then_overlay":
+                rect = self._expanded_visual_erase_rect(item, fitz.Rect(rect))
+                rect = self._clamp_rect_to_page(rect, page.rect)
+            bbox_px = [
+                rect.x0 / self.pixel_to_point,
+                rect.y0 / self.pixel_to_point,
+                rect.x1 / self.pixel_to_point,
+                rect.y1 / self.pixel_to_point,
+            ]
+            if replacement_strategy == "text_erase_then_overlay":
+                ov = self._save_text_erased_overlay(page_data, bbox_px, kind=kind)
+            else:
+                ov = self._save_crop_overlay(page_data, bbox_px, kind=kind)
+            if not ov or not os.path.exists(ov.get("path", "")):
+                return False
+            x0, y0, x1, y1 = [float(v) * self.pixel_to_point for v in ov["bbox"]]
+            restore_rect = fitz.Rect(x0, y0, x1, y1)
+            restore_rect = self._clamp_rect_to_page(restore_rect, page.rect)
+            if restore_rect.get_area() <= 0:
+                return False
+            page_idx = int(getattr(page, "number", 0) or 0)
+            prior_rects = self._restored_background_rects.setdefault(page_idx, [])
+            for prev in prior_rects:
+                inter = restore_rect & prev
+                if inter.get_area() <= 0:
+                    continue
+                overlap_ratio = inter.get_area() / max(1.0, min(restore_rect.get_area(), prev.get_area()))
+                if overlap_ratio >= 0.25:
+                    return False
+            page.insert_image(restore_rect, filename=ov["path"], overlay=True, keep_proportion=False)
+            prior_rects.append(fitz.Rect(restore_rect))
+            return True
+        except Exception:
+            return False
+
+    def _visual_group_key(self, page, item):
+        if not isinstance(item, dict):
+            return None
+        mode = str(item.get("descriptor_group_render_mode") or "").strip().lower()
+        if mode not in {"annotation_group", "chart_legend_group", "chart_axis_group", "chart_series_group"}:
+            return None
+        gids = item.get("descriptor_group_ids") or {}
+        group_id = (
+            gids.get("annotation_group_id")
+            or gids.get("legend_group_id")
+            or gids.get("axis_group_id")
+            or gids.get("tick_group_id")
+            or gids.get("series_group_id")
+        )
+        if not group_id:
+            return None
+        return (int(getattr(page, "number", 0) or 0), mode, str(group_id))
+
+    def _fitz_rect_from_pixels(self, bbox_like):
+        if isinstance(bbox_like, fitz.Rect):
+            return fitz.Rect(bbox_like)
+        if not isinstance(bbox_like, (list, tuple)) or len(bbox_like) != 4:
+            return None
+        try:
+            return fitz.Rect(
+                float(bbox_like[0]) * self.pixel_to_point,
+                float(bbox_like[1]) * self.pixel_to_point,
+                float(bbox_like[2]) * self.pixel_to_point,
+                float(bbox_like[3]) * self.pixel_to_point,
+            )
+        except Exception:
+            return None
+
+    def _expanded_visual_erase_rect(self, item, rect):
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return rect
+        result = fitz.Rect(rect)
+        visual_obj = item.get("descriptor_visual_text_object") or {}
+        obj_rect = self._fitz_rect_from_pixels(visual_obj.get("bbox"))
+        if isinstance(obj_rect, fitz.Rect) and obj_rect.get_area() > 0:
+            result = result | obj_rect
+        visual_text = item.get("descriptor_visual_text") or {}
+        if str(visual_text.get("background_replacement_strategy") or "").strip().lower() != "text_erase_then_overlay":
+            return result
+        priority = str(visual_obj.get("visual_priority") or "").strip().lower()
+        pad_x = max(1.5, min(7.0, result.height * 0.30))
+        pad_y = max(1.2, min(5.5, result.height * 0.22))
+        if priority == "primary":
+            pad_x += 1.0
+            pad_y += 0.8
+        return fitz.Rect(result.x0 - pad_x, result.y0 - pad_y, result.x1 + pad_x, result.y1 + pad_y)
+
+    def _visual_text_group_bbox(self, item):
+        if not isinstance(item, dict):
+            return None
+        visual_group = item.get("descriptor_visual_text_group") or {}
+        rect = self._fitz_rect_from_pixels(visual_group.get("bbox"))
+        if isinstance(rect, fitz.Rect) and rect.get_area() > 0:
+            return rect
+        visual_obj = item.get("descriptor_visual_text_object") or {}
+        rect = self._fitz_rect_from_pixels(visual_obj.get("bbox"))
+        if isinstance(rect, fitz.Rect) and rect.get_area() > 0:
+            return rect
+        return None
+
+    def _prepare_visual_group_background(self, page, item, group_rect):
+        key = self._visual_group_key(page, item)
+        if key is None:
+            return False
+        if key in self._prepared_visual_groups:
+            return False
+        ok = self._restore_background_rect(page, item, group_rect, kind=f"{key[1]}_group_bg_restore")
+        self._prepared_visual_groups[key] = bool(ok)
+        return bool(ok)
+
+    def _is_visual_group_item(self, item):
+        if not isinstance(item, dict):
+            return False
+        mode = str(item.get("descriptor_group_render_mode") or "").strip().lower()
+        return mode in {"annotation_group", "chart_legend_group", "chart_axis_group", "chart_series_group"}
+
+    def _group_visual_items(self, items):
+        grouped = {}
+        passthrough = []
+        for item in items or []:
+            if not self._is_visual_group_item(item):
+                passthrough.append(item)
+                continue
+            gids = item.get("descriptor_group_ids") or {}
+            mode = str(item.get("descriptor_group_render_mode") or "").strip().lower()
+            group_id = (
+                gids.get("annotation_group_id")
+                or gids.get("legend_group_id")
+                or gids.get("axis_group_id")
+                or gids.get("tick_group_id")
+                or gids.get("series_group_id")
+            )
+            if not group_id:
+                passthrough.append(item)
+                continue
+            key = (mode, str(group_id))
+            grouped.setdefault(key, []).append(item)
+        ordered_groups = []
+        for key, members in grouped.items():
+            members = sorted(members, key=lambda it: (it["bbox"].y0, it["bbox"].x0))
+            preferred_bbox = None
+            for member in members:
+                preferred_bbox = self._visual_text_group_bbox(member)
+                if isinstance(preferred_bbox, fitz.Rect) and preferred_bbox.get_area() > 0:
+                    break
+            ordered_groups.append(
+                {
+                    "mode": key[0],
+                    "id": key[1],
+                    "items": members,
+                    "bbox": preferred_bbox if isinstance(preferred_bbox, fitz.Rect) and preferred_bbox.get_area() > 0 else fitz.Rect(
+                        min(it["bbox"].x0 for it in members),
+                        min(it["bbox"].y0 for it in members),
+                        max(it["bbox"].x1 for it in members),
+                        max(it["bbox"].y1 for it in members),
+                    ),
+                }
+            )
+        ordered_groups.sort(key=lambda g: (g["bbox"].y0, g["bbox"].x0))
+        passthrough.sort(key=lambda it: (it["bbox"].y0, it["bbox"].x0))
+        return ordered_groups, passthrough
+
+    def _visual_group_role_priority(self, item):
+        structural_role = str(item.get("descriptor_structural_role") or "").strip().lower()
+        role = str(item.get("role") or "").strip().lower()
+        if structural_role in {"figure_title", "chart_title"} or role == "title":
+            return 0
+        if role in {"section_heading", "header"}:
+            return 1
+        if structural_role in {"diagram_label", "chart_axis_label"}:
+            return 2
+        if structural_role in {"chart_legend_label", "chart_series_label"}:
+            return 3
+        if structural_role in {"chart_tick_label"}:
+            return 4
+        return 5
+
+    def _dedupe_visual_group_items(self, items):
+        kept = []
+        for item in sorted(items or [], key=lambda it: (self._visual_group_role_priority(it), it["bbox"].y0, it["bbox"].x0)):
+            text = self._clean_text_for_render(item.get("text", "")).strip().lower()
+            if not text:
+                kept.append(item)
+                continue
+            duplicate = False
+            for prev in kept:
+                prev_text = self._clean_text_for_render(prev.get("text", "")).strip().lower()
+                if prev_text != text:
+                    continue
+                inter = (item["bbox"] & prev["bbox"]).get_area()
+                close = abs(item["bbox"].x0 - prev["bbox"].x0) <= 24.0 and abs(item["bbox"].y0 - prev["bbox"].y0) <= 24.0
+                overlap_ratio = inter / max(1.0, min(item["bbox"].get_area(), prev["bbox"].get_area()))
+                if overlap_ratio >= 0.35 or close:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(item)
+        return sorted(kept, key=lambda it: (self._visual_group_role_priority(it), it["bbox"].y0, it["bbox"].x0))
+
+    def _whiteout_rect(self, page, rect, pad_x=1.5, pad_y=0.8):
+        try:
+            wipe = fitz.Rect(rect.x0 - pad_x, rect.y0 - pad_y, rect.x1 + pad_x, rect.y1 + pad_y)
+            wipe = self._clamp_rect_to_page(wipe, page.rect)
+            if wipe.get_area() > 0:
+                page.draw_rect(wipe, color=None, fill=(1, 1, 1), overlay=True)
+        except Exception:
+            return
 
     def _has_native_blocks(self, page_data):
         for b in page_data.get("blocks", []):
@@ -1320,6 +1924,19 @@ class DocumentReconstructor:
         block_preferred_text = re.sub(r"\s+", " ", (block.get("translated_text") or "").strip())
         return block_preferred_text or re.sub(r"\s+", " ", " ".join(text_parts)).strip()
 
+    def _get_block_source_text(self, block):
+        text_parts = []
+        for line in block.get("lines", []):
+            line_src = self._clean_text_for_render(line.get("line_text", "")).strip()
+            if line_src:
+                text_parts.append(line_src)
+                continue
+            for phrase in line.get("phrases", []):
+                src = self._clean_text_for_render(phrase.get("texte", "")).strip()
+                if src:
+                    text_parts.append(src)
+        return re.sub(r"\s+", " ", " ".join(text_parts)).strip()
+
     def _is_symbol_heavy_text(self, text):
         s = text or ""
         if not s:
@@ -1331,6 +1948,66 @@ class DocumentReconstructor:
         if symbols >= 3 and symbols >= max(2, int(0.25 * max(1, letters + symbols))):
             return True
         return False
+
+    def _is_reference_like_text(self, text):
+        s = self._clean_text_for_render(text)
+        if not s:
+            return False
+        if re.fullmatch(r"\(?\d+(?:\.\d+){1,4}\)?", s):
+            return True
+        if re.fullmatch(r"\((\d+|[ivxlcdm]+|[a-z])\)", s, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"\[\d+([,\-\s]*\d+)*\]", s):
+            return True
+        return False
+
+    def _should_render_equation_as_anchored_text(self, item):
+        if not isinstance(item, dict):
+            return False
+        if (item.get("role") or "").lower() != "equation_inline":
+            return False
+        text = self._clean_text_for_render(item.get("text", ""))
+        if not text:
+            return False
+        if self._is_reference_like_text(text):
+            return True
+        if self._is_symbol_heavy_text(text):
+            return False
+        if re.search(r"\b[a-zA-Z]\s*/\s*[a-zA-Z]\b", text):
+            return False
+        if re.search(r"\b[dD][A-Za-z]\s*/\s*d[A-Za-z]\b", text):
+            return False
+        words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", text)
+        return len(words) >= 1
+
+    def _anchored_zone_bounds(self, item, top, bottom):
+        bbox = item.get("bbox")
+        if not isinstance(bbox, fitz.Rect):
+            return max(top, 0.0), min(bottom, bottom)
+        descriptor_region_bbox = item.get("descriptor_region_bbox")
+        role = str(item.get("role") or "").strip().lower()
+        slot_h = max(8.0, float(item.get("slot_h_pt", 8.0) or 8.0))
+        source_lines = [x for x in (item.get("source_lines") or []) if str(x).strip()]
+        translated_multiline = bool(
+            item.get("translated_block")
+            and item.get("preserve_linebreaks")
+            and len(source_lines) >= 2
+        )
+        zone_top = max(top, bbox.y0 - max(4.0, slot_h * 0.6))
+        extra = max(8.0, slot_h * 1.2)
+        if translated_multiline:
+            extra = max(extra, slot_h * (len(source_lines) + 1.6))
+        if role in {"header", "footer"}:
+            extra = max(extra, slot_h * 2.2)
+        zone_bottom = min(bottom, bbox.y1 + extra)
+        if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            if role in {"header", "footer"}:
+                zone_top = max(top, min(zone_top, descriptor_region_bbox.y0))
+                zone_bottom = min(bottom, max(zone_bottom, descriptor_region_bbox.y1, bbox.y1 + extra))
+            else:
+                zone_top = max(zone_top, descriptor_region_bbox.y0)
+                zone_bottom = min(zone_bottom, max(zone_top + 6.0, descriptor_region_bbox.y1))
+        return zone_top, zone_bottom
 
     def _overlay_exists(self, overlays, bbox):
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -1348,6 +2025,63 @@ class DocumentReconstructor:
             if ratio >= 0.95:
                 return True
         return False
+
+    def _layout_descriptor_maps(self, page_data):
+        descriptor = (page_data or {}).get("layout_descriptor")
+        if not isinstance(descriptor, dict):
+            descriptor = ((page_data or {}).get("layout") or {}).get("layout_descriptor")
+        if not isinstance(descriptor, dict):
+            return {}, {}, {}, {}, {}, {}, {}, {}, {}
+        elements = descriptor.get("elements") or []
+        groups = descriptor.get("groups") or []
+        regions = descriptor.get("regions") or []
+        constraints = descriptor.get("constraints") or []
+        relations = descriptor.get("relations") or []
+        page_organization = descriptor.get("page_organization") or {}
+        reconstruction_plan = descriptor.get("reconstruction_plan") or {}
+        visual_text_model = descriptor.get("visual_text_model") or {}
+        element_map = {str(el.get("id")): el for el in elements if isinstance(el, dict) and el.get("id")}
+        group_map = {str(gr.get("id")): gr for gr in groups if isinstance(gr, dict) and gr.get("id")}
+        region_map = {str(rg.get("id")): rg for rg in regions if isinstance(rg, dict) and rg.get("id")}
+        visual_object_map = {}
+        for obj in visual_text_model.get("objects") or []:
+            if not isinstance(obj, dict):
+                continue
+            source_element_id = str(obj.get("source_element_id") or "")
+            if source_element_id:
+                visual_object_map[source_element_id] = obj
+        visual_group_map = {
+            str(gr.get("id")): gr
+            for gr in (visual_text_model.get("groups") or [])
+            if isinstance(gr, dict) and gr.get("id")
+        }
+        constraint_map = {}
+        for constraint in constraints:
+            if not isinstance(constraint, dict):
+                continue
+            element_id = str(constraint.get("element_id") or "")
+            if not element_id:
+                continue
+            constraint_map.setdefault(element_id, []).append(constraint)
+        relation_map = {}
+        for relation in relations:
+            if not isinstance(relation, dict):
+                continue
+            source_id = str(relation.get("source_id") or "")
+            if not source_id:
+                continue
+            relation_map.setdefault(source_id, []).append(relation)
+        return (
+            element_map,
+            group_map,
+            region_map,
+            constraint_map,
+            relation_map,
+            page_organization,
+            reconstruction_plan,
+            visual_object_map,
+            visual_group_map,
+        )
 
     def _save_crop_overlay(self, page_data, bbox, kind="dynamic"):
         source_img = page_data.get("source_image_path")
@@ -1500,7 +2234,12 @@ class DocumentReconstructor:
         dims = page_data.get("dimensions", {}) or {}
         page_h_px = float(dims.get("height", 0.0) or 0.0)
         page_family = str(page_data.get("page_family") or ((page_data.get("layout") or {}).get("page_family")) or "").strip().lower()
-        figure_like_page = page_family in {"body_with_figure", "body_with_diagram", "mixed_page"}
+        layout_type = str(page_data.get("layout_type") or ((page_data.get("layout") or {}).get("layout_type")) or "").strip().lower()
+        document_type = str(page_data.get("document_type") or ((page_data.get("layout") or {}).get("document_type")) or "").strip().lower()
+        figure_like_page = (
+            layout_type in {"annotated_page", "image_dominant", "mixed_blocks"}
+            and document_type not in {"scientific_paper", "book_page", "manual_guide"}
+        ) or page_family in {"body_with_figure", "body_with_diagram", "mixed_page"}
         for block in blocks:
             bbox = block.get("bbox")
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -1734,6 +2473,17 @@ class DocumentReconstructor:
 
     def _extract_block_slot_items(self, page_data):
         items = []
+        (
+            descriptor_elements,
+            descriptor_groups,
+            descriptor_regions,
+            descriptor_constraints,
+            descriptor_relations,
+            descriptor_page_organization,
+            descriptor_reconstruction_plan,
+            descriptor_visual_objects,
+            descriptor_visual_groups,
+        ) = self._layout_descriptor_maps(page_data)
         dims = page_data.get("dimensions", {}) or {}
         page_w_pt = float(dims.get("width", 1000.0)) * self.pixel_to_point
         page_h_pt = float(dims.get("height", 1000.0)) * self.pixel_to_point
@@ -1755,6 +2505,70 @@ class DocumentReconstructor:
         for block in page_data.get("blocks", []):
             if block.get("render_mode") == "background_only":
                 continue
+            block_id = str(block.get("id") or "")
+            descriptor_block = descriptor_elements.get(block_id) if block_id else None
+            paragraph_group = None
+            if isinstance(descriptor_block, dict):
+                paragraph_id = str(descriptor_block.get("paragraph_id") or "").strip()
+                if paragraph_id:
+                    paragraph_group = descriptor_groups.get(paragraph_id)
+            paragraph_constraints = (paragraph_group or {}).get("constraints") or {}
+            region_id = (paragraph_group or {}).get("region_id") or ((descriptor_block or {}).get("page_region_id"))
+            descriptor_region = descriptor_regions.get(str(region_id)) if region_id else None
+            descriptor_region_type = str((descriptor_region or {}).get("type") or "").strip().lower()
+            descriptor_ai_region_id = str((descriptor_block or {}).get("ai_region_id") or "")
+            descriptor_ai_region = descriptor_regions.get(descriptor_ai_region_id) if descriptor_ai_region_id else None
+            descriptor_ai_region_type = str((descriptor_ai_region or {}).get("type") or "").strip().lower()
+            descriptor_band_role = str((descriptor_block or {}).get("band_role") or "").strip().lower()
+            descriptor_structural_role = str((descriptor_block or {}).get("structural_role") or "").strip().lower()
+            descriptor_layout_behavior = str((descriptor_block or {}).get("layout_behavior") or "").strip().lower()
+            descriptor_attachment_target_id = str((descriptor_block or {}).get("attachment_target_id") or "").strip()
+            descriptor_group_ids = (descriptor_block or {}).get("group_ids") or {}
+            descriptor_section_id = str((descriptor_block or {}).get("section_id") or "").strip()
+            descriptor_typographic_class = str((descriptor_block or {}).get("typographic_class") or "").strip().lower()
+            descriptor_visual_object = descriptor_visual_objects.get(block_id) if block_id else None
+            descriptor_visual_group = None
+            if isinstance(descriptor_visual_object, dict):
+                visual_group_id = str(descriptor_visual_object.get("group_id") or "").strip()
+                if visual_group_id:
+                    descriptor_visual_group = descriptor_visual_groups.get(visual_group_id)
+            block_constraints = descriptor_constraints.get(block_id, []) if block_id else []
+            descriptor_region_rect = (
+                fitz.Rect([float(v) * self.pixel_to_point for v in descriptor_region.get("bbox")])
+                if isinstance(descriptor_region, dict) and isinstance(descriptor_region.get("bbox"), (list, tuple)) and len(descriptor_region.get("bbox")) == 4
+                else None
+            )
+            block_relations = descriptor_relations.get(block_id, []) if block_id else []
+            anchor_target_rect = None
+            anchor_preferred_side = ""
+            for relation in block_relations:
+                rel_type = str(relation.get("type") or "").strip().lower()
+                if rel_type not in {"anchored_to", "left_of", "right_of", "above", "below"}:
+                    continue
+                target_id = str(relation.get("target_id") or "")
+                target_region = descriptor_regions.get(target_id)
+                target_bbox = (target_region or {}).get("bbox")
+                if isinstance(target_bbox, (list, tuple)) and len(target_bbox) == 4:
+                    anchor_target_rect = fitz.Rect([float(v) * self.pixel_to_point for v in target_bbox])
+                    if rel_type in {"left_of", "right_of", "above", "below"}:
+                        anchor_preferred_side = rel_type
+                    elif not anchor_preferred_side and isinstance(descriptor_region_rect, fitz.Rect):
+                        dx = descriptor_region_rect.x0 + descriptor_region_rect.width / 2.0 - (anchor_target_rect.x0 + anchor_target_rect.width / 2.0)
+                        dy = descriptor_region_rect.y0 + descriptor_region_rect.height / 2.0 - (anchor_target_rect.y0 + anchor_target_rect.height / 2.0)
+                        if abs(dx) >= abs(dy):
+                            anchor_preferred_side = "right_of" if dx >= 0 else "left_of"
+                        else:
+                            anchor_preferred_side = "below" if dy >= 0 else "above"
+                    break
+            table_locked_block = bool(
+                descriptor_region_type in {"table_cell", "table_row"}
+                or any(str(c.get("type") or "") == "table_cell_locked" for c in block_constraints)
+                or descriptor_layout_behavior in {"locked_in_cell", "locked_in_table"}
+            )
+            preserve_sentence_integrity = bool(
+                any(str(constraint.get("type") or "") == "no_internal_sentence_break" for constraint in block_constraints)
+                or (paragraph_constraints and paragraph_constraints.get("can_break_inside_sentence") is False)
+            )
             source = block.get("source", "ocr")
             block_is_translated = self._is_translated_block(block)
             block_role = block.get("role", "body")
@@ -1874,6 +2688,14 @@ class DocumentReconstructor:
                     if not line_txt_src:
                         line_txt_src = " ".join(this_line_parts)
                     line_txt = self._clean_text_for_render(line_txt_src)
+                    original_line_text = self._clean_text_for_render(
+                        line.get("line_text")
+                        or " ".join(
+                            self._clean_text_for_render(ph.get("texte", ""))
+                            for ph in (line.get("phrases", []) or [])
+                            if self._clean_text_for_render(ph.get("texte", ""))
+                        )
+                    )
                     line_texts.append(line_txt)
                     line_marker = (line.get("leading_marker") or "").strip()
                     line_markers_used.append(line_marker)
@@ -1899,6 +2721,7 @@ class DocumentReconstructor:
                     line_entries.append(
                         {
                             "text": line_txt,
+                            "source_text": original_line_text,
                             "marker": line_marker,
                             "bbox": lb,
                             "indent_px": float(line.get("indent_px", 0.0) or 0.0),
@@ -1917,6 +2740,14 @@ class DocumentReconstructor:
                         fallback_line = line.get("line_text") or ""
                     fallback_line = self._clean_text_for_render(fallback_line)
                     if fallback_line:
+                        original_line_text = self._clean_text_for_render(
+                            line.get("line_text")
+                            or " ".join(
+                                self._clean_text_for_render(ph.get("texte", ""))
+                                for ph in (line.get("phrases", []) or [])
+                                if self._clean_text_for_render(ph.get("texte", ""))
+                            )
+                        )
                         line_texts.append(fallback_line)
                         line_marker = (line.get("leading_marker") or "").strip()
                         line_markers_used.append(line_marker)
@@ -1924,6 +2755,7 @@ class DocumentReconstructor:
                         line_entries.append(
                             {
                                 "text": fallback_line,
+                                "source_text": original_line_text,
                                 "marker": line_marker,
                                 "bbox": lb,
                                 "indent_px": float(line.get("indent_px", 0.0) or 0.0),
@@ -1946,11 +2778,58 @@ class DocumentReconstructor:
                                 break
             block_preferred_text = re.sub(r"\s+", " ", (block.get("translated_text") or "").strip())
             page_family = str(page_data.get("page_family") or ((page_data.get("layout") or {}).get("page_family")) or "").strip().lower()
-            anchored_figure_page = page_family in {"body_with_figure", "body_with_diagram"}
+            page_family_group = str(page_data.get("page_family_group") or ((page_data.get("layout") or {}).get("page_family_group")) or page_family).strip().lower()
+            layout_type = str(page_data.get("layout_type") or ((page_data.get("layout") or {}).get("layout_type")) or "").strip().lower()
+            document_type = str(page_data.get("document_type") or ((page_data.get("layout") or {}).get("document_type")) or "").strip().lower()
+            page_case = page_data.get("page_case") or {}
+            fallback_policy = str(page_case.get("fallback_policy") or "").strip().lower()
+            prefer_paragraph_flow = str(block.get("render_policy") or "").strip().lower() == "paragraph_flow"
+            anchored_figure_page = (
+                layout_type in {"annotated_page", "table_dominant", "image_dominant", "mixed_blocks"}
+                and document_type not in {"scientific_paper", "book_page", "manual_guide"}
+            ) or page_family_group in {"body_with_figure", "body_with_diagram", "mixed_page", "table_page"}
+            text_layout_page = bool(
+                layout_type in {"single_column", "double_column", "text_heavy"}
+                and fallback_policy != "safe_mixed"
+                and (not anchored_figure_page or prefer_paragraph_flow)
+            )
             paragraph_flow_mode = bool(block.get("translation_compose_mode") == "paragraph_flow" and block_role == "body")
+            effective_block_alignment = block.get("alignment", "left")
+            if descriptor_layout_behavior == "flow_in_band" and block_role == "body" and block_is_translated:
+                paragraph_flow_mode = True
+            if (
+                not paragraph_flow_mode
+                and block_role == "body"
+                and document_type in {"scientific_paper", "book_page", "manual_guide"}
+                and layout_type == "double_column"
+            ):
+                unit_type = str(block.get("unit_type") or "").strip().lower()
+                looks_narrative = len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", block_preferred_text or "")) >= 12
+                if unit_type not in {"short_label", "chart_label", "formula_label", "diagram_label", "reference_link", "citation"} and looks_narrative:
+                    paragraph_flow_mode = True
+            if (
+                not paragraph_flow_mode
+                and block_role == "body"
+                and block_is_translated
+                and str(paragraph_constraints.get("render_mode") or "").strip().lower() == "flow_in_region"
+            ):
+                paragraph_flow_mode = True
+            if (
+                not paragraph_flow_mode
+                and block_role == "body"
+                and block_is_translated
+                and descriptor_region_type == "text_band"
+            ):
+                paragraph_flow_mode = True
             if not block_is_translated:
                 paragraph_flow_mode = False
-            if anchored_figure_page and block_role == "body":
+            if anchored_figure_page and block_role == "body" and not prefer_paragraph_flow:
+                paragraph_flow_mode = False
+            if fallback_policy == "safe_mixed" and block_role == "body":
+                paragraph_flow_mode = False
+            if table_locked_block:
+                paragraph_flow_mode = False
+            if descriptor_band_role in {"annotation_band", "caption_band", "header_band", "legend_band", "axis_band"}:
                 paragraph_flow_mode = False
             if block_is_translated and paragraph_flow_mode:
                 # Paragraph-level translation mode: use block translated text, then compose.
@@ -2003,6 +2882,7 @@ class DocumentReconstructor:
                     / max(1, sum(1 for c in heading_candidate if c.isalpha()))
                 ) >= 0.45
                 and str(first_run_style.get("color", "")).lower() != str(style.get("color", "")).lower()
+                and descriptor_region_type not in {"annotation_band", "caption_band", "header_band"}
             )
             if block_is_translated and block_role in {"diagram_text_label"} and translated_phrase_items:
                 items.extend(translated_phrase_items)
@@ -2045,6 +2925,27 @@ class DocumentReconstructor:
             if not row_slots:
                 row_slots = [fitz.Rect(bbox)]
 
+            preserve_block_left_anchor = bool(
+                block_is_translated
+                and block_role == "body"
+                and layout_type == "double_column"
+                and document_type in {"manual_guide", "book_page", "scientific_paper"}
+                and descriptor_region_type in {"text", "text_band"}
+                and block.get("translation_compose_mode") == "preserved"
+            )
+            if preserve_block_left_anchor:
+                normalized_row_slots = []
+                for row in row_slots:
+                    normalized_row_slots.append(
+                        fitz.Rect(
+                            bbox.x0,
+                            row.y0,
+                            max(bbox.x0 + 10.0, bbox.x1),
+                            row.y1,
+                        )
+                    )
+                row_slots = normalized_row_slots or [fitz.Rect(bbox)]
+
             gap_x = float(median(gaps_x)) if gaps_x else max(2.0, slot_h * 0.25)
             gap_y = float(median(gaps_y)) if gaps_y else max(3.0, slot_h * 0.35)
             row_start_x = min(s.x0 for s in row_slots) if row_slots else bbox.x0
@@ -2055,6 +2956,8 @@ class DocumentReconstructor:
                 block.get("role") in {"header", "title", "section_heading"}
                 or (len(text) <= 140 and (flags.get("bold") or upper_ratio >= 0.55))
             )
+            if descriptor_structural_role in {"running_header", "section_title", "figure_title", "chart_title"}:
+                is_title = True
             is_diagram_label = bool(
                 block.get("role") == "diagram_label"
                 or block.get("role") == "figure_label"
@@ -2065,6 +2968,10 @@ class DocumentReconstructor:
                 and len(text) <= 220
                 )
             )
+            if descriptor_region_type == "annotation_band":
+                is_diagram_label = True
+            if descriptor_structural_role in {"diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label"}:
+                is_diagram_label = True
             if block.get("role") == "diagram_text_label":
                 is_diagram_label = False
                 is_title = False
@@ -2094,11 +3001,72 @@ class DocumentReconstructor:
                 "diagram_label",
                 "diagram_text_label",
             }
+            if descriptor_structural_role in {
+                "running_header",
+                "running_footer",
+                "section_title",
+                "figure_caption",
+                "figure_title",
+                "diagram_label",
+                "chart_axis_label",
+                "chart_tick_label",
+                "chart_legend_label",
+                "table_header_cell",
+            }:
+                is_structural_role = True
             has_hard_breaks = any(
                 bool((ln.get("hard_break_before") if isinstance(ln, dict) else False))
                 for ln in block.get("lines", [])
             )
             item_lang = block.get("language") or page_lang or self._infer_text_lang(text)
+            editorial_header_row_texts = []
+            if (
+                block_role == "header"
+                and layout_type == "double_column"
+                and document_type in {"manual_guide", "book_page", "scientific_paper"}
+                and line_entries
+            ):
+                row_groups = []
+                header_row_tol = max(2.0, slot_h * 0.5)
+                for le in line_entries:
+                    bb = le.get("bbox")
+                    if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                        continue
+                    y0_px = float(bb[1])
+                    if not row_groups or abs(y0_px - row_groups[-1]["y0"]) > header_row_tol / max(self.pixel_to_point, 1e-6):
+                        row_groups.append({"y0": y0_px, "entries": [le]})
+                    else:
+                        row_groups[-1]["entries"].append(le)
+                for row in row_groups:
+                    entries = []
+                    for le in row["entries"]:
+                        bb = le.get("bbox")
+                        if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                            continue
+                        txt = self._clean_text_for_render(
+                            le.get("translated_text")
+                            or le.get("text")
+                            or ""
+                        ).strip()
+                        phrase_candidates = []
+                        for ph in le.get("phrases", []) or []:
+                            ptxt = self._clean_text_for_render(
+                                ph.get("translated_text")
+                                or ph.get("texte")
+                                or ""
+                            ).strip()
+                            if ptxt:
+                                phrase_candidates.append(ptxt)
+                        if phrase_candidates:
+                            txt = " ".join(phrase_candidates).strip()
+                        if txt:
+                            entries.append((float(bb[0]), txt))
+                    if entries:
+                        entries.sort(key=lambda it: it[0])
+                        merged_row_text = self._clean_text_for_render(" ".join(txt for _, txt in entries)).strip()
+                        if merged_row_text:
+                            editorial_header_row_texts.append(merged_row_text)
+
             source_lines_for_render = []
             for i, raw_line in enumerate(line_texts):
                 lt = self._clean_text_for_render(raw_line)
@@ -2135,6 +3103,7 @@ class DocumentReconstructor:
                                         "row_start_x_pt": mrect.x0,
                                         "style": self._merge_styles(le0.get("marker_style", {}), le0.get("style", {})),
                                         "source": source,
+                                        "source_text": marker,
                                         "alignment": "left",
                                         "justify_explicit": False,
                                         "role": "list_marker",
@@ -2151,6 +3120,10 @@ class DocumentReconstructor:
                     if re.match(r"^\s*(?:\d+[.)]?|[•▪◦·\-\*])\s*$", prev_txt):
                         lt = re.sub(r"^\s*(?:\d+[.)]?\s+|[•▪◦·\-\*]\s+)", "", lt).strip()
                 source_lines_for_render.append(lt)
+            if editorial_header_row_texts:
+                source_lines_for_render = editorial_header_row_texts
+                text = "\n".join(editorial_header_row_texts)
+
             # Keep numeric/list markers (e.g. standalone "1", "2") fixed at original
             # location; remove them from flowing body text to avoid displacement.
             if block_is_translated and block_role == "body" and line_entries:
@@ -2185,6 +3158,7 @@ class DocumentReconstructor:
                                         "row_start_x_pt": mrect.x0,
                                         "style": self._merge_styles(le.get("style", {}), style),
                                         "source": source,
+                                        "source_text": ltxt,
                                         "alignment": "left",
                                         "justify_explicit": False,
                                         "role": "list_marker",
@@ -2211,6 +3185,33 @@ class DocumentReconstructor:
                 preserve_linebreaks = True
             if paragraph_flow_mode:
                 preserve_linebreaks = False
+            word_like_tokens = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", text or "")
+            allow_vertical_expand = bool(
+                block_role == "body"
+                and block_is_translated
+                and paragraph_flow_mode
+                and text_layout_page
+                and len(word_like_tokens) >= 16
+                and block.get("render_policy") != "anchored_text"
+            )
+            if descriptor_region_type == "text_band" and paragraph_flow_mode and block_role == "body":
+                allow_vertical_expand = True
+            if paragraph_flow_mode and block_role == "body":
+                allow_vertical_expand = bool(
+                    allow_vertical_expand or paragraph_constraints.get("allow_vertical_expand")
+                )
+            if table_locked_block:
+                allow_vertical_expand = False
+            if (
+                block_role == "body"
+                and block_is_translated
+                and layout_type in {"single_column", "double_column", "text_heavy"}
+                and document_type in {"scientific_paper", "book_page", "manual_guide"}
+                and str(block.get("unit_type") or "").strip().lower() == "narrative_body"
+                and str(effective_block_alignment or "left").strip().lower() in {"right", "center"}
+                and not bool(block.get("justify_explicit"))
+            ):
+                effective_block_alignment = "left"
             accent_color = ""
             for c in span_color_sequence[:18]:
                 if str(c).strip():
@@ -2248,7 +3249,7 @@ class DocumentReconstructor:
                             "is_title": True,
                             "is_diagram_label": False,
                             "accent_color": heading_color or accent_color,
-                            **self._alignment_payload(block.get("alignment", "left"), source="block"),
+                            **self._alignment_payload(effective_block_alignment, source="block"),
                         }
                     )
                     text = body_text_rx
@@ -2281,7 +3282,7 @@ class DocumentReconstructor:
                             "is_title": True,
                             "is_diagram_label": False,
                             "accent_color": first_run_style.get("color", "") if isinstance(first_run_style, dict) else "",
-                            **self._alignment_payload(block.get("alignment", "left"), source="block"),
+                            **self._alignment_payload(effective_block_alignment, source="block"),
                         }
                     )
                     bbox = fitz.Rect(bbox.x0, min(bbox.y1, first_run_bbox.y1 + 1.0), bbox.x1, bbox.y1)
@@ -2304,6 +3305,13 @@ class DocumentReconstructor:
                         or (block_role == "body" and source == "native")
                     )
                 )
+                or (
+                    block_is_translated
+                    and block.get("render_policy") == "anchored_text"
+                    and block_role in {"body", "section_heading", "title", "figure_caption", "diagram_text_label"}
+                )
+                or descriptor_region_type in {"annotation_band", "caption_band"}
+                or table_locked_block
             )
             if use_strict_line_items:
                 pushed_any = False
@@ -2336,24 +3344,59 @@ class DocumentReconstructor:
                             "row_start_x_pt": lr.x0,
                             "style": lst,
                             "source": source,
+                            "source_text": self._clean_text_for_render(le.get("source_text", "")),
                             "role": block_role,
                             "lang": item_lang,
                             "is_title": bool(block_role in {"title", "section_heading", "header"}),
                             "is_diagram_label": bool(is_diagram_label),
                             "accent_color": accent_color,
                             "translated_block": bool(block_is_translated),
+                            "descriptor_region_bbox": fitz.Rect(descriptor_region_rect) if isinstance(descriptor_region_rect, fitz.Rect) else None,
+                            "descriptor_region_type": descriptor_region_type,
+                            "descriptor_region_id": str(region_id or ""),
+                            "descriptor_ai_region_type": descriptor_ai_region_type,
+                            "descriptor_ai_region_id": descriptor_ai_region_id,
+                            "descriptor_band_role": descriptor_band_role,
+                            "descriptor_structural_role": descriptor_structural_role,
+                            "descriptor_layout_behavior": descriptor_layout_behavior,
+                            "descriptor_attachment_target_id": descriptor_attachment_target_id,
+                            "descriptor_group_ids": descriptor_group_ids,
+                            "descriptor_group_render_mode": str((descriptor_block or {}).get("group_render_mode") or ""),
+                            "descriptor_typographic_class": descriptor_typographic_class,
+                            "descriptor_visual_text": dict((descriptor_block or {}).get("visual_text") or {}),
+                            "descriptor_visual_text_object": dict(descriptor_visual_object or {}),
+                            "descriptor_visual_text_group": dict(descriptor_visual_group or {}),
+                            "descriptor_section_id": descriptor_section_id,
+                            "descriptor_page_organization": descriptor_page_organization,
+                            "descriptor_reconstruction_plan": descriptor_reconstruction_plan,
+                            "page_data": page_data,
+                            "anchor_target_bbox": fitz.Rect(anchor_target_rect) if isinstance(anchor_target_rect, fitz.Rect) else None,
+                            "anchor_preferred_side": anchor_preferred_side,
+                            "preserve_sentence_integrity": bool(preserve_sentence_integrity),
                             **self._alignment_payload("left", source="strict_line"),
                         }
                     )
                     pushed_any = True
                 if pushed_any:
                     continue
+            structured_source_lines = [ln for ln in (source_lines_for_render or block.get("line_texts") or line_texts) if str(ln).strip()]
+            use_structured_source_lines = bool(
+                (not paragraph_flow_mode)
+                and structured_source_lines
+                and (
+                    preserve_linebreaks
+                    or (not block_is_translated)
+                    or has_list_markers
+                    or has_hard_breaks
+                    or has_number_only_lines
+                )
+            )
             items.append(
                 {
                     "text": text,
-                    "source_lines": (source_lines_for_render or block.get("line_texts") or line_texts),
+                    "source_lines": structured_source_lines,
                     "preserve_linebreaks": preserve_linebreaks,
-                    "use_structured_source_lines": bool((not paragraph_flow_mode) and ((not block_is_translated) or has_list_markers or has_hard_breaks or has_number_only_lines)),
+                    "use_structured_source_lines": use_structured_source_lines,
                     "has_number_markers": bool(has_number_only_lines),
                     "marker_text_indent_pt": float(marker_text_indent_pt),
                     "allow_line_overflow": bool(
@@ -2362,7 +3405,37 @@ class DocumentReconstructor:
                     "paragraph_flow_mode": bool(paragraph_flow_mode),
                     "strict_bbox_mode": True,
                     "allow_expand_to_page_right": bool(block_is_translated and block_role == "body"),
+                    "allow_vertical_expand": bool(allow_vertical_expand),
                     "expand_right_limit_pt": float(page_blue_right_pt),
+                    "descriptor_region_bbox": fitz.Rect(descriptor_region_rect) if isinstance(descriptor_region_rect, fitz.Rect) else None,
+                    "descriptor_region_type": descriptor_region_type,
+                    "descriptor_region_id": str(region_id or ""),
+                    "descriptor_ai_region_type": descriptor_ai_region_type,
+                    "descriptor_ai_region_id": descriptor_ai_region_id,
+                    "descriptor_band_role": descriptor_band_role,
+                    "descriptor_structural_role": descriptor_structural_role,
+                    "descriptor_layout_behavior": descriptor_layout_behavior,
+                    "descriptor_attachment_target_id": descriptor_attachment_target_id,
+                    "descriptor_group_ids": descriptor_group_ids,
+                    "descriptor_group_render_mode": str((descriptor_block or {}).get("group_render_mode") or ""),
+                    "descriptor_typographic_class": descriptor_typographic_class,
+                    "descriptor_visual_text": dict((descriptor_block or {}).get("visual_text") or {}),
+                    "descriptor_visual_text_object": dict(descriptor_visual_object or {}),
+                    "descriptor_visual_text_group": dict(descriptor_visual_group or {}),
+                    "descriptor_section_id": descriptor_section_id,
+                    "descriptor_page_organization": descriptor_page_organization,
+                    "descriptor_reconstruction_plan": descriptor_reconstruction_plan,
+                    "page_data": page_data,
+                    "anchor_target_bbox": fitz.Rect(anchor_target_rect) if isinstance(anchor_target_rect, fitz.Rect) else None,
+                    "anchor_preferred_side": anchor_preferred_side,
+                    "descriptor_paragraph_id": str((paragraph_group or {}).get("id") or ""),
+                    "descriptor_no_internal_sentence_break": bool(
+                        any(
+                            str(constraint.get("type") or "") == "no_internal_sentence_break"
+                            for constraint in block_constraints
+                        )
+                    ),
+                    "preserve_sentence_integrity": bool(preserve_sentence_integrity),
                     "bbox": bbox,
                     "slots": row_slots,
                     "slot_w_pt": max(10.0, bbox.width),
@@ -2370,20 +3443,30 @@ class DocumentReconstructor:
                     "slot_gap_x_pt": gap_x,
                     "slot_gap_y_pt": gap_y,
                     "row_start_x_pt": row_start_x,
+                    "preferred_left_x_pt": bbox.x0,
+                    "preserve_block_left_anchor": bool(preserve_block_left_anchor),
                     "style": self._merge_styles(style, {}),
                     "source": source,
+                    "source_text": self._get_block_source_text(block),
                     "role": block.get("role", "body"),
                     "lang": item_lang,
                     "is_title": is_title,
                     "is_diagram_label": is_diagram_label,
                     "accent_color": accent_color,
                     "translated_block": bool(block_is_translated),
-                    **self._alignment_payload(block.get("alignment", "left"), source="block"),
+                    **self._alignment_payload(effective_block_alignment, source="block"),
                 }
             )
 
             # Header often contains "page-number + title" merged in one OCR line.
-            if block.get("role") == "header":
+            # On editorial double-column pages, keeping the original merged line
+            # preserves the top-band hierarchy better than splitting number/title.
+            split_header_number = not (
+                block.get("role") == "header"
+                and layout_type == "double_column"
+                and document_type in {"manual_guide", "book_page", "scientific_paper"}
+            )
+            if block.get("role") == "header" and split_header_number:
                 m = re.match(r"^\s*(\d{1,3})\s+(.+)$", text)
                 if not m:
                     m_end = re.match(r"^\s*(.+?)\s+(\d{1,3})\s*$", text)
@@ -2568,33 +3651,169 @@ class DocumentReconstructor:
         if not text:
             return "", anchor_y, None, []
         forbidden_rects = forbidden_rects or []
-        style = item["style"]
+        style = self._normalized_style_for_item(item)
         source = item["source"]
         resolved = self.font_resolver.resolve(style)
         fontfile = resolved.get("fontfile")
         builtin = resolved.get("builtin")
         fontname = self._resolve_page_fontname(page, fontfile, builtin)
-        base_fs = self._get_original_fontsize(style, max(1.0, item["slot_h_pt"]), source)
+        base_fs = self._normalized_fontsize_for_item(item, style, max(1.0, item["slot_h_pt"]), source)
         rgb = self._resolve_text_color(style, item)
 
         block_w = max(10.0, item["bbox"].width)
         x0 = max(left, min(item["bbox"].x0, right - block_w))
+        descriptor_region_bbox = item.get("descriptor_region_bbox")
+        descriptor_region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+        descriptor_ai_region_type = str(item.get("descriptor_ai_region_type") or "").strip().lower()
+        descriptor_band_role = str(item.get("descriptor_band_role") or "").strip().lower()
+        descriptor_structural_role = str(item.get("descriptor_structural_role") or "").strip().lower()
+        descriptor_layout_behavior = str(item.get("descriptor_layout_behavior") or "").strip().lower()
+        descriptor_group_ids = item.get("descriptor_group_ids") or {}
+        descriptor_group_render_mode = str(item.get("descriptor_group_render_mode") or "").strip().lower()
+        descriptor_typographic_class = str(item.get("descriptor_typographic_class") or "").strip().lower()
+        descriptor_page_organization = item.get("descriptor_page_organization") or {}
+        descriptor_reconstruction_plan = item.get("descriptor_reconstruction_plan") or {}
+        descriptor_visual_text = item.get("descriptor_visual_text") or {}
+        descriptor_visual_group = item.get("descriptor_visual_text_group") or {}
+        anchor_target_bbox = item.get("anchor_target_bbox")
+        anchor_preferred_side = str(item.get("anchor_preferred_side") or "").strip().lower()
+        native_structure = descriptor_page_organization.get("native_structure") or {}
+
+        def _fitz_rect_from_any(bbox_like):
+            if isinstance(bbox_like, fitz.Rect):
+                return fitz.Rect(bbox_like)
+            if isinstance(bbox_like, (list, tuple)) and len(bbox_like) == 4:
+                try:
+                    return fitz.Rect(
+                        float(bbox_like[0]) * self.pixel_to_point,
+                        float(bbox_like[1]) * self.pixel_to_point,
+                        float(bbox_like[2]) * self.pixel_to_point,
+                        float(bbox_like[3]) * self.pixel_to_point,
+                    )
+                except Exception:
+                    return None
+            return None
+
+        def _native_group_bbox():
+            ann_id = str(descriptor_group_ids.get("annotation_group_id") or "").strip()
+            if ann_id:
+                for group in descriptor_page_organization.get("annotation_groups") or []:
+                    if str(group.get("id") or "") == ann_id:
+                        return _fitz_rect_from_any(group.get("bbox"))
+            cell_id = str(descriptor_group_ids.get("cell_id") or "").strip()
+            row_id = str(descriptor_group_ids.get("table_row_group_id") or "").strip()
+            if row_id:
+                for row in descriptor_page_organization.get("table_row_groups") or []:
+                    if str(row.get("id") or "") == row_id:
+                        if cell_id:
+                            for cell in row.get("cells") or []:
+                                if str(cell.get("id") or "") == cell_id or str(cell.get("block_id") or "") == str(item.get("source_block_id") or ""):
+                                    return _fitz_rect_from_any(cell.get("bbox"))
+                        return _fitz_rect_from_any(row.get("bbox"))
+            chart_groups = descriptor_page_organization.get("chart_groups") or {}
+            legend_id = str(descriptor_group_ids.get("legend_group_id") or "").strip()
+            if legend_id:
+                legend = chart_groups.get("legend_group") or {}
+                if str(legend.get("id") or "") == legend_id:
+                    return _fitz_rect_from_any(legend.get("bbox"))
+            series_id = str(descriptor_group_ids.get("series_group_id") or "").strip()
+            if series_id:
+                for series in chart_groups.get("series_groups") or []:
+                    if str(series.get("id") or "") == series_id:
+                        return _fitz_rect_from_any(series.get("bbox"))
+            tick_id = str(descriptor_group_ids.get("tick_group_id") or "").strip()
+            if tick_id:
+                ticks = chart_groups.get("tick_group") or {}
+                if str(ticks.get("id") or "") == tick_id:
+                    return _fitz_rect_from_any(ticks.get("bbox"))
+                ticks_x = chart_groups.get("x_tick_group") or {}
+                if str(ticks_x.get("id") or "") == tick_id:
+                    return _fitz_rect_from_any(ticks_x.get("bbox"))
+            axis_id = str(descriptor_group_ids.get("axis_group_id") or "").strip()
+            if axis_id:
+                for axis in chart_groups.get("axis_groups") or []:
+                    if str(axis.get("id") or "") == axis_id:
+                        return _fitz_rect_from_any(axis.get("bbox"))
+            return None
+
+        native_group_bbox = _native_group_bbox()
+        visual_group_bbox = self._visual_text_group_bbox(item)
+        effective_group_bbox = visual_group_bbox if isinstance(visual_group_bbox, fitz.Rect) and visual_group_bbox.get_area() > 0 else native_group_bbox
+        group_background_prepared = False
+        if (
+            render
+            and descriptor_group_render_mode in {"annotation_group", "chart_legend_group", "chart_axis_group", "chart_series_group"}
+            and isinstance(effective_group_bbox, fitz.Rect)
+            and effective_group_bbox.get_area() > 0
+        ):
+            group_background_prepared = self._prepare_visual_group_background(page, item, effective_group_bbox)
+        if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            region_left = max(left, descriptor_region_bbox.x0)
+            region_right = min(right, descriptor_region_bbox.x1)
+        else:
+            region_left = left
+            region_right = right
+        if isinstance(effective_group_bbox, fitz.Rect) and effective_group_bbox.get_area() > 0:
+            region_left = max(region_left, effective_group_bbox.x0)
+            region_right = min(region_right, effective_group_bbox.x1)
+        strict_anchor_zone = descriptor_region_type in {"annotation_band", "caption_band", "table_cell", "table_row"}
+        if descriptor_band_role in {"annotation_band", "caption_band", "header_band", "legend_band", "axis_band", "table_band"}:
+            strict_anchor_zone = True
+        if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            x0 = max(region_left, min(x0, max(region_left, region_right - min(block_w, max(8.0, region_right - region_left)))))
+        if isinstance(effective_group_bbox, fitz.Rect) and effective_group_bbox.get_area() > 0:
+            x0 = max(region_left, min(x0, max(region_left, region_right - min(block_w, max(8.0, region_right - region_left)))))
+        if strict_anchor_zone and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            original_offset = max(0.0, item["bbox"].x0 - descriptor_region_bbox.x0)
+            x0 = max(region_left, min(region_left + original_offset, max(region_left, region_right - min(block_w, region_right - region_left))))
+        if strict_anchor_zone and isinstance(effective_group_bbox, fitz.Rect) and effective_group_bbox.get_area() > 0:
+            original_offset = max(0.0, item["bbox"].x0 - effective_group_bbox.x0)
+            x0 = max(region_left, min(region_left + original_offset, max(region_left, region_right - min(block_w, region_right - region_left))))
         if item.get("paragraph_flow_mode") and item.get("has_number_markers"):
             # Keep paragraph text aligned with source text column, not marker column.
             x0 = min(right - 8.0, x0 + max(0.0, float(item.get("marker_text_indent_pt", 0.0) or 0.0)))
+        if item.get("paragraph_flow_mode") and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            x0 = max(region_left, min(x0, max(region_left, region_right - block_w)))
         y0 = max(zone_top, anchor_y)
+        if item.get("paragraph_flow_mode") and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            y0 = max(y0, descriptor_region_bbox.y0)
+        if item.get("paragraph_flow_mode") and isinstance(effective_group_bbox, fitz.Rect) and effective_group_bbox.get_area() > 0:
+            y0 = max(y0, effective_group_bbox.y0)
+        if descriptor_layout_behavior in {"anchored", "locked_in_cell", "locked_in_table"} and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            y0 = max(y0, descriptor_region_bbox.y0)
+        if descriptor_layout_behavior in {"anchored", "locked_in_cell", "locked_in_table"} and isinstance(effective_group_bbox, fitz.Rect) and effective_group_bbox.get_area() > 0:
+            y0 = max(y0, effective_group_bbox.y0)
         dx = x0 - item["bbox"].x0
         dy = y0 - item["bbox"].y0
         block_right = min(right, x0 + block_w)
         if item.get("allow_expand_to_page_right"):
             limit_pt = float(item.get("expand_right_limit_pt", right) or right)
             block_right = min(right, max(x0 + 8.0, limit_pt))
+        if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            block_right = min(block_right, region_right)
+        if isinstance(native_group_bbox, fitz.Rect) and native_group_bbox.get_area() > 0:
+            block_right = min(block_right, region_right)
+        if strict_anchor_zone and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            block_right = min(region_right, max(x0 + 8.0, descriptor_region_bbox.x1))
+        if strict_anchor_zone and isinstance(native_group_bbox, fitz.Rect) and native_group_bbox.get_area() > 0:
+            block_right = min(region_right, max(x0 + 8.0, native_group_bbox.x1))
+        if strict_anchor_zone and isinstance(anchor_target_bbox, fitz.Rect) and anchor_target_bbox.get_area() > 0:
+            if anchor_preferred_side == "left_of":
+                block_right = min(block_right, max(x0 + 8.0, anchor_target_bbox.x0 - 2.0))
+            elif anchor_preferred_side == "right_of":
+                x0 = max(x0, min(block_right - 8.0, anchor_target_bbox.x1 + 2.0))
+            elif anchor_preferred_side == "above":
+                zone_bottom = min(zone_bottom, max(y0 + 8.0, anchor_target_bbox.y0 - 2.0))
+            elif anchor_preferred_side == "below":
+                y0 = max(y0, anchor_target_bbox.y1 + 2.0)
         role = item.get("role")
         # Strict slot anchoring requested:
         # - line start must match phrase slot x0
         # - line wrapping must use blue box right edge
         # - no center/right/justify alignment
         body_stable_left = False
+        if descriptor_structural_role in {"opening_paragraph", "body_paragraph"} and descriptor_band_role == "text_band":
+            body_stable_left = True
         # Professional paragraph rule: keep stable vertical rhythm (line starts + line heights)
         # for body text to avoid "stair-step" OCR line jitter.
         body_stable_vertical = body_stable_left
@@ -2603,10 +3822,18 @@ class DocumentReconstructor:
         stable_gap_y = max(1.8, min(7.5, float(item.get("slot_gap_y_pt", stable_slot_h * 0.28))))
         stable_next_y = y0
         # Smart horizontal expansion for short/top metadata and headings.
-        if role in {"header", "footer"}:
+        if role in {"header", "footer"} or descriptor_structural_role in {"running_header", "running_footer"}:
             block_right = right
         elif item.get("is_title") and block_w < (right - left) * 0.72:
             block_right = min(right, x0 + max(block_w, (right - left) * 0.72))
+        if descriptor_band_role == "title_band" and isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+            x0 = max(region_left, descriptor_region_bbox.x0)
+            block_right = min(right, descriptor_region_bbox.x1)
+        if descriptor_band_role in {"annotation_band", "legend_band", "axis_band", "table_band"} and isinstance(native_group_bbox, fitz.Rect) and native_group_bbox.get_area() > 0:
+            x0 = max(region_left, native_group_bbox.x0)
+            block_right = min(region_right, native_group_bbox.x1)
+            y0 = max(y0, native_group_bbox.y0)
+            zone_bottom = min(zone_bottom, max(y0 + 8.0, native_group_bbox.y1))
 
         slots = [fitz.Rect(s.x0 + dx, s.y0 + dy, s.x1 + dx, s.y1 + dy) for s in item["slots"]]
         slots.sort(key=lambda r: (r.y0, r.x0))
@@ -2618,17 +3845,80 @@ class DocumentReconstructor:
                 preset_lines = [self._clean_text_for_render(x).strip() for x in str(override_text).split("\n") if x.strip()]
             else:
                 preset_lines = [self._clean_text_for_render(x).strip() for x in item.get("source_lines", []) if x and x.strip()]
+        translated_structured_fit = bool(
+            preserve_linebreaks
+            and item.get("translated_block")
+            and (not item.get("keep_exact_line"))
+            and preset_lines
+        )
+        if translated_structured_fit:
+            strict_bbox_mode = False
         words = [] if preserve_linebreaks else text.split()
         used_bottom = y0
         idx = 0
         used_slots = []
         prev_slot_bottom = None
+        fitted_structured_fs = None
+        fitted_structured_line_h = None
+        if render and self._should_whiteout_before_render(item):
+            self._whiteout_rect(page, item.get("bbox", fitz.Rect(x0, y0, block_right, max(y0 + 6.0, y0 + item.get("slot_h_pt", 8.0)))))
+        elif render and (not group_background_prepared) and self._should_restore_background_before_render(item):
+            self._restore_background_rect(
+                page,
+                item,
+                item.get("bbox", fitz.Rect(x0, y0, block_right, max(y0 + 6.0, y0 + item.get("slot_h_pt", 8.0)))),
+                kind="translated_anchor_bg_restore",
+            )
+        if translated_structured_fit:
+            bbox_bottom = min(zone_bottom, max(y0 + 8.0, float(item["bbox"].y1) + dy))
+            available_h = max(8.0, bbox_bottom - y0)
+            line_count = max(1, len(preset_lines))
+            desired_gap = max(1.0, min(float(item.get("slot_gap_y_pt", 2.0)), available_h * 0.08))
+            total_gap = desired_gap * max(0, line_count - 1)
+            if total_gap >= available_h:
+                desired_gap = max(0.5, available_h / max(2.0, line_count * 3.0))
+                total_gap = desired_gap * max(0, line_count - 1)
+            target_line_h = max(6.0, (available_h - total_gap) / line_count)
+            fitted_structured_fs = min(base_fs, max(5.5, target_line_h / 1.22))
+            slot_w_fit = max(8.0, block_right - x0)
+            while (
+                fitted_structured_fs > 5.5 + 1e-6
+                and any(
+                    self._measure_text_width(line, fitted_structured_fs, fontname, fontfile) > slot_w_fit * 1.01
+                    for line in preset_lines
+                )
+            ):
+                fitted_structured_fs = max(5.5, fitted_structured_fs - 0.2)
+            fitted_structured_line_h = max(6.0, fitted_structured_fs * 1.22)
+            desired_gap = max(
+                0.5,
+                min(desired_gap, max(0.5, (available_h - fitted_structured_line_h * line_count) / max(1, line_count - 1))),
+            )
+            slots = []
+            cur_slot_y = y0
+            for _ in range(line_count):
+                next_y = min(bbox_bottom, cur_slot_y + fitted_structured_line_h)
+                slots.append(fitz.Rect(x0, cur_slot_y, block_right, max(cur_slot_y + 6.0, next_y)))
+                cur_slot_y = next_y + desired_gap
         if item.get("paragraph_flow_mode") and not preserve_linebreaks:
             # Strict block mode: compose the whole paragraph inside its source bbox.
             # No spill to extra pages/rows; keep line starts anchored at block x0.
+            if descriptor_reconstruction_plan.get("primary_flow_regions") and descriptor_band_role == "text_band":
+                x0 = max(region_left, float(item.get("preferred_left_x_pt", x0) or x0))
             box_w = max(8.0, block_right - x0)
-            box_h = max(8.0, min(zone_bottom, item["bbox"].y1 + dy) - y0)
+            box_bottom = min(zone_bottom, item["bbox"].y1 + dy)
+            if item.get("allow_vertical_expand"):
+                box_bottom = zone_bottom
+            if isinstance(descriptor_region_bbox, fitz.Rect) and descriptor_region_bbox.get_area() > 0:
+                region_type = str(item.get("descriptor_region_type") or "").strip().lower()
+                if region_type == "text_band":
+                    box_bottom = max(box_bottom, descriptor_region_bbox.y1)
+                else:
+                    box_bottom = min(box_bottom, max(y0 + 8.0, descriptor_region_bbox.y1))
+            box_h = max(8.0, box_bottom - y0)
             base_try = base_fs if self.fixed_font_size else min(base_fs, max(7.0, item.get("slot_h_pt", 10.0) * 0.92))
+            if descriptor_typographic_class in {"editorial_body", "diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label", "figure_caption"}:
+                base_try = max(base_try, base_fs * 0.94)
             def _wrap_words_no_split(full_text, width, fsz):
                 ws = [w for w in self._clean_text_for_render(full_text).split() if w]
                 out = []
@@ -2661,9 +3951,11 @@ class DocumentReconstructor:
                 baseline = y + min(line_h * 0.82, line_h - 1.0)
                 if baseline > (y0 + box_h):
                     break
-                if render:
-                    self._safe_insert_text_dedup(page, (x0, baseline), line, fs, fontname, rgb)
                 slot_rect = fitz.Rect(x0, y, x0 + box_w, min(y + line_h, y0 + box_h))
+                if render:
+                    if self._should_whiteout_per_line(item):
+                        self._whiteout_rect(page, slot_rect, pad_x=0.8, pad_y=0.35)
+                    self._safe_insert_text_dedup(page, (x0, baseline), line, fs, fontname, rgb)
                 used_slots.append(slot_rect)
                 used_bottom = max(used_bottom, slot_rect.y1)
                 y += line_h
@@ -2671,9 +3963,17 @@ class DocumentReconstructor:
             return "", used_bottom, blue_rect, used_slots
         while words or preset_lines:
             if idx >= len(slots):
-                if strict_bbox_mode:
+                can_extend_slots = bool(
+                    item.get("allow_vertical_expand")
+                    or (
+                        item.get("preserve_sentence_integrity")
+                        and isinstance(descriptor_region_bbox, fitz.Rect)
+                        and descriptor_region_bbox.get_area() > 0
+                    )
+                )
+                if strict_bbox_mode and not can_extend_slots:
                     break
-                if item.get("is_diagram_label"):
+                if item.get("is_diagram_label") and not can_extend_slots:
                     break
                 prev = slots[-1] if slots else fitz.Rect(x0, y0, x0 + item["slot_w_pt"], y0 + item["slot_h_pt"])
                 # New rows are appended downward; each line fills available width first.
@@ -2704,7 +4004,12 @@ class DocumentReconstructor:
             slot_w = max(8.0, slot.width)
             slot_h = max(8.0, slot.height)
             fs = base_fs if (self.fixed_font_size or strict_bbox_mode) else min(base_fs, slot_h * 0.92)
+            if descriptor_typographic_class in {"editorial_body", "diagram_label", "chart_axis_label", "chart_tick_label", "chart_legend_label", "figure_caption"}:
+                fs = max(fs, base_fs * 0.94)
+            if fitted_structured_fs is not None:
+                fs = min(fs, fitted_structured_fs)
             expected_align = self._normalize_alignment(item.get("alignment", "left"))
+            region_type = str(item.get("descriptor_region_type") or "").strip().lower()
             if item.get("role") == "figure_caption":
                 if not self.fixed_font_size:
                     fs = max(6.0, base_fs)
@@ -2714,20 +4019,35 @@ class DocumentReconstructor:
                 elif item.get("role") == "section_heading":
                     fs = max(fs, min(max(10.5, base_fs * 1.12), slot_h * 1.02))
                 elif item.get("is_diagram_label"):
-                    fs = min(fs, 8.6)
+                    fs = max(min(fs, 9.6), min(base_fs, 8.4))
                 else:
                     fs = min(fs, max(8.0, slot_h * 0.78))
+            if item.get("role") == "header":
+                fs = max(fs, 8.8)
+            if region_type in {"annotation_band", "caption_band", "header_band"}:
+                fs = max(fs, 8.2)
             required_line_h = max(1.0, fs * 1.22)
             if slot_h < required_line_h:
                 slot = fitz.Rect(slot.x0, slot.y0, slot.x1, slot.y0 + required_line_h)
                 slot_h = max(8.0, slot.height)
-            if forbidden_rects and (not strict_bbox_mode):
+            if forbidden_rects and (not strict_bbox_mode) and (not strict_anchor_zone):
                 probe = fitz.Rect(slot)
                 for _ in range(6):
                     collisions = [fr for fr in forbidden_rects if (probe & fr).get_area() > 0]
                     if not collisions:
                         break
                     next_y = max(fr.y1 for fr in collisions) + max(1.0, slot_h * 0.12)
+                    shifted = False
+                    x_step = max(6.0, min(slot_w * 0.18, 28.0))
+                    for dx in (x_step, -x_step, x_step * 2.0, -x_step * 2.0):
+                        cand_x0 = max(left, min(right - slot_w, probe.x0 + dx))
+                        cand = fitz.Rect(cand_x0, probe.y0, cand_x0 + slot_w, probe.y1)
+                        if not any((cand & fr).get_area() > 0 for fr in forbidden_rects):
+                            probe = cand
+                            shifted = True
+                            break
+                    if shifted:
+                        continue
                     if next_y >= zone_bottom - 2.0:
                         break
                     probe = fitz.Rect(probe.x0, next_y, probe.x1, next_y + slot_h)
@@ -2755,6 +4075,12 @@ class DocumentReconstructor:
                     allow_overflow = bool(item.get("allow_line_overflow", False))
                     line_w_now = self._measure_text_width(line, fs, fontname, fontfile)
                     overflow_ok = bool(allow_overflow and line_w_now <= slot_w * 1.12)
+                    if (not overflow_ok) and item.get("translated_block") and (not self.fixed_font_size):
+                        min_fs = max(4.8, min(fs, 6.6)) if item.get("preserve_sentence_integrity") else max(5.5, min(fs, 7.0))
+                        while line_w_now > slot_w and fs > min_fs + 1e-6:
+                            fs = max(min_fs, fs - 0.2)
+                            line_w_now = self._measure_text_width(line, fs, fontname, fontfile)
+                        overflow_ok = bool(allow_overflow and line_w_now <= slot_w * 1.12)
                     # Keep original font size on structured lines (lists/bullets/numbered lines).
                     # In strict bbox mode, allow shrink only for paragraph-flow composition.
                     if (not overflow_ok) and (not preserve_linebreaks) and ((not self.fixed_font_size) or strict_bbox_mode) and line_w_now > slot_w:
@@ -2763,7 +4089,7 @@ class DocumentReconstructor:
                             fs = max(min_fs, fs - 0.2)
                     line_w_now = self._measure_text_width(line, fs, fontname, fontfile)
                     overflow_ok = bool(allow_overflow and line_w_now <= slot_w * 1.12)
-                    if (not overflow_ok) and line_w_now > slot_w:
+                    if (not overflow_ok) and line_w_now > slot_w and not item.get("preserve_sentence_integrity"):
                         wds = line.split()
                         if len(wds) > 1:
                             line, tail = self._consume_words_for_width(wds, slot_w, fs, fontname, fontfile)
@@ -2835,12 +4161,22 @@ class DocumentReconstructor:
                 right=slot.x1,
                 is_last_line=(not words and not preset_lines),
             )
+            preferred_left_x = slot.x0
+            if (
+                preserve_linebreaks
+                and item.get("preserve_block_left_anchor")
+                and item.get("role") == "body"
+            ):
+                try:
+                    preferred_left_x = max(left, min(right - 6.0, float(item.get("preferred_left_x_pt", slot.x0))))
+                except Exception:
+                    preferred_left_x = slot.x0
             line_x = self._compute_aligned_x(
                 alignment=expected_align,
                 line_w=line_w,
-                left=slot.x0,
+                left=preferred_left_x,
                 right=slot.x1,
-                preferred_x=slot.x0,
+                preferred_x=preferred_left_x,
                 is_last_line=(not words and not preset_lines),
             )
             baseline = slot.y0 + min(slot_h * 0.82, slot_h - 1.0)
@@ -2851,6 +4187,8 @@ class DocumentReconstructor:
                     if accent is not None:
                         line_rgb = accent
             if render:
+                if self._should_whiteout_per_line(item):
+                    self._whiteout_rect(page, slot, pad_x=0.8, pad_y=0.35)
                 self._safe_insert_text_dedup(page, (line_x, baseline), line, fs, fontname, line_rgb)
             if render and self.style_audit_enabled:
                 exp_color = style.get("color", "#000000")
@@ -2936,6 +4274,14 @@ class DocumentReconstructor:
     def _save_layout_debug_overlays(self, doc, debug_store, output_path):
         out_dir = os.path.dirname(output_path) or "."
         base = os.path.splitext(os.path.basename(output_path))[0]
+        def _norm_debug_rect(rect):
+            try:
+                r = fitz.Rect(rect).normalize()
+            except Exception:
+                return None
+            if r.x1 < r.x0 or r.y1 < r.y0:
+                return None
+            return r
         for page_idx, rects in debug_store.items():
             if page_idx < 0 or page_idx >= len(doc):
                 continue
@@ -2945,8 +4291,14 @@ class DocumentReconstructor:
             draw = ImageDraw.Draw(img)
             s = float(self.layout_debug_dpi) / 72.0
             for r in rects.get("blue", []):
+                r = _norm_debug_rect(r)
+                if r is None:
+                    continue
                 draw.rectangle([r.x0 * s, r.y0 * s, r.x1 * s, r.y1 * s], outline=(0, 90, 255), width=3)
             for r in rects.get("red", []):
+                r = _norm_debug_rect(r)
+                if r is None:
+                    continue
                 draw.rectangle([r.x0 * s, r.y0 * s, r.x1 * s, r.y1 * s], outline=(255, 0, 0), width=1)
             out_path = os.path.join(out_dir, f"{base}_layout_debug_p{page_idx + 1}.jpg")
             img.save(out_path, quality=92)
@@ -3432,6 +4784,13 @@ class DocumentReconstructor:
             if rect.y0 >= page_rect.y0 and rect.y1 <= page_rect.y1:
                 if not self._has_overlap(rect, placed_rects) and not self._has_overlap(rect, forbidden_rects):
                     return rect
+            x_step = max(4.0, step * 0.9)
+            for dx in (x_step, -x_step, x_step * 2.0, -x_step * 2.0):
+                cand = fitz.Rect(rect.x0 + dx, rect.y0, rect.x1 + dx, rect.y1)
+                cand = self._clamp_rect_to_page(cand, page_rect)
+                if cand.y0 >= page_rect.y0 and cand.y1 <= page_rect.y1:
+                    if not self._has_overlap(cand, placed_rects) and not self._has_overlap(cand, forbidden_rects):
+                        return cand
             rect = fitz.Rect(rect.x0, rect.y0 + step, rect.x1, rect.y1 + step)
         return target_rect
 

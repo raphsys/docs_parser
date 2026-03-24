@@ -76,6 +76,80 @@ def _looks_symbolic(text):
     return False
 
 
+def _is_shared_technical_term_fr(text):
+    tokens = _tokenize(text)
+    if not tokens:
+        return False
+    allowed = {
+        "image",
+        "images",
+        "convolution",
+        "convolutions",
+        "pixel",
+        "pixels",
+    }
+    return all(tok in allowed for tok in tokens)
+
+
+def _is_preservable_symbolic_clause(text, document_type="", layout_type=""):
+    src = _normalize_spaces(text)
+    if not src:
+        return False
+    if not re.search(r"[<>=%]", src):
+        return False
+    if not re.search(r"\b(value is|which means|means that|less than|greater than)\b", src, flags=re.IGNORECASE):
+        return False
+
+    doc_kind = _normalize_spaces(document_type).lower()
+    layout_kind = _normalize_spaces(layout_type).lower()
+    if layout_kind == "table_dominant" and doc_kind in {"form", "invoice", "receipt", "mixed_unknown"}:
+        return True
+
+    # Fallback for short operator clauses that are structurally tied to a diagram,
+    # table cell, or formula explanation even when page-level metadata is incomplete.
+    tokens = _tokenize(src)
+    if len(tokens) > 8:
+        return False
+    if len(src) > 48:
+        return False
+    return bool(re.search(r"\b(value|means|than)\b", src, flags=re.IGNORECASE))
+
+
+def _is_preservable_short_label_fr(text, unit_type=""):
+    unit_type = _normalize_spaces(unit_type).lower()
+    if unit_type not in {"short_label", "chart_label"}:
+        return False
+    raw = _normalize_spaces(text)
+    tokens = _tokenize(text)
+    if len(tokens) != 1:
+        return False
+    if len(raw) > 32:
+        return False
+    if re.search(r"\d", raw):
+        return False
+    return bool(re.fullmatch(r"[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]{2,31}", raw))
+
+
+def _is_figure_reference_label(text):
+    raw = _normalize_spaces(text)
+    if not raw:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[\(\[]?(?:fig(?:ure)?|figure)\s+\d+(?:\.\d+){0,3}(?:[\)\]])?(?:[.:;])?",
+            raw,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_numeric_heading_marker(text):
+    raw = _normalize_spaces(text)
+    if not raw:
+        return False
+    return bool(re.fullmatch(r"\d+(?:\.\d+){1,5}\.?", raw))
+
+
 def _guess_source_text(unit):
     return _normalize_spaces(
         unit.get("texte_original")
@@ -98,12 +172,50 @@ def _guess_translated_text(unit):
 def _iter_phrase_units(page):
     if not isinstance(page, dict):
         return
+    descriptor = page.get("layout_descriptor") or ((page.get("layout") or {}).get("layout_descriptor")) or {}
+    descriptor_elements = {
+        str(el.get("id")): el
+        for el in (descriptor.get("elements") or [])
+        if isinstance(el, dict) and el.get("id")
+    }
+    descriptor_groups = {
+        str(gr.get("id")): gr
+        for gr in (descriptor.get("groups") or [])
+        if isinstance(gr, dict) and gr.get("id")
+    }
+    descriptor_constraints = {}
+    for constraint in (descriptor.get("constraints") or []):
+        if not isinstance(constraint, dict):
+            continue
+        element_id = str(constraint.get("element_id") or "")
+        if not element_id:
+            continue
+        descriptor_constraints.setdefault(element_id, []).append(constraint)
+    page_family = page.get("page_family") or ((page.get("layout") or {}).get("page_family")) or ""
+    page_family_group = page.get("page_family_group") or ((page.get("layout") or {}).get("page_family_group")) or page_family
+    document_type = page.get("document_type") or ((page.get("layout") or {}).get("document_type")) or ""
+    layout_type = page.get("layout_type") or ((page.get("layout") or {}).get("layout_type")) or ""
+    style_profile = page.get("style_profile") or ((page.get("layout") or {}).get("style_profile")) or ""
     blocks = page.get("blocks", []) or []
     for b_idx, block in enumerate(blocks):
+        block_id = str(block.get("id") or "")
+        descriptor_block = descriptor_elements.get(block_id) if block_id else None
+        paragraph_group = None
+        if isinstance(descriptor_block, dict):
+            paragraph_id = str(descriptor_block.get("paragraph_id") or "").strip()
+            if paragraph_id:
+                paragraph_group = descriptor_groups.get(paragraph_id)
+        block_constraints = descriptor_constraints.get(block_id, []) if block_id else []
+        preserve_sentence_integrity = bool(
+            any(str(c.get("type") or "") == "no_internal_sentence_break" for c in block_constraints)
+            or ((paragraph_group or {}).get("constraints") or {}).get("can_break_inside_sentence") is False
+        )
         lines = block.get("lines", []) or []
         for l_idx, line in enumerate(lines):
             phrases = line.get("phrases", []) or []
             for p_idx, phrase in enumerate(phrases):
+                spans = phrase.get("spans", []) or []
+                skip_flags = [bool(sp.get("skip_render", False)) for sp in spans if isinstance(sp, dict)]
                 unit = {
                     "page_id": page.get("page", 0),
                     "block_index": b_idx,
@@ -115,6 +227,24 @@ def _iter_phrase_units(page):
                     "translation_strategy": phrase.get("translation_strategy") or block.get("translation_strategy") or "semantic_reflow",
                     "coverage_required": phrase.get("coverage_required") or block.get("coverage_required") or "strict",
                     "translatable": bool(phrase.get("translatable", block.get("translatable", True))),
+                    "render_policy": phrase.get("render_policy") or line.get("render_policy") or block.get("render_policy") or "",
+                    "block_render_policy": block.get("render_policy") or "",
+                    "render_mode": phrase.get("render_mode") or line.get("render_mode") or block.get("render_mode") or "",
+                    "unit_type": phrase.get("unit_type") or line.get("unit_type") or block.get("unit_type") or "",
+                    "page_family": page_family,
+                    "page_family_group": page_family_group,
+                    "document_type": document_type,
+                    "layout_type": layout_type,
+                    "style_profile": style_profile,
+                    "preserve_sentence_integrity": preserve_sentence_integrity,
+                    "descriptor_paragraph_id": str((paragraph_group or {}).get("id") or ""),
+                    "block_unit_id": block.get("unit_id") or block_id or f"blk_{b_idx}",
+                    "block_source_text": _normalize_spaces(block.get("text") or ""),
+                    "block_translated_text": _normalize_spaces(block.get("translated_text") or ""),
+                    "block_is_primary_render_unit": l_idx == 0 and p_idx == 0,
+                    "visible_text": _normalize_spaces(phrase.get("text") or ""),
+                    "has_skipped_spans": any(skip_flags),
+                    "all_spans_skip_render": bool(skip_flags) and all(skip_flags),
                     "source_text": _guess_source_text(phrase),
                     "translated_text": _guess_translated_text(phrase),
                 }
@@ -182,14 +312,18 @@ def _classify_unit_status(unit, target_lang="fr"):
     strategy = unit["translation_strategy"]
     required = unit["coverage_required"]
     translatable = unit["translatable"]
+    unit_type = _normalize_spaces(unit.get("unit_type") or "").lower()
 
     if not source_text:
         return "ignored", "empty_source"
     if required != "strict":
         return "optional", "coverage_optional"
     if not translatable or strategy == "exact_preserve":
+        visible_text = _normalize_spaces(unit.get("visible_text") or "")
         if translated_text == source_text:
             return "covered", "preserved"
+        if visible_text and _normalize_text(visible_text) and _normalize_text(visible_text) in _normalize_text(translated_text):
+            return "covered", "preserved_visible_snippet"
         return "warning", "preserve_mismatch"
     if _looks_page_number(source_text):
         return "covered", "page_marker"
@@ -205,6 +339,20 @@ def _classify_unit_status(unit, target_lang="fr"):
 
     if strategy == "layout_constrained":
         if src_norm == tgt_norm:
+            if unit_type in {"reference_link", "citation"}:
+                return "covered", "reference_or_citation_preserved"
+            if target_lang == "fr" and _is_figure_reference_label(source_text):
+                return "covered", "figure_reference_preserved"
+            if target_lang == "fr" and _is_shared_technical_term_fr(source_text):
+                return "covered", "shared_technical_term"
+            if target_lang == "fr" and _is_preservable_symbolic_clause(
+                source_text,
+                document_type=unit.get("document_type") or "",
+                layout_type=unit.get("layout_type") or "",
+            ):
+                return "covered", "preserved_symbolic_clause"
+            if target_lang == "fr" and _is_preservable_short_label_fr(source_text, unit_type=unit_type):
+                return "covered", "preserved_short_label"
             if target_lang == "fr" and re.search(r"[A-Za-z]", source_text):
                 return "warning", "layout_unchanged"
             return "covered", "layout_preserved"
@@ -308,7 +456,12 @@ def _extract_rendered_page_texts(pdf_path):
     pages = []
     try:
         for page in doc:
-            text = page.get_text("text") or ""
+            words = page.get_text("words") or []
+            if words:
+                words = sorted(words, key=lambda w: (w[5], w[6], w[7], round(w[1], 3), round(w[0], 3)))
+                text = " ".join(str(w[4]) for w in words if str(w[4]).strip())
+            else:
+                text = page.get_text("text") or ""
             pages.append(_normalize_spaces(text))
     finally:
         doc.close()
@@ -318,6 +471,22 @@ def _extract_rendered_page_texts(pdf_path):
 def _expected_rendered_text(unit):
     strategy = unit.get("translation_strategy") or "semantic_reflow"
     translatable = bool(unit.get("translatable", True))
+    render_policy = _normalize_spaces(unit.get("render_policy") or "").lower()
+    block_render_policy = _normalize_spaces(unit.get("block_render_policy") or "").lower()
+    render_mode = _normalize_spaces(unit.get("render_mode") or "").lower()
+    visible_text = _normalize_spaces(unit.get("visible_text") or "")
+    if render_policy == "background_only" or render_mode == "background_only":
+        return ""
+    if block_render_policy == "paragraph_flow" and str(unit.get("role") or "").strip().lower() == "body":
+        if not bool(unit.get("block_is_primary_render_unit")):
+            return ""
+        block_text = _normalize_spaces(unit.get("block_translated_text") or unit.get("block_source_text") or "")
+        if block_text:
+            return block_text
+    if bool(unit.get("all_spans_skip_render")):
+        return ""
+    if bool(unit.get("has_skipped_spans")) and visible_text and (not translatable or strategy == "exact_preserve"):
+        return visible_text
     if not translatable or strategy == "exact_preserve":
         return _normalize_spaces(unit.get("source_text") or unit.get("translated_text") or "")
     return _normalize_spaces(unit.get("translated_text") or unit.get("source_text") or "")
@@ -387,10 +556,27 @@ def _classify_rendered_presence(unit, page_text, full_text=""):
     full_ratio = _ordered_subsequence_ratio(expected_tokens, full_tokens)
     if full_ratio >= 1.0:
         return "covered", "document_ordered_token_match", expected
+    role = _normalize_spaces(unit.get("role") or "").lower()
+    if role == "header":
+        page_compact = re.sub(r"\s+", "", page_norm)
+        expected_compact = re.sub(r"\s+", "", expected_norm)
+        full_compact = re.sub(r"\s+", "", full_norm)
+        if expected_compact and expected_compact in page_compact:
+            return "covered", "header_compact_match", expected
+        if expected_compact and full_compact and expected_compact in full_compact:
+            return "covered", "document_header_compact_match", expected
+    if _is_numeric_heading_marker(expected):
+        if ratio >= 0.6:
+            return "covered", "heading_marker_partial_match", expected
+        if full_ratio >= 0.6:
+            return "covered", "document_heading_marker_partial_match", expected
+    sentence_strict = bool(unit.get("preserve_sentence_integrity"))
     if ratio >= 0.6:
-        return "warning", "partial_token_match", expected
+        return ("warning", "sentence_truncated", expected) if sentence_strict else ("warning", "partial_token_match", expected)
     if full_ratio >= 0.6:
-        return "warning", "document_partial_token_match", expected
+        return ("warning", "document_sentence_truncated", expected) if sentence_strict else ("warning", "document_partial_token_match", expected)
+    if sentence_strict and (ratio >= 0.3 or full_ratio >= 0.3):
+        return "missing", "sentence_not_fully_rendered", expected
     return "missing", "not_rendered", expected
 
 

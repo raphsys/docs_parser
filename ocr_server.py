@@ -27,6 +27,9 @@ from visual_compare import compare_reconstruction
 from html_exporter import HtmlStyleExporter
 from coverage_validator import analyze_document_coverage, analyze_rendered_text_coverage
 from publication_qa import publication_qa
+from page_policy_matrix import PagePolicyMatrix
+from page_extraction_postprocessors import apply_page_extraction_postprocessors
+from layout_ai_enricher import get_layout_ai_enricher
 
 # --- Configuration ---
 UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'uploads', 'converted_pages', 'ocr_results'
@@ -48,6 +51,8 @@ layout_optimizer = LayoutOptimizer()
 text_removal_strategy = TextRemovalStrategy()
 native_pdf_extractor = NativePDFExtractor()
 html_exporter = HtmlStyleExporter()
+page_policy_matrix = PagePolicyMatrix()
+layout_ai_enricher = get_layout_ai_enricher()
 _translator_instance = None
 
 
@@ -61,6 +66,14 @@ def get_translator():
         raise RuntimeError(f"Impossible de charger le module de traduction: {e}") from e
     _translator_instance = DocumentTranslator()
     return _translator_instance
+
+
+def _safe_runtime_stem(filename: str) -> str:
+    name = os.path.basename(str(filename or "")).strip()
+    if not name:
+        return "document"
+    name = re.sub(r"[^\w.\-]+", "_", name)
+    return name[:180] or "document"
 
 
 def _find_office_binary():
@@ -144,6 +157,11 @@ def _is_equation_like_text(text):
     s = _norm_text(text or "")
     if not s:
         return False
+    words = re.findall(r"[a-zà-ÿ][a-zà-ÿ0-9'\-]*", s, flags=re.IGNORECASE)
+    # Natural-language fragments with several lexical words are not equations,
+    # even if they contain hyphens or punctuation.
+    if len(words) >= 4 and not re.search(r"[=<>±×÷∑∫∞≈≠≤≥√∆∂µλΩα-ωΑ-Ω]", s):
+        return False
     # Typical compact inline math/fragments.
     if len(s) <= 36:
         if re.search(r"(d[a-z]\s*/\s*d[a-z]|[a-z]\s*/\s*[a-z])", s):
@@ -180,6 +198,7 @@ def _is_immutable_inline_text(text):
     s = _norm_text(text or "")
     if not s:
         return False
+    lexical_words = re.findall(r"[a-zà-ÿ][a-zà-ÿ0-9'\-]*", s, flags=re.IGNORECASE)
     if re.fullmatch(r"[a-z]+-score", s, flags=re.IGNORECASE):
         return False
     # Preserve visual list markers / numbering exactly from source.
@@ -193,6 +212,8 @@ def _is_immutable_inline_text(text):
         return True
     if _is_reference_like_text(s):
         return True
+    if len(lexical_words) >= 4:
+        return False
     # chemistry-like formulas
     if re.fullmatch(r"(?:[A-Z][a-z]?\d*){2,}", s):
         return True
@@ -603,74 +624,103 @@ def _postprocess_blocks(blocks, img_w, img_h):
     return grouped
 
 
-def _annotate_translation_contracts(blocks):
+def _annotate_translation_contracts(blocks, page_context=None):
+    page_context = page_context or {}
+    page_role = page_context.get("page_role") or "body"
+    page_family = page_context.get("page_family") or "body_text"
+    page_family_group = page_context.get("page_family_group") or page_family
+    document_type = page_context.get("document_type") or "mixed_unknown"
+    layout_type = page_context.get("layout_type") or "mixed_blocks"
+    style_profile = page_context.get("style_profile") or "mixed_irregular"
+    page_case = page_context.get("page_case") or {}
+    fallback_policy = page_case.get("fallback_policy") or ""
+
     def classify_text(text, role, source_kind):
-        txt = _normalize_spaces(text)
-        role = (role or "body").strip().lower()
-        source_kind = (source_kind or "").strip().lower()
-        if not txt:
-            return False, "ignore", "optional"
-        if role in {"equation_inline", "diagram_label"}:
-            return False, "exact_preserve", "strict"
-        if role in {"header", "footer"} and re.fullmatch(r"\d{1,4}|[ivxlcdm]+", txt, flags=re.I):
-            return False, "exact_preserve", "strict"
-        if re.fullmatch(r"[•▪◦·\-\*]", txt):
-            return False, "exact_preserve", "strict"
-        if re.fullmatch(r"\d{1,4}([.)]|)", txt):
-            return False, "exact_preserve", "strict"
-        if re.fullmatch(r"[A-Z]{2,5}", txt):
-            return False, "exact_preserve", "strict"
-        if role in {"title", "section_heading", "figure_caption", "diagram_text_label"}:
-            return True, "layout_constrained", "strict"
-        if source_kind in {"native_span", "native_phrase"} and len(txt.split()) <= 10:
-            return True, "layout_constrained", "strict"
-        return True, "semantic_reflow", "strict"
+        return page_policy_matrix.classify_unit_policy(
+            text=text,
+            role=role,
+            source_kind=source_kind,
+            page_role=page_role,
+            page_family=page_family,
+            page_family_group=page_family_group,
+            document_type=document_type,
+            layout_type=layout_type,
+            style_profile=style_profile,
+            fallback_policy=fallback_policy,
+        )
+
+    def inherit_reference_policy(parent_unit_type, parent_policy, child_policy):
+        parent_kind = _normalize_spaces(parent_unit_type).lower()
+        child_kind = _normalize_spaces((child_policy or {}).get("unit_type") or "").lower()
+        if parent_kind not in {"citation", "reference_link"}:
+            return child_policy
+        if child_kind in {"citation", "reference_link", "code_visible", "formula", "formula_label"}:
+            return child_policy
+        inherited = dict(child_policy or {})
+        inherited["unit_type"] = parent_kind
+        inherited["translatable"] = bool(parent_policy.get("translatable"))
+        inherited["translation_strategy"] = parent_policy.get("translation_strategy")
+        inherited["coverage_required"] = parent_policy.get("coverage_required")
+        inherited["render_policy"] = parent_policy.get("render_policy")
+        return inherited
 
     for b_idx, block in enumerate(blocks or []):
         role = block.get("role", "body")
         source = block.get("source", "ocr")
         source_kind = block.get("source_kind") or ("native_block" if source == "native" else "ocr_block")
         text = block.get("text") or _block_text(block)
-        translatable, strategy, coverage = classify_text(text, role, source_kind)
+        policy = classify_text(text, role, source_kind)
         block["unit_id"] = block.get("id") or f"blk_{b_idx}"
         block["source_kind"] = source_kind
         block["text"] = text
         block["text_normalized"] = _normalize_spaces(text)
-        block["translatable"] = bool(translatable)
-        block["translation_strategy"] = strategy
-        block["coverage_required"] = coverage
+        block["translatable"] = bool(policy["translatable"])
+        block["unit_type"] = policy.get("unit_type") or ""
+        block["translation_strategy"] = policy["translation_strategy"]
+        block["coverage_required"] = policy["coverage_required"]
+        block["render_policy"] = policy["render_policy"]
         for l_idx, line in enumerate(block.get("lines", []) or []):
             l_txt = line.get("line_text") or _line_phrase_text(line)
             l_kind = line.get("source_kind") or ("native_line" if source == "native" else "ocr_line")
-            l_translatable, l_strategy, l_coverage = classify_text(l_txt, role, l_kind)
+            l_policy = classify_text(l_txt, role, l_kind)
+            l_policy = inherit_reference_policy(block.get("unit_type"), policy, l_policy)
             line["unit_id"] = f"{block['unit_id']}:line:{l_idx}"
             line["source_kind"] = l_kind
             line["text"] = l_txt
             line["text_normalized"] = _normalize_spaces(l_txt)
-            line["translatable"] = bool(l_translatable)
-            line["translation_strategy"] = l_strategy
-            line["coverage_required"] = l_coverage
+            line["translatable"] = bool(l_policy["translatable"])
+            line["unit_type"] = l_policy.get("unit_type") or ""
+            line["translation_strategy"] = l_policy["translation_strategy"]
+            line["coverage_required"] = l_policy["coverage_required"]
+            line["render_policy"] = l_policy["render_policy"]
             for p_idx, phrase in enumerate(line.get("phrases", []) or []):
-                p_txt = _phrase_render_text(phrase)
+                p_render_txt = _phrase_render_text(phrase)
+                p_txt = _normalize_spaces(phrase.get("texte") or p_render_txt)
                 p_kind = phrase.get("source_kind") or ("native_phrase" if source == "native" else "ocr_phrase")
-                p_translatable, p_strategy, p_coverage = classify_text(p_txt, role, p_kind)
+                p_policy = classify_text(p_txt, role, p_kind)
+                p_policy = inherit_reference_policy(line.get("unit_type") or block.get("unit_type"), l_policy, p_policy)
                 phrase["unit_id"] = f"{line['unit_id']}:phrase:{p_idx}"
                 phrase["source_kind"] = p_kind
-                phrase["text"] = p_txt
-                phrase["text_normalized"] = _normalize_spaces(p_txt)
-                phrase["translatable"] = bool(p_translatable)
-                phrase["translation_strategy"] = p_strategy
-                phrase["coverage_required"] = p_coverage
+                phrase["text"] = p_render_txt
+                phrase["text_normalized"] = _normalize_spaces(p_render_txt)
+                phrase["translatable"] = bool(p_policy["translatable"])
+                phrase["unit_type"] = p_policy.get("unit_type") or ""
+                phrase["translation_strategy"] = p_policy["translation_strategy"]
+                phrase["coverage_required"] = p_policy["coverage_required"]
+                phrase["render_policy"] = p_policy["render_policy"]
                 for s_idx, span in enumerate(phrase.get("spans", []) or []):
                     s_txt = _normalize_spaces(span.get("texte", ""))
                     s_kind = span.get("source_kind") or ("native_span" if source == "native" else "ocr_span")
-                    s_translatable, s_strategy, s_coverage = classify_text(s_txt, role, s_kind)
+                    s_policy = classify_text(s_txt, role, s_kind)
+                    s_policy = inherit_reference_policy(phrase.get("unit_type") or line.get("unit_type") or block.get("unit_type"), p_policy, s_policy)
                     span["unit_id"] = f"{phrase['unit_id']}:span:{s_idx}"
                     span["source_kind"] = s_kind
                     span["text_normalized"] = s_txt
-                    span["translatable"] = bool(s_translatable)
-                    span["translation_strategy"] = s_strategy
-                    span["coverage_required"] = s_coverage
+                    span["translatable"] = bool(s_policy["translatable"])
+                    span["unit_type"] = s_policy.get("unit_type") or ""
+                    span["translation_strategy"] = s_policy["translation_strategy"]
+                    span["coverage_required"] = s_policy["coverage_required"]
+                    span["render_policy"] = s_policy["render_policy"]
 
 
 def _detect_leading_marker(text):
@@ -1431,13 +1481,14 @@ def _write_layout_xml(blocks, filename, page_idx, img_w, img_h):
                             "flags": json.dumps(st.get("flags", {}), ensure_ascii=False),
                         },
                     )
-    out_name = f"layout_{filename}_{page_idx}.xml"
+    out_name = f"layout_{_safe_runtime_stem(filename)}_{page_idx}.xml"
     out_path = os.path.join(RESULTS_DIR, out_name)
     ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
     return out_path
 
 
 def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default"):
+    safe_filename = _safe_runtime_stem(filename)
     source_fn = f"src_{uuid.uuid4().hex}_{idx + 1}.png"
     source_path = os.path.join(RESULTS_DIR, source_fn)
     try:
@@ -1494,9 +1545,9 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     immutable_overlays = _extract_immutable_overlays(final_blocks, img, filename, idx)
 
     layout_meta = _annotate_layout(final_blocks, img.width, img.height)
-    style_profile = {}
+    visual_style_profile = {}
     try:
-        final_blocks, style_profile = build_page_style_profile(
+        final_blocks, visual_style_profile = build_page_style_profile(
             final_blocks,
             layout_meta=layout_meta,
             page_width=img.width,
@@ -1514,17 +1565,17 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     try:
         text_regions = _collect_text_regions_for_inpainting(final_blocks, non_text_zones, immutable_overlays=immutable_overlays)
         clean_bgr, mask, text_removal_debug = text_removal_strategy.remove(img, text_regions, mode=text_removal_mode)
-        bg_name = f"bg_master_{filename}_{idx}.png"
+        bg_name = f"bg_master_{safe_filename}_{idx}.png"
         bg_master_path = os.path.join(RESULTS_DIR, bg_name)
         cv2.imwrite(bg_master_path, clean_bgr)
-        mask_name = f"mask_master_{filename}_{idx}.png"
+        mask_name = f"mask_master_{safe_filename}_{idx}.png"
         mask_master_path = os.path.join(RESULTS_DIR, mask_name)
         cv2.imwrite(mask_master_path, mask)
     except Exception as e:
         print(f"Erreur génération fond maître chirurgical : {e}")
 
     # 4. VISUALISATION (Bboxes colorées pour l aperçu)
-    vis_fn = f"vis_{filename}_{idx}.jpg"
+    vis_fn = f"vis_{safe_filename}_{idx}.jpg"
     img_draw = img.copy()
     draw = ImageDraw.Draw(img_draw)
     
@@ -1621,7 +1672,8 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "drawings": native_drawings,
         "layout": layout_meta,
         "layout_xml_path": layout_xml_path,
-        "style_profile": style_profile,
+        "visual_style_profile": visual_style_profile,
+        "style_profile": visual_style_profile,
         "font_ai_summary": font_ai_summary,
         "layout_version": "v4_layout_roles_alignment_style_profile",
         "dimensions": {"width": img.width, "height": img.height},
@@ -1629,6 +1681,15 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     try:
         # Canonical structure enrichment for stable translation/reconstruction.
         page_structure = layout_v2_builder.build(page_structure)
+        page_structure, layout_ai_info = layout_ai_enricher.enrich(page_structure, img)
+        if layout_ai_info.get("applied"):
+            page_structure = layout_v2_builder.build(page_structure)
+        page_structure, postprocess_info = apply_page_extraction_postprocessors(page_structure)
+        if postprocess_info.get("changed") or postprocess_info.get("applied") or page_structure.get("native_structure"):
+            page_structure = layout_v2_builder.build(page_structure)
+        page_structure["layout_ai"] = layout_ai_info
+        page_structure["extraction_postprocess"] = postprocess_info
+        _annotate_translation_contracts(page_structure.get("blocks", []), page_context=page_structure)
     except Exception as e:
         print(f"Erreur LayoutV2Builder: {e}")
 
@@ -1637,6 +1698,13 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "content": display_text,
         "hierarchical_extraction": hierarchical_extraction,
         "fidelity_layout": fidelity_layout,
+        "page_role": page_structure.get("page_role"),
+        "document_type": page_structure.get("document_type"),
+        "layout_type": page_structure.get("layout_type"),
+        "style_profile": page_structure.get("style_profile"),
+        "page_family": page_structure.get("page_family"),
+        "page_family_group": page_structure.get("page_family_group"),
+        "page_case": page_structure.get("page_case"),
         "structure": page_structure,
         "visual_url": f"/results/{vis_fn}"
     }
@@ -1808,7 +1876,7 @@ async def translate_units(data: dict):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/translate")
-async def translate_structure_endpoint(data: dict, target_lang: str = "French"):
+async def translate_structure_endpoint(data: dict, target_lang: str = "French", style: str = None, tone: str = None):
     try:
         structure = data
         if isinstance(structure, dict) and "structure" in structure:
@@ -1833,11 +1901,11 @@ async def translate_structure_endpoint(data: dict, target_lang: str = "French"):
                 ):
                     pages.append(translator.translate_layout_v2(page, target_lang=target_lang))
                 else:
-                    pages.append(translator.translate_page(page, target_lang=target_lang) if isinstance(page, dict) else page)
+                    pages.append(translator.translate_page(page, target_lang=target_lang, style=style, tone=tone) if isinstance(page, dict) else page)
             return JSONResponse(content={"status": "success", "structure": json_serializable({"pages": pages})})
 
         if isinstance(structure, dict):
-            translated = translator.translate_page(structure, target_lang=target_lang)
+            translated = translator.translate_page(structure, target_lang=target_lang, style=style, tone=tone)
             return JSONResponse(content={"status": "success", "structure": json_serializable(translated)})
 
         return JSONResponse(content={"error": "Invalid payload: expected dict structure"}, status_code=400)
@@ -1846,7 +1914,7 @@ async def translate_structure_endpoint(data: dict, target_lang: str = "French"):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/reconstruct")
-async def reconstruct_document(data: dict, target_lang: str = None, debug_compare: bool = False, export_html: bool = False):
+async def reconstruct_document(data: dict, target_lang: str = None, debug_compare: bool = False, export_html: bool = False, style: str = None, tone: str = None):
     try:
         if isinstance(data, dict) and "structure" in data:
             data = data["structure"]
@@ -1880,7 +1948,7 @@ async def reconstruct_document(data: dict, target_lang: str = None, debug_compar
                     page = translator.translate_layout_v2(page, target_lang=target_lang)
                 else:
                     # 1. Traduction par bloc
-                    page = translator.translate_page(page, target_lang=target_lang)
+                    page = translator.translate_page(page, target_lang=target_lang, style=style, tone=tone)
                 # 2. Réajustement géométrique optionnel (désactivé par défaut pour préserver les positions source).
                 if LAYOUT_OPTIMIZER_ON_TRANSLATION:
                     page = layout_optimizer.adjust_layout(page)

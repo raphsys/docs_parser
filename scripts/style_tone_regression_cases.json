@@ -1,0 +1,24 @@
+[
+  {
+    "text": "Why do we need dropout layers?",
+    "block_role": "title",
+    "strategy": "layout_constrained",
+    "target_lang": "fr",
+    "profiles": [
+      {"style": "academique", "tone": "formel"},
+      {"style": "pedagogique", "tone": "didactique"},
+      {"style": "professionnel", "tone": "neutre"}
+    ]
+  },
+  {
+    "text": "This model is useful and important for the analysis.",
+    "block_role": "body",
+    "strategy": "semantic_reflow",
+    "target_lang": "fr",
+    "profiles": [
+      {"style": "marketing", "tone": "persuasif"},
+      {"style": "academique", "tone": "formel"},
+      {"style": "scientifique", "tone": "analytique"}
+    ]
+  }
+]

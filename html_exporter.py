@@ -130,7 +130,9 @@ body {
         rules = []
         emitted = set()
         for page in pages:
-            profile = page.get("style_profile", {}) if isinstance(page, dict) else {}
+            profile = {}
+            if isinstance(page, dict):
+                profile = page.get("visual_style_profile") or page.get("style_profile", {})
             comp = profile.get("component_styles", {}) if isinstance(profile, dict) else {}
             for class_id, meta in comp.items():
                 css_id = _css_class_id(class_id)
@@ -146,7 +148,10 @@ body {
     def _render_page(self, page, idx):
         layout = page.get("layout", {}) if isinstance(page, dict) else {}
         margins = layout.get("margins", {}) if isinstance(layout, dict) else {}
-        grid = page.get("style_profile", {}).get("page_grid", {}) if isinstance(page, dict) else {}
+        visual_profile = {}
+        if isinstance(page, dict):
+            visual_profile = page.get("visual_style_profile") or page.get("style_profile", {})
+        grid = visual_profile.get("page_grid", {}) if isinstance(visual_profile, dict) else {}
         cols = int(grid.get("columns", 1) or 1)
         two_col = " two-col" if cols >= 2 else ""
         left_pad = int(margins.get("left", 0))

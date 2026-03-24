@@ -1,0 +1,23 @@
+[
+  {
+    "pdf": "tests/doc_pdf/test_docintelligence-8.pdf",
+    "target_lang": "fr",
+    "min_content_coverage": 1.0,
+    "min_rendered_coverage": 1.0,
+    "min_visual_similarity": 0.75
+  },
+  {
+    "pdf": "tests/doc_pdf/test_docintelligence-148.pdf",
+    "target_lang": "fr",
+    "min_content_coverage": 1.0,
+    "min_rendered_coverage": 1.0,
+    "min_visual_similarity": 0.75
+  },
+  {
+    "pdf": "tests/doc_pdf/test_docintelligence-336.pdf",
+    "target_lang": "fr",
+    "min_content_coverage": 1.0,
+    "min_rendered_coverage": 0.93,
+    "min_visual_similarity": 0.90
+  }
+]

@@ -144,6 +144,10 @@ class FontResolver:
     def resolve(self, style: Dict) -> Dict[str, Optional[str]]:
         font_name = style.get("font", "") or ""
         flags = style.get("flags", {}) or {}
+        embedded_font_path = str(style.get("embedded_font_path") or "").strip()
+
+        if embedded_font_path and os.path.isfile(embedded_font_path):
+            return {"fontfile": embedded_font_path, "builtin": None}
 
         if font_name:
             exact_key = self._normalize_name(font_name)

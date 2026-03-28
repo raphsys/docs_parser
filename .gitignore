@@ -37,6 +37,9 @@ build/
 dist/
 downloads/
 eggs/
+node_modules/
+npm-debug.log*
+.npm-cache/
 *.egg-info/
 *.egg
 MANIFEST
@@ -51,17 +54,25 @@ tmp/
 uploads/
 ocr_results/
 converted_pages/
+results/
 tests/output/
 *.bak
 *.bak_xml
 *.crdownload
+scripts/
 
 # Local model / data caches and experiment outputs
 checkpoints/
 runs/
 wandb/
 models/
-ai_models/translation/
+frontend-expo/.expo/
+ai_models/translation/*
+!ai_models/translation/model_inventory.json
+!ai_models/translation/translation_profiles.json
+!ai_models/translation/style_tone_profiles.json
+ai_models/ppstructurev3/*
+!ai_models/ppstructurev3/README.md
 datasets/terminology_sources/
 
 # Large model/binary files

@@ -1,4 +1,7 @@
+import hashlib
+import os
 import re
+import tempfile
 
 
 def _normalize_font_key(font_name: str) -> str:
@@ -57,12 +60,107 @@ class NativePDFExtractor:
     - source_kind / translatability hooks for later translation planning
     """
 
-    def _build_style(self, font_name, span_text, size, color):
+    def __init__(self, embedded_font_cache_dir=None):
+        cache_dir = embedded_font_cache_dir or os.getenv("LAYOUT_EMBEDDED_FONT_CACHE_DIR", "").strip()
+        if not cache_dir:
+            cache_dir = os.path.join(tempfile.gettempdir(), "docs_parser_embedded_fonts")
+        self.embedded_font_cache_dir = cache_dir
+        self._embedded_font_file_cache = {}
+        self._embedded_font_map_cache = {}
+
+    def _doc_cache_key(self, pdf_page):
+        doc = getattr(pdf_page, "parent", None)
+        doc_name = ""
+        try:
+            doc_name = os.path.realpath(getattr(doc, "name", "") or "")
+        except Exception:
+            doc_name = ""
+        return doc_name or f"mem:{id(doc)}"
+
+    def _ensure_embedded_font_cache_dir(self):
+        try:
+            os.makedirs(self.embedded_font_cache_dir, exist_ok=True)
+        except Exception:
+            return None
+        return self.embedded_font_cache_dir
+
+    def _extract_embedded_font_file(self, pdf_page, xref, font_name):
+        doc = getattr(pdf_page, "parent", None)
+        if doc is None:
+            return None
+        cache_key = (self._doc_cache_key(pdf_page), int(xref))
+        cached = self._embedded_font_file_cache.get(cache_key)
+        if cached and os.path.isfile(cached):
+            return cached
+
+        cache_dir = self._ensure_embedded_font_cache_dir()
+        if not cache_dir:
+            return None
+
+        try:
+            extracted = doc.extract_font(int(xref))
+        except Exception:
+            return None
+        if not extracted or len(extracted) < 4:
+            return None
+
+        ext = str(extracted[1] or "bin").strip().lower()
+        font_bytes = extracted[3]
+        if not font_bytes:
+            return None
+        ext = re.sub(r"[^a-z0-9]+", "", ext) or "bin"
+        font_key = _normalize_font_key(font_name or extracted[0] or f"font{xref}") or f"font{xref}"
+        digest = hashlib.sha1(font_bytes).hexdigest()[:12]
+        out_path = os.path.join(cache_dir, f"{font_key}-{int(xref)}-{digest}.{ext}")
+        if not os.path.isfile(out_path):
+            with open(out_path, "wb") as fh:
+                fh.write(font_bytes)
+        self._embedded_font_file_cache[cache_key] = out_path
+        return out_path
+
+    def _get_page_embedded_font_map(self, pdf_page):
+        cache_key = (self._doc_cache_key(pdf_page), int(getattr(pdf_page, "number", -1)))
+        cached = self._embedded_font_map_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+        font_map = {}
+        try:
+            page_fonts = pdf_page.get_fonts(full=True) or []
+        except Exception:
+            page_fonts = []
+
+        for font_entry in page_fonts:
+            if not isinstance(font_entry, (list, tuple)) or len(font_entry) < 4:
+                continue
+            try:
+                xref = int(font_entry[0])
+            except Exception:
+                continue
+            font_name = str(font_entry[3] or "").strip()
+            if not font_name:
+                continue
+            font_path = self._extract_embedded_font_file(pdf_page, xref, font_name)
+            if not font_path:
+                continue
+            key_variants = {
+                _normalize_font_key(font_name),
+                _normalize_font_key(font_name.split("+", 1)[-1]),
+            }
+            for key in key_variants:
+                if key and key not in font_map:
+                    font_map[key] = font_path
+
+        self._embedded_font_map_cache[cache_key] = font_map
+        return font_map
+
+    def _build_style(self, font_name, span_text, size, color, embedded_font_path=None):
         low_font = (font_name or "").lower()
         return {
             "font": font_name,
             "font_name_raw": font_name,
             "font_key_normalized": _normalize_font_key(font_name),
+            "embedded_font_path": embedded_font_path,
             "size": float(size or 12.0),
             "color": _color_int_to_hex(color),
             "flags": {
@@ -123,6 +221,7 @@ class NativePDFExtractor:
     def extract_page(self, pdf_page, sx: float = 1.0, sy: float = 1.0):
         dict_text = pdf_page.get_text("dict")
         raw_text = pdf_page.get_text("rawdict")
+        embedded_font_map = self._get_page_embedded_font_map(pdf_page)
         native_blocks = []
         non_text_zones = []
         images = []
@@ -183,7 +282,13 @@ class NativePDFExtractor:
                         "source": "native",
                         "source_kind": "native_span",
                         "span_index": span_idx,
-                        "style": self._build_style(font_name, txt, s.get("size", 12.0), s.get("color", 0)),
+                        "style": self._build_style(
+                            font_name,
+                            txt,
+                            s.get("size", 12.0),
+                            s.get("color", 0),
+                            embedded_font_path=embedded_font_map.get(_normalize_font_key(font_name)),
+                        ),
                     }
                     span_payload.update(self._translatability_contract(txt))
                     current_spans.append(span_payload)

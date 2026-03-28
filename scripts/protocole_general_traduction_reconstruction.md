@@ -12,6 +12,10 @@ Obtenir un document traduit aussi proche que possible de l'original, quel que so
 - aucune sortie hors page
 - rejet automatique si la qualite n'atteint pas le seuil requis
 
+Exception explicite:
+
+- les annotations textuelles visuelles attendues sur image ou diagramme ne doivent pas etre traitees comme des collisions fautives
+
 ## Principe directeur
 
 Le systeme ne doit jamais etre optimise pour un fichier de test particulier.
@@ -28,12 +32,60 @@ Les specialisations sont autorisees:
 
 - par role documentaire
 - par famille de page
+- par classe de rendu semantique, y compris `visual_annotation_text`
 
 Elles sont interdites:
 
 - par nom de fichier
 - par corpus de test
 - par coordonnees hard-codees propres a une page de benchmark
+
+## Politique QA Des Annotations Visuelles
+
+Le systeme doit distinguer deux cas:
+
+1. texte editorial ordinaire superpose a une image
+2. annotation visuelle attendue, ancree a une image, un schema ou un graphe
+
+Seul le cas `1` est une collision bloquante.
+
+Le cas `2` doit etre modele explicitement comme `visual_annotation_text`.
+
+Une unite `visual_annotation_text` est definie par au moins un des signaux suivants:
+
+- `text_embedding_mode = embedded_in_visual`
+- `band_role in {annotation_band, legend_band, axis_band}`
+- `group_render_mode in {annotation_group, chart_legend_group, chart_axis_group, chart_series_group}`
+- `doc_role in {diagram_label, axis_label, legend_label}`
+
+Invariants QA associes:
+
+- une annotation visuelle peut legalement chevaucher une image raster
+- une annotation visuelle peut legalement generer un recouvrement geometrique avec une autre annotation visuelle proche
+- ces cas ne doivent pas etre comptes dans `text_img_collisions` ni dans `word_overlaps`
+- ils doivent etre suivis dans des compteurs separes `ignored_visual_annotation_*`
+- la qualite de ces zones doit etre evaluee par une metrique dediee de fidelite visuelle locale
+
+Metriques QA requises:
+
+- `text_img_collisions`: collisions bloquantes hors annotations visuelles
+- `word_overlaps`: overlaps bloquants hors annotations visuelles
+- `ignored_visual_annotation_text_img_collisions`
+- `ignored_visual_annotation_word_overlaps`
+- `visual_annotation_regions.background_similarity_score`
+
+Variables d'environnement QA:
+
+- `PUBLICATION_QA_VISUAL_MIN_SCORE`
+- `PUBLICATION_QA_VISUAL_ANNOTATION_MIN_SCORE`
+- `PUBLICATION_QA_MAX_WORD_OVERLAPS`
+- `PUBLICATION_QA_MAX_TEXT_IMAGE_COLLISIONS`
+
+Principe de rendu associe:
+
+- les annotations visuelles traduites doivent privilegier un rendu a slot exact ou quasi exact
+- le fond doit etre restaure localement
+- la QA doit valider la lisibilite et la fidelite locale, pas imposer l'absence absolue de texte sur image
 
 ## 1. Format canonique `layout.v3`
 
@@ -543,4 +595,3 @@ Une solution est acceptee seulement si elle est:
 - applicable a tout type de page via le meme protocole
 - specialisee uniquement par role documentaire ou famille de page
 - jamais par fichier de test
-

@@ -113,6 +113,37 @@ body {
   white-space: pre-wrap;
   word-wrap: break-word;
 }
+.toc-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.toc-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.toc-label {
+  min-width: 0;
+  flex: 1;
+}
+.toc-dots {
+  flex: 1;
+  min-width: 18px;
+  border-bottom: 1px dotted rgba(68, 92, 115, 0.55);
+  transform: translateY(-2px);
+}
+.toc-page-num {
+  flex: 0 0 auto;
+  text-align: right;
+  min-width: 32px;
+}
+.toc-role-toc-title .toc-dots {
+  display: none;
+}
+.toc-role-toc-title .toc-page-num {
+  min-width: 0;
+}
 .role-header, .role-footer {
   opacity: 0.86;
 }
@@ -145,6 +176,32 @@ body {
             rules.append(".cls-default { font-family: Arial, sans-serif; font-size: 12px; color: #222; }")
         return "\n".join(rules)
 
+    def _render_toc_page(self, page):
+        toc = page.get("toc") or {}
+        rows = toc.get("toc_rows") or []
+        if not rows:
+            return ""
+
+        body = ["<div class=\"toc-wrap\">"]
+        for row in rows:
+            role = str(row.get("role") or "toc-row").strip().lower()
+            label = (row.get("translated_label") or row.get("label") or "").strip()
+            page_num = (row.get("page") or "").strip()
+            marker = (row.get("marker") or "").strip()
+            if marker:
+                label = f"{marker} {label}".strip()
+            indent_px = float(row.get("indent_px", 0.0) or 0.0)
+            indent_css = max(0.0, indent_px / 4.0)
+            role_css = f"toc-role-{re.sub(r'[^a-zA-Z0-9_-]+', '-', role)}"
+            style_attr = f"margin-left:{indent_css:.1f}px;"
+            body.append(f"<div class=\"toc-row {role_css}\" style=\"{style_attr}\">")
+            body.append(f"<span class=\"toc-label\">{_safe_text(label)}</span>")
+            body.append("<span class=\"toc-dots\"></span>")
+            body.append(f"<span class=\"toc-page-num\">{_safe_text(page_num)}</span>")
+            body.append("</div>")
+        body.append("</div>")
+        return "\n".join(body)
+
     def _render_page(self, page, idx):
         layout = page.get("layout", {}) if isinstance(page, dict) else {}
         margins = layout.get("margins", {}) if isinstance(layout, dict) else {}
@@ -163,6 +220,17 @@ body {
         body.append(
             f"<div class=\"page-content\" style=\"padding:{max(6, top_pad//5)}px {max(8, right_pad//5)}px {max(6, bottom_pad//5)}px {max(8, left_pad//5)}px;\">"
         )
+        if (
+            isinstance(page, dict)
+            and page.get("schema_version") == "layout.v2"
+            and str(page.get("page_role") or "").strip().lower() == "toc"
+        ):
+            toc_html = self._render_toc_page(page)
+            if toc_html:
+                body.append(toc_html)
+                body.append("</div>")
+                body.append("</section>")
+                return "\n".join(body)
         for block in page.get("blocks", []):
             txt = _block_text(block)
             if not txt:

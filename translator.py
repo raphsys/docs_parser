@@ -4,6 +4,7 @@ import json
 import unicodedata
 from typing import Optional
 
+from block_typology import classify_block_typology
 from context_classifier import ContextClassifier
 from terminology_manager import TerminologyManager
 from style_tone_classifier import StyleToneClassifier
@@ -43,8 +44,10 @@ class DocumentTranslator:
         self._strict_gate = os.getenv("TRANSLATION_GATING_STRICT", "1").strip().lower() in {"1", "true", "yes", "on"}
         self._profiles_path = os.getenv("TRANSLATION_PROFILES_PATH", "ai_models/translation/translation_profiles.json")
         self._style_tone_profiles_path = os.getenv("TRANSLATION_STYLE_TONE_PROFILES_PATH", "ai_models/translation/style_tone_profiles.json")
+        self._model_inventory_path = os.getenv("TRANSLATION_MODEL_INVENTORY_PATH", "ai_models/translation/model_inventory.json")
         self._profiles = self._load_translation_profiles()
         self._style_tone_profiles = self._load_style_tone_profiles()
+        self._model_inventory = self._load_model_inventory()
         self._domain_glossaries = self._build_domain_glossaries()
         self._context_classifier = ContextClassifier()
         self._terminology_manager = TerminologyManager()
@@ -114,24 +117,136 @@ class DocumentTranslator:
         leak = self._source_leak_score(s, target_lang=tgt, source_lang=source_lang)
         return leak <= 1.15
 
+    def _default_model_inventory(self):
+        return {
+            "primary": [
+                {
+                    "name": "nllb_200_distilled_600m",
+                    "model_dir": "ai_models/translation/nllb_200_distilled_600m_ct2_int8",
+                    "tokenizer_dir": "ai_models/translation/nllb_200_distilled_600m_tokenizer",
+                    "family": "nllb",
+                },
+                {
+                    "name": "m2m100_418m",
+                    "model_dir": "ai_models/translation/m2m100_418m_ct2_int8",
+                    "tokenizer_dir": "ai_models/translation/m2m100_418m_tokenizer",
+                    "family": "m2m100",
+                },
+            ],
+            "fallback": [
+                {
+                    "name": "m2m100_418m",
+                    "model_dir": "ai_models/translation/m2m100_418m_ct2_int8",
+                    "tokenizer_dir": "ai_models/translation/m2m100_418m_tokenizer",
+                    "family": "m2m100",
+                }
+            ],
+            "enfr": [
+                {
+                    "name": "opus_mt_tc_big_en_fr",
+                    "model_dir": "ai_models/translation/opus_mt_tc_big_en_fr_ct2_int8",
+                    "tokenizer_dir": "ai_models/translation/opus_mt_tc_big_en_fr_tokenizer",
+                    "family": "marian",
+                }
+            ],
+        }
+
+    def _load_model_inventory(self):
+        inventory = self._default_model_inventory()
+        path = self._model_inventory_path
+        if not path or not os.path.isfile(path):
+            return inventory
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return inventory
+            for bucket in ("primary", "fallback", "enfr"):
+                entries = payload.get(bucket)
+                if not isinstance(entries, list):
+                    continue
+                normalized = []
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    model_dir = str(item.get("model_dir") or "").strip()
+                    tokenizer_dir = str(item.get("tokenizer_dir") or "").strip()
+                    if not model_dir or not tokenizer_dir:
+                        continue
+                    normalized.append(
+                        {
+                            "name": str(item.get("name") or os.path.basename(model_dir) or bucket),
+                            "model_dir": model_dir,
+                            "tokenizer_dir": tokenizer_dir,
+                            "family": str(item.get("family") or "auto").strip().lower() or "auto",
+                        }
+                    )
+                if normalized:
+                    inventory[bucket] = normalized
+            return inventory
+        except Exception:
+            return inventory
+
+    def _resolve_ct2_assets(self, kind="primary"):
+        env_map = {
+            "primary": ("CT2_MODEL_DIR", "CT2_TOKENIZER_DIR", os.getenv("TRANSLATOR_MODEL_FAMILY", "auto")),
+            "fallback": (
+                "CT2_FALLBACK_MODEL_DIR",
+                "CT2_FALLBACK_TOKENIZER_DIR",
+                os.getenv("TRANSLATOR_FALLBACK_MODEL_FAMILY", "auto"),
+            ),
+            "enfr": ("CT2_ENFR_MODEL_DIR", "CT2_ENFR_TOKENIZER_DIR", "marian"),
+        }
+        model_env, tokenizer_env, default_family = env_map.get(kind, env_map["primary"])
+        env_model_dir = str(os.getenv(model_env, "") or "").strip()
+        env_tokenizer_dir = str(os.getenv(tokenizer_env, "") or "").strip()
+        if env_model_dir or env_tokenizer_dir:
+            if not env_model_dir or not env_tokenizer_dir:
+                raise RuntimeError(
+                    f"Configuration incomplète: {model_env} et {tokenizer_env} doivent être définies ensemble."
+                )
+            if not os.path.isdir(env_model_dir):
+                raise RuntimeError(f"Répertoire modèle introuvable pour {model_env}: {env_model_dir}")
+            if not os.path.isdir(env_tokenizer_dir):
+                raise RuntimeError(f"Répertoire tokenizer introuvable pour {tokenizer_env}: {env_tokenizer_dir}")
+            return {
+                "name": f"env:{kind}",
+                "model_dir": env_model_dir,
+                "tokenizer_dir": env_tokenizer_dir,
+                "family": str(default_family or "auto").strip().lower() or "auto",
+            }
+
+        for entry in self._model_inventory.get(kind, []):
+            model_dir = str(entry.get("model_dir") or "").strip()
+            tokenizer_dir = str(entry.get("tokenizer_dir") or "").strip()
+            if os.path.isdir(model_dir) and os.path.isdir(tokenizer_dir):
+                return {
+                    "name": str(entry.get("name") or kind),
+                    "model_dir": model_dir,
+                    "tokenizer_dir": tokenizer_dir,
+                    "family": str(entry.get("family") or "auto").strip().lower() or "auto",
+                }
+        return None
+
     def _init_ct2_backend(self):
         if ctranslate2 is None or AutoTokenizer is None:
             raise RuntimeError(
                 "CTranslate2/Transformers indisponibles. "
                 "Installe 'ctranslate2' et 'transformers' dans l'env actif."
             )
-        model_dir = os.getenv("CT2_MODEL_DIR", "ai_models/translation/nllb_200_distilled_600m_ct2_int8")
-        tokenizer_dir = os.getenv("CT2_TOKENIZER_DIR", "ai_models/translation/nllb_200_distilled_600m_tokenizer")
-        if not os.path.isdir(model_dir):
-            raise RuntimeError(
-                f"Modèle CTranslate2 introuvable: {model_dir}. "
-                "Prépare le modèle dans ai_models/translation/ (conversion int8)."
+        assets = self._resolve_ct2_assets("primary")
+        if assets is None:
+            candidates = ", ".join(
+                str(entry.get("model_dir") or "")
+                for entry in (self._model_inventory.get("primary") or [])
+                if isinstance(entry, dict)
             )
-        if not os.path.isdir(tokenizer_dir):
             raise RuntimeError(
-                f"Tokenizer introuvable: {tokenizer_dir}. "
-                "Télécharge/copie un tokenizer compatible dans ai_models/translation/."
+                "Aucun modèle CTranslate2 primaire disponible. "
+                f"Candidats vérifiés: {candidates or 'aucun'}."
             )
+        model_dir = assets["model_dir"]
+        tokenizer_dir = assets["tokenizer_dir"]
         inter_threads = int(os.getenv("CT2_INTER_THREADS", "1"))
         intra_threads = int(os.getenv("CT2_INTRA_THREADS", "4"))
         self._ct2_translator = ctranslate2.Translator(
@@ -145,10 +260,10 @@ class DocumentTranslator:
             model_dir,
             tokenizer_dir,
             tokenizer=self._ct2_tokenizer,
-            preferred=os.getenv("TRANSLATOR_MODEL_FAMILY", "auto"),
+            preferred=os.getenv("TRANSLATOR_MODEL_FAMILY", assets.get("family") or "auto"),
             allow_primary_env=True,
         )
-        print(f"Traduction CT2 model_family: {self._model_family}")
+        print(f"Traduction CT2 model={assets.get('name')} model_family: {self._model_family}")
         self._init_fallback_backend()
         self._init_enfr_backend()
         self._cache = {}
@@ -275,28 +390,27 @@ class DocumentTranslator:
         # Auto-load multilingual fallback when primary model is pair-specific (e.g., Marian EN->FR).
         if self._model_family != "marian":
             return
-        f_model_dir = os.getenv("CT2_FALLBACK_MODEL_DIR", "ai_models/translation/m2m100_418m_ct2_int8")
-        f_tokenizer_dir = os.getenv("CT2_FALLBACK_TOKENIZER_DIR", "ai_models/translation/m2m100_418m_tokenizer")
-        if not (os.path.isdir(f_model_dir) and os.path.isdir(f_tokenizer_dir)):
+        assets = self._resolve_ct2_assets("fallback")
+        if assets is None:
             return
         try:
             inter_threads = int(os.getenv("CT2_INTER_THREADS", "1"))
             intra_threads = int(os.getenv("CT2_INTRA_THREADS", "4"))
             self._fallback_ct2_translator = ctranslate2.Translator(
-                f_model_dir,
+                assets["model_dir"],
                 device="cpu",
                 inter_threads=inter_threads,
                 intra_threads=intra_threads,
             )
-            self._fallback_ct2_tokenizer = AutoTokenizer.from_pretrained(f_tokenizer_dir, use_fast=False)
+            self._fallback_ct2_tokenizer = AutoTokenizer.from_pretrained(assets["tokenizer_dir"], use_fast=False)
             self._fallback_model_family = self._resolve_model_family(
-                f_model_dir,
-                f_tokenizer_dir,
+                assets["model_dir"],
+                assets["tokenizer_dir"],
                 tokenizer=self._fallback_ct2_tokenizer,
-                preferred=os.getenv("TRANSLATOR_FALLBACK_MODEL_FAMILY", "auto"),
+                preferred=os.getenv("TRANSLATOR_FALLBACK_MODEL_FAMILY", assets.get("family") or "auto"),
                 allow_primary_env=False,
             )
-            print(f"Traduction fallback model_family: {self._fallback_model_family}")
+            print(f"Traduction fallback model={assets.get('name')} model_family: {self._fallback_model_family}")
         except Exception:
             self._fallback_ct2_translator = None
             self._fallback_ct2_tokenizer = None
@@ -304,28 +418,27 @@ class DocumentTranslator:
     def _init_enfr_backend(self):
         # Optional dedicated EN->FR pair model (OPUS/Marian) to avoid mixed-language
         # residues observed with generic multilingual models on technical text.
-        model_dir = os.getenv("CT2_ENFR_MODEL_DIR", "ai_models/translation/opus_mt_tc_big_en_fr_ct2_int8")
-        tokenizer_dir = os.getenv("CT2_ENFR_TOKENIZER_DIR", "ai_models/translation/opus_mt_tc_big_en_fr_tokenizer")
-        if not (os.path.isdir(model_dir) and os.path.isdir(tokenizer_dir)):
+        assets = self._resolve_ct2_assets("enfr")
+        if assets is None:
             return
         try:
             inter_threads = int(os.getenv("CT2_INTER_THREADS", "1"))
             intra_threads = int(os.getenv("CT2_INTRA_THREADS", "4"))
             self._enfr_ct2_translator = ctranslate2.Translator(
-                model_dir,
+                assets["model_dir"],
                 device="cpu",
                 inter_threads=inter_threads,
                 intra_threads=intra_threads,
             )
-            self._enfr_ct2_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, use_fast=False)
+            self._enfr_ct2_tokenizer = AutoTokenizer.from_pretrained(assets["tokenizer_dir"], use_fast=False)
             self._enfr_model_family = self._resolve_model_family(
-                model_dir,
-                tokenizer_dir,
+                assets["model_dir"],
+                assets["tokenizer_dir"],
                 tokenizer=self._enfr_ct2_tokenizer,
-                preferred="marian",
+                preferred=assets.get("family") or "marian",
                 allow_primary_env=False,
             )
-            print(f"Traduction EN->FR model_family: {self._enfr_model_family}")
+            print(f"Traduction EN->FR model={assets.get('name')} model_family: {self._enfr_model_family}")
         except Exception:
             self._enfr_ct2_translator = None
             self._enfr_ct2_tokenizer = None
@@ -347,7 +460,7 @@ class DocumentTranslator:
             return "m2m100"
         return "m2m100"
 
-    def _resolve_translation_contract(self, unit, default_strategy="semantic_reflow", default_translatable=True):
+    def _resolve_translation_contract(self, unit, default_strategy="semantic_reflow", default_translatable=True, context=None):
         if not isinstance(unit, dict):
             return {
                 "strategy": default_strategy,
@@ -365,6 +478,11 @@ class DocumentTranslator:
             translatable = bool(raw_translatable)
         coverage_required = self._normalize_spaces(unit.get("coverage_required") or "strict").lower() or "strict"
         unit_type = self._normalize_spaces(unit.get("unit_type") or "").lower()
+        unit_text = self._translation_contract_unit_text(unit)
+        if unit_type == "code_visible" and strategy == "exact_preserve" and self._should_relax_code_visible_contract(unit, unit_text, context=context):
+            strategy = "layout_constrained"
+            translatable = True
+            coverage_required = "strict"
         return {
             "strategy": strategy,
             "translatable": translatable,
@@ -372,10 +490,161 @@ class DocumentTranslator:
             "unit_type": unit_type,
         }
 
+    def _translation_contract_unit_text(self, unit):
+        if not isinstance(unit, dict):
+            return ""
+        unit_text = self._normalize_spaces(
+            unit.get("texte")
+            or unit.get("text")
+            or unit.get("line_text")
+            or unit.get("translated_text")
+            or ""
+        )
+        if unit_text:
+            return unit_text
+        lines = unit.get("lines") or []
+        if not isinstance(lines, list):
+            return ""
+        collected = []
+        for line in lines[:8]:
+            if not isinstance(line, dict):
+                continue
+            line_text = self._normalize_spaces(
+                line.get("texte")
+                or line.get("text")
+                or line.get("line_text")
+                or line.get("translated_text")
+                or ""
+            )
+            if not line_text:
+                phrase_parts = []
+                for phrase in line.get("phrases", []) or []:
+                    if not isinstance(phrase, dict):
+                        continue
+                    phrase_text = self._normalize_spaces(
+                        phrase.get("texte")
+                        or phrase.get("text")
+                        or phrase.get("line_text")
+                        or phrase.get("translated_text")
+                        or ""
+                    )
+                    if phrase_text:
+                        phrase_parts.append(phrase_text)
+                line_text = self._normalize_spaces(" ".join(phrase_parts))
+            if line_text:
+                collected.append(line_text)
+        return self._normalize_spaces(" ".join(collected))
+
+    def _code_visible_structure_profile(self, unit, context=None):
+        return classify_block_typology(unit, context=context)
+
+    def _should_relax_code_visible_contract(self, unit, unit_text, context=None):
+        src = self._normalize_spaces(unit_text)
+        if not src:
+            return False
+        profile = self._code_visible_structure_profile(unit, context=context)
+        if self._looks_like_programming_code_line(src):
+            return False
+        lines = unit.get("lines") or []
+        if isinstance(lines, list) and len(lines) >= 5:
+            return False
+        if self._looks_like_translatable_code_visible(src):
+            if not isinstance(lines, list) or not lines:
+                return True
+            if profile["is_heading_like"] or profile["band_role"] in {"annotation_band", "legend_band", "caption_band"}:
+                return True
+        if not isinstance(lines, list) or not lines:
+            return False
+        translatable_line_count = 0
+        code_like_line_count = 0
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            line_text = self._translation_contract_unit_text(line)
+            if not line_text:
+                continue
+            line_unit_type = self._normalize_spaces(line.get("unit_type") or "").lower()
+            if (
+                self._looks_like_programming_code_line(line_text)
+                or re.search(r"[_=]{6,}", line_text)
+                or (line_unit_type == "code_visible" and len(re.findall(r"[()=]", line_text)) >= 2)
+            ):
+                code_like_line_count += 1
+                continue
+            if self._looks_like_translatable_code_visible(line_text) or line_unit_type in {"short_label", "narrative_body"}:
+                translatable_line_count += 1
+        if code_like_line_count >= max(2, len(lines) - 1):
+            return False
+        if profile["subtype"] in {"editorial_locked_callout", "editorial_short_callout"}:
+            return translatable_line_count > 0
+        return translatable_line_count > 0
+
+    def _looks_like_translatable_code_visible(self, text):
+        src = self._normalize_spaces(text)
+        if not src:
+            return False
+        if re.fullmatch(r"(?:prints|saves)\s+the\s+[A-Za-z_][A-Za-z0-9_\.]*\s+(?:summary|output)", src, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"(?:a|an|the)\s+[A-Za-z_][A-Za-z0-9_\.]*", src, flags=re.IGNORECASE):
+            ident = src.split()[-1]
+            if "_" in ident and ident.lower().endswith(("_model", "_layer", "_output", "_input")):
+                return True
+        word_count = len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", src))
+        if word_count < 3:
+            return False
+        if re.fullmatch(r"[\w\s\.\-\(\)\[\]\{\}:=,+/*<>#%\"']+", src) and "_" in src and word_count <= 3:
+            return False
+        cue_hits = re.findall(
+            r"\b(the|and|to|of|for|with|using|saves|prints|visit|click|you|your|will|need|choose|might|charged|input|output)\b",
+            src,
+            flags=re.IGNORECASE,
+        )
+        if cue_hits:
+            return True
+        if "http" in src.lower() or "www." in src.lower() or ".com" in src.lower():
+            return True
+        return bool(re.search(r"\b[a-z]{3,}\b", src) and " " in src)
+
+    def _looks_like_programming_code_line(self, text):
+        src = self._normalize_spaces(text)
+        if not src:
+            return False
+        if not any(tok in src for tok in ("=", "(", ")", ".", "_")):
+            return False
+        if re.search(r"^\s*(?:def|class|return|import|from|lambda|for|while|if|else)\b", src):
+            return True
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z_][A-Za-z0-9_]*", src):
+            return True
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(", src):
+            return True
+        if re.search(r"\b(?:input|output|inputs|outputs|activation|name|summary)\s*=", src):
+            return True
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", src):
+            return True
+        return False
+
     def _translate_short_label_fr(self, text, block_context="", block_role="body", domain="general", subdomain=""):
         src = self._normalize_spaces(text)
         if not src:
             return src
+        exact_regex = [
+            (r"^Instantiates$", "Instancie"),
+            (r"^a new_model$", "un nouveau modèle"),
+            (r"^Model class$", "classe Model"),
+            (r"^using Keras['’]s$", "avec Keras"),
+            (r"^Prints the ([A-Za-z_][A-Za-z0-9_\.]*) summary$", r"Affiche le résumé de \1"),
+            (r"^Saves the output of ([A-Za-z_][A-Za-z0-9_\.]*)$", r"Enregistre la sortie de \1"),
+            (r"^to be the input of the next layer$", "pour servir d'entrée à la couche suivante"),
+            (
+                r"^Visit\s+([A-Za-z0-9./:_-]+)\s*,?\s*and click the Create an AWS Account button\.\s*You will$",
+                r"Visitez \1, puis cliquez sur le bouton Create an AWS Account. Vous devrez",
+            ),
+            (r"^charged for anything yet\.$", "être facturé pour quoi que ce soit pour le moment."),
+        ]
+        for pattern, replacement in exact_regex:
+            mapped = re.sub(pattern, replacement, src, flags=re.IGNORECASE)
+            if mapped != src:
+                return self._normalize_spaces(mapped)
         glossary_hint = self._normalize_spaces(self._apply_cnn_glossary_fr(src))
         if glossary_hint and glossary_hint.lower() != src.lower():
             return glossary_hint
@@ -689,7 +958,16 @@ class DocumentTranslator:
                 forced_output = forced_layout_labels[src_core_norm]
             elif src_core_norm.endswith(" images") and "drawbacks of mlps for processing" in src_core_norm:
                 forced_output = "Limites des MLP pour le traitement des images"
+            elif src_core_norm == "prints the new_model summary":
+                forced_output = "Affiche le résumé de new_model"
+            elif src_core_norm == "saves the output of base_model":
+                forced_output = "Enregistre la sortie de base_model"
+            elif src_core_norm == "to be the input of the next layer":
+                forced_output = "pour servir d'entrée à la couche suivante"
             if forced_output:
+                return f"{bullet} {forced_output}".strip() if bullet else forced_output
+            if re.fullmatch(r"charged for anything yet\.?", src_core_norm, flags=re.IGNORECASE):
+                forced_output = "être facturé pour quoi que ce soit pour le moment."
                 return f"{bullet} {forced_output}".strip() if bullet else forced_output
             out = self._apply_cnn_glossary_fr(out)
             out = self._normalize_technical_terms_fr(out)
@@ -951,6 +1229,14 @@ class DocumentTranslator:
                 page_tone = "didactique"
             elif reference_heavy_page:
                 page_tone = "analytique"
+        page_translation_context = {
+            "layout_type": layout_type,
+            "page_family": page_family,
+            "page_family_group": page_family_group,
+            "document_type": document_type,
+            "figure_or_diagram_page": figure_or_diagram_page,
+            "reference_heavy_page": reference_heavy_page,
+        }
 
         for block in structure.get("blocks", []):
             block_role = block.get("role", "body")
@@ -959,6 +1245,7 @@ class DocumentTranslator:
                 block,
                 default_strategy="semantic_reflow" if role_lc == "body" else "layout_constrained",
                 default_translatable=True,
+                context={**page_translation_context, "block_role": block_role, "role": block_role},
             )
             block_unit_type = block_contract.get("unit_type") or ""
             block_lines = block.get("lines", []) or []
@@ -966,13 +1253,17 @@ class DocumentTranslator:
                 self._normalize_spaces((ph.get("texte") or ""))
                 for ln in block_lines for ph in (ln.get("phrases", []) or [])
             ))
+            is_programming_code_line = bool(
+                role_lc in {"equation_inline", "equation_block"}
+                and self._looks_like_programming_code_line(block_text_preview)
+            )
             # Keep image/diagram/equation labels immutable.
             # In this project, many internal figure labels are extracted as role=title.
             is_likely_figure_label = bool(
                 role_lc in {"equation_inline", "equation_block"}
                 and self._should_preserve_equation_role_text(block_text_preview)
             )
-            if is_likely_figure_label and block_unit_type not in {"code_visible", "reference_link", "citation"}:
+            if (is_likely_figure_label or is_programming_code_line) and block_unit_type not in {"code_visible", "reference_link", "citation"}:
                 # Figure internals and equations are immutable by policy.
                 kept = []
                 for line in block.get("lines", []):
@@ -1044,6 +1335,7 @@ class DocumentTranslator:
                             phrase,
                             default_strategy="layout_constrained",
                             default_translatable=True,
+                            context={**page_translation_context, "block_role": block_role, "role": block_role},
                         )
                         if not phrase_contract["translatable"] or phrase_contract["strategy"] == "exact_preserve":
                             translated_phrase = orig_phrase_text
@@ -1121,6 +1413,7 @@ class DocumentTranslator:
                     phrase,
                     default_strategy=block_contract["strategy"],
                     default_translatable=block_contract["translatable"],
+                    context={**page_translation_context, "block_role": block_role, "role": block_role},
                 )
                 phrase_unit_type = phrase_contract.get("unit_type") or ""
                 if (figure_or_diagram_page or reference_heavy_page) and role_lc in {"title", "figure_caption", "diagram_label", "diagram_text_label", "equation_inline"}:
@@ -1491,6 +1784,165 @@ class DocumentTranslator:
     # ---------------------------------------------------------------------
     # layout.v2 TOC translation (label-only)
     # ---------------------------------------------------------------------
+    def _split_toc_numeric_prefix(self, label):
+        s = self._normalize_spaces(label)
+        m = re.match(r"^((?:\d+)(?:\.\d+)+)\s+(.*)$", s)
+        if not m:
+            return "", s
+        return m.group(1), self._normalize_spaces(m.group(2))
+
+    def _translate_toc_short_label_fr(self, label, role=""):
+        s = self._normalize_spaces(label)
+        if not s:
+            return s
+        role_lc = self._normalize_spaces(role).lower()
+        exact = {
+            "adam": "Adam",
+            "network architecture": "Architecture du réseau",
+            "lenet architecture": "Architecture de LeNet",
+            "alexnet architecture": "Architecture d'AlexNet",
+            "vggnet architecture": "Architecture de VGGNet",
+            "kaggle": "Kaggle",
+            "fashion-mnist": "Fashion-MNIST",
+            "google open images": "Google Open Images",
+            "imagenet": "ImageNet",
+            "ms coco": "MS COCO",
+            "mnist": "MNIST",
+            "cifar": "CIFAR",
+            "inception": "Inception",
+            "googlenet": "GoogLeNet",
+            "resnet": "ResNet",
+            "cnn design patterns": "Modèles de conception des CNN",
+            "gradient descent with momentum": "Descente de gradient avec momentum",
+            "dropout layers": "Couches dropout",
+            "the covariate shift problem": "Le problème du décalage de covariance",
+            "covariate shift in neural networks": "Décalage de covariance dans les réseaux neuronaux",
+            "part image classification and detection": "Partie classification et détection d'images",
+        }
+        mapped = exact.get(s.lower())
+        if mapped:
+            return mapped
+        if role_lc == "part_title" and s.lower().startswith("part "):
+            rest = self._normalize_spaces(re.sub(r"^part\b", "", s, flags=re.IGNORECASE))
+            rest = self._normalize_spaces(re.sub(r"^\d+\b", "", rest))
+            rest = re.sub(r"\bimage classification\b", "classification d'images", rest, flags=re.IGNORECASE)
+            rest = re.sub(r"\band\b", "et", rest, flags=re.IGNORECASE)
+            rest = re.sub(r"\bdetection\b", "détection", rest, flags=re.IGNORECASE)
+            return self._normalize_spaces(f"Partie {rest}")
+        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9\-']+)\s+architecture", s, flags=re.IGNORECASE)
+        if m:
+            subject = m.group(1)
+            if subject.upper() in {"CNN", "RNN", "MLP"}:
+                return f"Architecture des {subject.upper()}"
+            if subject.lower() == "network":
+                return "Architecture du réseau"
+            article = "d'" if re.match(r"^[AEIOUYaeiouy]", subject) else "de "
+            return f"Architecture {article}{subject}"
+        return ""
+
+    def _postprocess_toc_label_fr(self, source_label, translated, role=""):
+        src = self._normalize_spaces(source_label)
+        out = self._normalize_spaces(translated)
+        if not src:
+            return out
+        if not out:
+            out = src
+
+        src_lc = src.lower()
+        exact_keep = {
+            "kaggle": "Kaggle",
+            "fashion-mnist": "Fashion-MNIST",
+            "googlenet": "GoogLeNet",
+            "resnet": "ResNet",
+            "imagenet": "ImageNet",
+            "ms coco": "MS COCO",
+            "google open images": "Google Open Images",
+            "mnist": "MNIST",
+            "cifar": "CIFAR",
+            "inception": "Inception",
+        }
+        if src_lc in exact_keep:
+            return exact_keep[src_lc]
+
+        if "inception" in src_lc:
+            out = re.sub(r"\baccueil\b", "Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bde l['’]Inception\b", "d'Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bd['’]accueil\b", "d'Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodule\s+d['’]Inception\b", "Module Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodule\s+Inception\s*:\s*version\s+naive\b", "Module Inception : version naive", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bperformances?\s+d['’]Inception\b", "Performances d'Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bnouvelles?\s+caract[ée]ristiques\s+de l['’]Inception\b", "Nouvelles caractéristiques d'Inception", out, flags=re.IGNORECASE)
+
+        if "pretrained network" in src_lc:
+            out = re.sub(
+                r"\br[ée]seau\s+pr[ée](?:-|\s)?(?:form[ée]|qualifi[ée]|entrai?n[ée]|entra[iî]n[ée])\b",
+                "réseau préentraîné",
+                out,
+                flags=re.IGNORECASE,
+            )
+        if "feature extractor" in src_lc:
+            out = re.sub(r"\bextracteur(?:\s+de)?\s+fonctionnalit[ée]s\b", "extracteur de caractéristiques", out, flags=re.IGNORECASE)
+        if "fine-tuning" in src_lc:
+            out = re.sub(r"\bfin de r[ée]glage\b", "réglage fin", out, flags=re.IGNORECASE)
+        if "open source datasets" in src_lc:
+            out = re.sub(r"\bensembles?\s+de\s+donn[ée]es\s+open\s+source\b", "Jeux de données open source", out, flags=re.IGNORECASE)
+        if "fashion-mnist" in src_lc:
+            out = re.sub(r"\bmniste?\s+fashion\b", "Fashion-MNIST", out, flags=re.IGNORECASE)
+        if "google open images" in src_lc:
+            out = re.sub(r"\bgoogle\s+ouvrir\s+des\s+images\b", "Google Open Images", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bimages?\s+ouvertes?\s+de\s+google\b", "Google Open Images", out, flags=re.IGNORECASE)
+        if "kaggle" in src_lc:
+            out = re.sub(r"\bc['’]est\s+un\s+kaggle\b", "Kaggle", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bkaggle\b", "Kaggle", out, flags=re.IGNORECASE)
+
+        dataset_terms = {
+            "googlenet": "GoogLeNet",
+            "resnet": "ResNet",
+            "imagenet": "ImageNet",
+            "ms coco": "MS COCO",
+            "mnist": "MNIST",
+            "cifar": "CIFAR",
+            "ssd": "SSD",
+            "yolo": "YOLO",
+            "r-cnn": "R-CNN",
+        }
+        for token, canonical in dataset_terms.items():
+            if token in src_lc:
+                out = re.sub(re.escape(canonical), canonical, out, flags=re.IGNORECASE)
+
+        return self._normalize_spaces(out)
+
+    def _translate_toc_label_fr(self, label, role=""):
+        src = self._normalize_spaces(label)
+        if not src:
+            return src
+        numeric_prefix, core = self._split_toc_numeric_prefix(src)
+        role_lc = self._normalize_spaces(role).lower()
+        short_translation = self._translate_toc_short_label_fr(core, role=role_lc)
+        if short_translation:
+            return self._normalize_spaces(f"{numeric_prefix} {short_translation}".strip())
+        translated = self.translate_text(
+            core,
+            target_lang="fr",
+            block_role="title",
+            strategy="layout_constrained",
+            translatable=True,
+        )
+        translated = self._normalize_spaces(translated)
+        translated = self._apply_cnn_glossary_fr(translated)
+        translated = self._fix_english_residuals_in_fr(translated)
+        translated = self._normalize_technical_terms_fr(translated)
+        translated = self._postprocess_toc_label_fr(core, translated, role=role_lc)
+        fallback = self._translate_toc_short_label_fr(core, role=role_lc)
+        if fallback and translated.lower() == core.lower():
+            translated = fallback
+        if numeric_prefix:
+            prefix_pattern = r"^\s*" + re.escape(numeric_prefix).replace(r"\.", r"[\.,]") + r"\s+"
+            translated = re.sub(prefix_pattern, "", translated, count=1)
+            translated = f"{numeric_prefix} {translated or core}".strip()
+        translated = self._postprocess_toc_label_fr(src, translated, role=role_lc)
+        return self._normalize_spaces(translated)
+
     def translate_layout_v2(self, structure, target_lang="fr"):
         """
         Translate a canonical layout (layout.v2) without destroying structure.
@@ -1513,13 +1965,17 @@ class DocumentTranslator:
                 r["translated_label"] = ""
                 r["translated_text"] = (r.get("page") or "").strip()
                 continue
-            translated = self.translate_text(
-                label,
-                target_lang=target_lang,
-                block_role="title",
-                strategy="layout_constrained",
-                translatable=True,
-            )
+            role = (r.get("role") or "").strip()
+            if self._normalize_lang_code(target_lang) == "fr":
+                translated = self._translate_toc_label_fr(label, role=role)
+            else:
+                translated = self.translate_text(
+                    label,
+                    target_lang=target_lang,
+                    block_role="title",
+                    strategy="layout_constrained",
+                    translatable=True,
+                )
             r["translated_label"] = translated
             page = (r.get("page") or "").strip()
             r["translated_text"] = (translated + (" " + page if page else "")).strip()

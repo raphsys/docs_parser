@@ -1,0 +1,32 @@
+{
+  "primary": [
+    {
+      "name": "nllb_200_distilled_600m",
+      "model_dir": "ai_models/translation/nllb_200_distilled_600m_ct2_int8",
+      "tokenizer_dir": "ai_models/translation/nllb_200_distilled_600m_tokenizer",
+      "family": "nllb"
+    },
+    {
+      "name": "m2m100_418m",
+      "model_dir": "ai_models/translation/m2m100_418m_ct2_int8",
+      "tokenizer_dir": "ai_models/translation/m2m100_418m_tokenizer",
+      "family": "m2m100"
+    }
+  ],
+  "fallback": [
+    {
+      "name": "m2m100_418m",
+      "model_dir": "ai_models/translation/m2m100_418m_ct2_int8",
+      "tokenizer_dir": "ai_models/translation/m2m100_418m_tokenizer",
+      "family": "m2m100"
+    }
+  ],
+  "enfr": [
+    {
+      "name": "opus_mt_tc_big_en_fr",
+      "model_dir": "ai_models/translation/opus_mt_tc_big_en_fr_ct2_int8",
+      "tokenizer_dir": "ai_models/translation/opus_mt_tc_big_en_fr_tokenizer",
+      "family": "marian"
+    }
+  ]
+}

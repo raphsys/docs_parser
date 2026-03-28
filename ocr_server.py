@@ -12,6 +12,7 @@ import fitz
 import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
@@ -40,6 +41,37 @@ OFFICE_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".odt", ".odp"}
 
 app = FastAPI(title="IA Document OCR - Stable Precision")
 app.mount("/results", StaticFiles(directory=RESULTS_DIR), name="results")
+
+
+def _parse_cors_origins():
+    raw = os.getenv("DOCS_PARSER_CORS_ORIGINS", "").strip()
+    if not raw:
+        return [
+            "http://127.0.0.1:19006",
+            "http://localhost:19006",
+            "http://127.0.0.1:8081",
+            "http://localhost:8081",
+            "http://127.0.0.1:8001",
+            "http://localhost:8001",
+        ]
+    origins = []
+    for part in raw.split(","):
+        value = part.strip()
+        if value:
+            origins.append(value)
+    return origins
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_parse_cors_origins(),
+    # Expo web may move between 19006/8081/8082/... when ports are occupied.
+    # Accept localhost loopback dev origins on arbitrary ports by default.
+    allow_origin_regex=r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 for d in [UPLOAD_DIR, CONV_DIR, RESULTS_DIR]:
     if not os.path.exists(d): os.makedirs(d)
@@ -2045,5 +2077,17 @@ async def export_html_document(data: dict):
     except Exception as e:
         import traceback; print(traceback.format_exc())
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/healthz")
+async def healthcheck():
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "service": "docs-parser",
+            "layout_ai_available": bool(layout_ai_enricher),
+            "results_url": "/results/",
+        }
+    )
 
 if __name__ == "__main__": uvicorn.run(app, host="0.0.0.0", port=8001)

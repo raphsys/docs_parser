@@ -1,0 +1,72 @@
+{
+  "default": {
+    "quality_thresholds": {
+      "critical_below": 72,
+      "review_below": 88
+    },
+    "quality_penalties": {
+      "unchanged_translation": 40,
+      "too_short": 20,
+      "too_long": 15,
+      "english_leak": 25,
+      "mixed_language": 12,
+      "punctuation_noise": 10,
+      "source_fragment": 6,
+      "parenthesis_mismatch": 8,
+      "weak_style_connectors": 8,
+      "literal_style_per_hit": 6,
+      "literal_style_max": 18
+    },
+    "quality_rules": {
+      "min_source_words_for_ratio_check": 5,
+      "short_ratio": 0.45,
+      "long_ratio": 2.7
+    },
+    "post_edit": {
+      "generic_cleanup": true,
+      "generic_replacements": [],
+      "literal_patterns": [],
+      "weak_connectors": []
+    }
+  },
+  "fr": {
+    "post_edit": {
+      "generic_replacements": [
+        {
+          "pattern": "\\bLaissez-nous utiliser\\b",
+          "replace": "Utilisons"
+        },
+        {
+          "pattern": "\\bLaissez-les jeter un oeil à\\b",
+          "replace": "Examinons"
+        },
+        {
+          "pattern": "\\bLaissez-les jeter un œil à\\b",
+          "replace": "Examinons"
+        },
+        {
+          "pattern": "\\bMaintenant il ya\\b",
+          "replace": "Maintenant, il y a"
+        },
+        {
+          "pattern": "\\bva continuer osciller\\b",
+          "replace": "continuera à osciller"
+        }
+      ],
+      "literal_patterns": [
+        "\\bce processus est appelé\\b",
+        "\\ble gradient détermine seulement\\b",
+        "\\bce peut être un pas\\b",
+        "\\bnous relançons le processus\\b",
+        "\\bnous choisissons cette voie\\b",
+        "\\bcela nous amène\\b",
+        "\\bvous finissez au point\\b"
+      ],
+      "weak_connectors": [
+        "et ainsi de suite",
+        "pour l'instant",
+        "pas tout à fait"
+      ]
+    }
+  }
+}

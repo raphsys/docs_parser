@@ -583,6 +583,383 @@ class LayoutV2Builder:
             }
         return page_data
 
+    def _toc_section_chapter_number(self, label):
+        m = re.match(r"^(\d+)\.\d+\b", str(label or "").strip())
+        return m.group(1) if m else ""
+
+    def _normalize_toc_spaced_caps(self, text):
+        s = re.sub(r"\s+", " ", str(text or "").strip())
+        prev = None
+        # OCR sometimes splits all-caps words as "P ART" or "I MAGE".
+        while s != prev:
+            prev = s
+            s = re.sub(r"\b([A-Z])\s+([A-Z]{2,})\b", r"\1\2", s)
+        return s.strip()
+
+    def _extract_toc_trailing_page(self, label):
+        s = str(label or "").strip()
+        m = re.search(r"\.{2,}\s*(\d{2,4}|[ivxlcdm]+)\s*$", s, flags=re.I)
+        if m:
+            stripped = re.sub(r"\.{2,}\s*(\d{2,4}|[ivxlcdm]+)\s*$", "", s, flags=re.I).strip()
+            return stripped, m.group(1).strip()
+        m = re.search(r"\s+(\d{2,4}|[ivxlcdm]+)\s*$", s, flags=re.I)
+        if not m:
+            return s, ""
+        stripped = s[:m.start()].strip()
+        if not stripped:
+            return s, ""
+        alpha_tokens = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'’\-]*", stripped)
+        if not alpha_tokens:
+            return s, ""
+        return stripped, m.group(1).strip()
+
+    def _normalize_toc_rows(self, rows):
+        if not isinstance(rows, list):
+            return rows
+        for row in rows:
+            label = self._normalize_toc_spaced_caps(row.get("label") or "")
+            label, trailing_page = self._extract_toc_trailing_page(label)
+            role = str(row.get("role") or "").strip().lower()
+            page_value = str(row.get("page") or "").strip()
+            compact = re.sub(r"[^a-z0-9]+", "", label.lower())
+            if compact.startswith("part") and ("classification" in compact or "detection" in compact):
+                role = "part_title"
+            if trailing_page:
+                if role == "part_title":
+                    page_value = trailing_page
+                elif re.fullmatch(r"\d", page_value) and re.fullmatch(r"\d{2,4}|[ivxlcdm]+", trailing_page, flags=re.I):
+                    page_value = trailing_page
+            if role == "part_title" and re.fullmatch(r"\d", page_value):
+                # Single isolated digits on TOC part banners are chapter markers,
+                # not part-page anchors.
+                row["chapter_marker"] = page_value
+                if row.get("page_bbox"):
+                    row["chapter_marker_bbox"] = row.get("page_bbox")
+                if isinstance(row.get("page_style"), dict) and row.get("page_style"):
+                    row["chapter_marker_style"] = dict(row.get("page_style") or {})
+                page_value = ""
+            row["label"] = label
+            row["page"] = page_value
+            row["role"] = role
+        return rows
+
+    def _normalize_toc_inline_text(self, text):
+        s = self._normalize_toc_spaced_caps(text)
+        s = re.sub(r"(?<=[A-Za-zÀ-ÿ\)])(?=(\d{2,4}\b))", " ", s)
+        s = re.sub(r"\s*([•■·])\s*", r" \1 ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _extract_toc_inline_segments(self, text):
+        s = self._normalize_toc_inline_text(text)
+        segments = []
+        page_re = re.compile(r"(?<![\w.])(\d{2,4}|[ivxlcdm]{2,})(?![\w.])", flags=re.I)
+        while s:
+            s = re.sub(r"^\s*(?:[•■·]|-)\s*", "", s).strip()
+            if not s:
+                break
+            match = None
+            for cand in page_re.finditer(s):
+                label = s[:cand.start()].strip(" -•■·")
+                if label and re.search(r"[A-Za-zÀ-ÿ]", label):
+                    match = cand
+                    break
+            if not match:
+                break
+            label = s[:match.start()].strip(" -•■·")
+            if label:
+                segments.append((label, match.group(1).strip()))
+            s = s[match.end():]
+        return segments, s.strip(" -•■· ")
+
+    def _approximate_toc_page_bbox(self, label_bbox, full_text, page_value):
+        if not isinstance(label_bbox, (list, tuple)) or len(label_bbox) != 4:
+            return None
+        text = self._normalize_toc_inline_text(full_text)
+        page_value = str(page_value or "").strip()
+        if not text or not page_value:
+            return None
+        try:
+            x0, y0, x1, y1 = [float(v) for v in label_bbox]
+        except Exception:
+            return None
+        match = re.search(rf"(?<![\d.])({re.escape(page_value)})(?![\d.])", text, flags=re.I)
+        if not match:
+            return None
+        total_chars = max(1, len(text))
+        start_frac = max(0.0, min(1.0, match.start(1) / total_chars))
+        end_frac = max(start_frac, min(1.0, match.end(1) / total_chars))
+        px0 = x0 + (x1 - x0) * start_frac
+        px1 = x0 + (x1 - x0) * end_frac
+        pad = max(4.0, (x1 - x0) * 0.012)
+        return [max(x0, px0 - pad), y0, min(x1, px1 + pad), y1]
+
+    def _split_compound_toc_rows(self, rows):
+        if not isinstance(rows, list) or not rows:
+            return rows
+
+        def shift_bbox_y(bbox, delta_y):
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                return bbox
+            try:
+                x0, y0, x1, y1 = [float(v) for v in bbox]
+            except Exception:
+                return bbox
+            return [x0, y0 + delta_y, x1, y1 + delta_y]
+
+        def row_text(row):
+            label = self._normalize_toc_inline_text(row.get("label") or "")
+            label, inline_page = self._extract_toc_trailing_page(label)
+            page = str(row.get("page") or inline_page or "").strip()
+            if label and page:
+                return f"{label} {page}".strip()
+            return label
+
+        def is_toc_title_text(text):
+            return bool(re.match(r"^(?:contents|sommaire|table of contents)\b", str(text or "").strip(), flags=re.I))
+
+        def starts_numbered_heading(text):
+            return bool(re.match(r"^\d+\.\d+\b", str(text or "").strip()))
+
+        def estimate_step(rows_buffer):
+            ys = []
+            for row in rows_buffer:
+                try:
+                    ys.append(float(row.get("y", 0.0) or 0.0))
+                except Exception:
+                    continue
+            diffs = [ys[i + 1] - ys[i] for i in range(len(ys) - 1) if (ys[i + 1] - ys[i]) > 3.0]
+            if diffs:
+                return float(statistics.median(diffs))
+            style = (rows_buffer[0].get("style") or {}) if rows_buffer else {}
+            try:
+                font_size = float(style.get("size") or style.get("font_size_pt") or 14.0)
+            except Exception:
+                font_size = 14.0
+            return max(18.0, font_size * 1.35)
+
+        def clone_row(anchor, label, page, lane_offset=0, y_override=None):
+            cloned = dict(anchor or {})
+            clean_label = self._normalize_toc_inline_text(label)
+            full_text = f"{clean_label} {page}".strip()
+            cloned["label"] = clean_label
+            cloned["page"] = str(page or "").strip()
+            try:
+                anchor_y = float((anchor or {}).get("y", 0.0) or 0.0)
+            except Exception:
+                anchor_y = 0.0
+            if isinstance(y_override, (int, float)):
+                delta_y = float(y_override) - anchor_y
+                cloned["y"] = float(y_override)
+                cloned["label_bbox"] = shift_bbox_y(anchor.get("label_bbox"), delta_y)
+                if cloned.get("page") == str((anchor or {}).get("page") or "").strip() and anchor.get("page_bbox"):
+                    cloned["page_bbox"] = shift_bbox_y(anchor.get("page_bbox"), delta_y)
+                else:
+                    cloned["page_bbox"] = None
+            elif cloned.get("page") == str((anchor or {}).get("page") or "").strip() and anchor.get("page_bbox"):
+                cloned["page_bbox"] = [float(v) for v in anchor.get("page_bbox")]
+            if cloned.get("page") == str((anchor or {}).get("page") or "").strip() and anchor.get("page_bbox"):
+                pass
+            elif not isinstance(y_override, (int, float)):
+                approx = self._approximate_toc_page_bbox(anchor.get("label_bbox"), full_text, cloned.get("page"))
+                cloned["page_bbox"] = approx
+            elif not cloned.get("page_bbox"):
+                approx = self._approximate_toc_page_bbox(cloned.get("label_bbox") or anchor.get("label_bbox"), full_text, cloned.get("page"))
+                cloned["page_bbox"] = approx
+            source_band_lane = int((anchor or {}).get("source_band_lane", 0) or 0)
+            cloned["source_band_lane"] = source_band_lane + lane_offset
+            return cloned
+
+        out = []
+        buffer_rows = []
+        buffer_text = ""
+
+        def flush_buffer():
+            nonlocal buffer_rows, buffer_text
+            if not buffer_rows:
+                return
+            if buffer_text.strip():
+                carry = dict(buffer_rows[0])
+                carry["label"] = self._normalize_toc_inline_text(buffer_text)
+                carry["page"] = ""
+                carry["page_bbox"] = None
+                out.append(carry)
+            buffer_rows = []
+            buffer_text = ""
+
+        for row in rows:
+            role = str(row.get("role") or "").strip().lower()
+            if role in {"part_title"}:
+                flush_buffer()
+                out.append(row)
+                continue
+            current_text = row_text(row)
+            if not current_text:
+                flush_buffer()
+                out.append(row)
+                continue
+            join_with_buffer = bool(
+                buffer_rows
+                and int(row.get("indent_level", 0) or 0) >= int(buffer_rows[-1].get("indent_level", 0) or 0)
+                and not is_toc_title_text(current_text)
+                and not is_toc_title_text(row_text(buffer_rows[-1]))
+                and not starts_numbered_heading(current_text)
+            )
+            if not join_with_buffer:
+                flush_buffer()
+            buffer_rows.append(row)
+            buffer_text = f"{buffer_text} {current_text}".strip() if buffer_text else current_text
+            segments, remainder = self._extract_toc_inline_segments(buffer_text)
+            if not segments:
+                continue
+            step_y = estimate_step(buffer_rows)
+            base_y = float(buffer_rows[0].get("y", 0.0) or 0.0)
+            for idx, (label, page) in enumerate(segments):
+                anchor = buffer_rows[min(idx, len(buffer_rows) - 1)]
+                if idx < len(buffer_rows):
+                    segment_y = float(buffer_rows[idx].get("y", base_y) or base_y)
+                else:
+                    segment_y = base_y + (step_y * idx)
+                out.append(clone_row(anchor, label, page, lane_offset=idx, y_override=segment_y))
+            if remainder:
+                anchor = buffer_rows[-1]
+                buffer_rows = [anchor]
+                buffer_text = remainder
+            else:
+                buffer_rows = []
+                buffer_text = ""
+
+        flush_buffer()
+        return out
+
+    def _annotate_toc_chapter_numbers(self, rows):
+        if not isinstance(rows, list):
+            return rows
+        for idx, row in enumerate(rows):
+            role = str((row or {}).get("role") or "").strip().lower()
+            if role != "chapter_title":
+                continue
+            chapter_number = ""
+            for nxt in rows[idx + 1:]:
+                next_role = str((nxt or {}).get("role") or "").strip().lower()
+                next_label = str((nxt or {}).get("label") or "").strip()
+                next_number = self._toc_section_chapter_number(next_label)
+                if next_number:
+                    chapter_number = next_number
+                    break
+                if next_role == "chapter_title":
+                    break
+            if chapter_number:
+                row["chapter_number"] = chapter_number
+            else:
+                row.pop("chapter_number", None)
+        return rows
+
+    def _annotate_toc_source_bands(self, rows):
+        if not isinstance(rows, list):
+            return rows
+
+        def union_bbox(entries):
+            boxes = []
+            for item in entries:
+                for key in ("label_bbox", "page_bbox"):
+                    bb = item.get(key) or []
+                    if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                        continue
+                    try:
+                        boxes.append([float(v) for v in bb])
+                    except Exception:
+                        continue
+            if not boxes:
+                return None
+            return [
+                min(bb[0] for bb in boxes),
+                min(bb[1] for bb in boxes),
+                max(bb[2] for bb in boxes),
+                max(bb[3] for bb in boxes),
+            ]
+
+        def row_bbox(row):
+            bb = union_bbox([row])
+            if bb:
+                return bb
+            y = float(row.get("y", 0.0) or 0.0)
+            return [0.0, y, 0.0, y]
+
+        indexed = []
+        for idx, row in enumerate(rows):
+            bb = row_bbox(row)
+            try:
+                anchor_y = float(row.get("y", bb[1]) or bb[1])
+            except Exception:
+                anchor_y = float(bb[1])
+            indexed.append((idx, row, bb, anchor_y))
+        indexed.sort(key=lambda item: (item[3], item[2][0], item[0]))
+
+        bands = []
+        for idx, row, bb, anchor_y in indexed:
+            target_band = None
+            for band in bands:
+                tol = max(2.0, min(6.0, band["font_hint"] * 0.28 + 1.5))
+                if abs(anchor_y - band["anchor_y"]) <= tol:
+                    target_band = band
+                    break
+            if target_band is None:
+                st = row.get("style") or {}
+                try:
+                    font_hint = float(st.get("size") or st.get("font_size_pt") or 10.0)
+                except Exception:
+                    font_hint = 10.0
+                target_band = {
+                    "id": len(bands),
+                    "anchor_y": anchor_y,
+                    "font_hint": font_hint,
+                    "rows": [],
+                }
+                bands.append(target_band)
+            target_band["rows"].append((idx, row, bb, anchor_y))
+
+        for band in bands:
+            band_rows = sorted(band["rows"], key=lambda item: (item[2][0], item[0]))
+            band_bbox = union_bbox([item[1] for item in band_rows]) or [0.0, band["anchor_y"], 0.0, band["anchor_y"]]
+            band_y = float(min(item[3] for item in band_rows))
+            for lane, (idx, row, bb, anchor_y) in enumerate(band_rows):
+                row["source_band_id"] = band["id"]
+                row["source_band_lane"] = lane
+                row["source_band_y"] = band_y
+                row["source_band_bbox"] = [float(v) for v in band_bbox]
+        return rows
+
+    def _is_equation_like_toc_false_positive(self, text):
+        s = re.sub(r"\s+", " ", (text or "").strip())
+        if not s:
+            return False
+        if re.search(r"[=<>±×÷∑∫∞≈≠≤≥√∆∂µλΩα-ωΑ-Ω^_]", s):
+            return True
+        if re.search(r"\b[dD][A-Za-z]\s*/\s*d[A-Za-z]\b", s):
+            return True
+        if re.search(r"\b[A-Za-z]\s*/\s*[A-Za-z]\b", s):
+            return True
+        if re.search(r"\bf\([A-Za-z]\)\b", s):
+            return True
+        if len(re.findall(r"[-+*/=]", s)) >= 2:
+            return True
+        return False
+
+    def _is_toc_candidate_line(self, text):
+        s = re.sub(r"\s+", " ", (text or "").strip())
+        if not s or self._is_equation_like_toc_false_positive(s):
+            return False
+        if re.search(r"\.{2,}\s*\d{1,4}\s*$", s):
+            return True
+        if re.search(r"^\s*\d+(?:\.\d+)*\s+.+\s+\d{1,3}\s*$", s):
+            return True
+        if re.search(r"^\s*[A-Za-zÀ-ÿ].+\s+\d{1,3}\s*$", s) and len(s) <= 110:
+            words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", s)
+            if len(words) >= 2:
+                return True
+        return False
+
     def _infer_page_translation_profile(self, page_role, page_family, document_type="", layout_type="", style_profile=""):
         role = str(page_role or "body").strip().lower()
         if role == "toc":
@@ -698,6 +1075,7 @@ class LayoutV2Builder:
 
         top_title = False
         toc_like = 0
+        equation_like_lines = 0
         total = 0
         page_marker_lines = 0
         label_lines = 0
@@ -727,9 +1105,9 @@ class LayoutV2Builder:
                 if not lt:
                     continue
                 flat_lines.append((lt, ln))
-                if re.search(r"^\s*\d+(?:\.\d+)*\s+.+\s+\d{1,3}\s*$", lt):
-                    toc_like += 1
-                elif re.search(r"^[A-Za-z].+\s+\d{1,3}\s*$", lt) and len(lt) <= 100:
+                if self._is_equation_like_toc_false_positive(lt):
+                    equation_like_lines += 1
+                if self._is_toc_candidate_line(lt):
                     toc_like += 1
                 elif re.search(r"^[ivxlcdm]+\s*$", lt, flags=re.I):
                     toc_like += 1
@@ -759,7 +1137,7 @@ class LayoutV2Builder:
             return "toc"
         if top_title and paired_rows >= 8 and page_marker_lines >= 8 and label_lines >= 8:
             return "toc"
-        if toc_like >= 10 and total >= 12:
+        if toc_like >= 12 and total >= 14 and page_marker_lines >= 8 and label_lines >= 8 and equation_like_lines <= 1:
             return "toc"
         return "body"
 
@@ -877,6 +1255,24 @@ class LayoutV2Builder:
         col_left = columns[0]["x0"] if columns else margins["left"]
         col_right = columns[-1]["x1"] if columns else margins["right"]
 
+        def toc_line_text(line):
+            parts = []
+            for ph in (line.get("phrases") or []):
+                raw = (ph.get("texte") or ph.get("raw_text") or "").strip()
+                if raw:
+                    parts.append(raw)
+            if parts:
+                return re.sub(r"\s+", " ", " ".join(parts)).strip()
+            text = (line.get("line_text") or line.get("translated_text") or "").strip()
+            if text:
+                return re.sub(r"\s+", " ", text).strip()
+            parts = []
+            for ph in (line.get("phrases") or []):
+                tx = (ph.get("text") or ph.get("translated_text") or ph.get("texte") or "").strip()
+                if tx:
+                    parts.append(tx)
+            return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
         def pick_line_style(line, block):
             for ph in (line.get("phrases") or []):
                 st = ph.get("style") or {}
@@ -912,6 +1308,9 @@ class LayoutV2Builder:
                 return "toc_title"
             if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", (page_value or "").strip(), flags=re.I) and not text:
                 return "page_marker"
+            if re.match(r"^\d+\.\d+\b", text):
+                if indent_level <= 2 and (font_size >= 17.0 or flags.get("bold")):
+                    return "section_heading"
             if indent_level <= 0 and font_size >= 12.0:
                 return "chapter_title"
             if indent_level <= 0 and flags.get("bold"):
@@ -921,6 +1320,59 @@ class LayoutV2Builder:
             if indent_level >= 1:
                 return "subentry"
             return "section_heading"
+
+        def looks_like_standalone_toc_row(entry):
+            text = (entry.get("text") or "").strip()
+            if not text:
+                return False
+            style = entry.get("style") or {}
+            flags = style.get("flags") or {}
+            try:
+                font_size = float(style.get("size") or style.get("font_size_pt") or 0.0)
+            except Exception:
+                font_size = 0.0
+            if re.match(r"^(contents|sommaire|table of contents)\b", text, flags=re.I):
+                return True
+            if re.match(r"^(?:\d+\.\d+|part\b|chapter\b)", text, flags=re.I):
+                return True
+            if re.match(r"^[•■·\-]\s*\S", text):
+                return True
+            if flags.get("bold") or font_size >= 12.0:
+                return True
+            return False
+
+        def same_visual_row(prev_entry, entry):
+            try:
+                prev_bb = [float(v) for v in (prev_entry.get("bbox") or [])]
+                cur_bb = [float(v) for v in (entry.get("bbox") or [])]
+                if len(prev_bb) != 4 or len(cur_bb) != 4:
+                    return False
+                prev_cy = (prev_bb[1] + prev_bb[3]) / 2.0
+                cur_cy = (cur_bb[1] + cur_bb[3]) / 2.0
+                h_ref = max(4.0, min(prev_bb[3] - prev_bb[1], cur_bb[3] - cur_bb[1]))
+                return abs(cur_cy - prev_cy) <= h_ref * 0.45
+            except Exception:
+                return False
+
+        def inline_page_bbox(entry, page_value):
+            bb = entry.get("bbox") or []
+            text = (entry.get("text") or "").strip()
+            if not isinstance(bb, (list, tuple)) or len(bb) != 4 or not text or not page_value:
+                return entry.get("bbox")
+            try:
+                x0, y0, x1, y1 = [float(v) for v in bb]
+            except Exception:
+                return entry.get("bbox")
+            match = re.search(r"(\d{2,4}|[ivxlcdm]+)\s*$", text, flags=re.I)
+            if not match:
+                return entry.get("bbox")
+            total_chars = max(1, len(text))
+            start_frac = max(0.0, min(1.0, match.start(1) / total_chars))
+            end_frac = max(start_frac, min(1.0, match.end(1) / total_chars))
+            px0 = x0 + (x1 - x0) * start_frac
+            px1 = x0 + (x1 - x0) * end_frac
+            pad = max(4.0, (x1 - x0) * 0.01)
+            return [max(x0, px0 - pad), y0, min(x1, px1 + pad), y1]
 
         def infer_toc_profile(role):
             role = str(role or "").strip().lower()
@@ -940,14 +1392,7 @@ class LayoutV2Builder:
                 bb = ln.get("bbox") or None
                 if not bb:
                     continue
-                text = (ln.get("line_text") or ln.get("translated_text") or "").strip()
-                if not text:
-                    parts = []
-                    for ph in (ln.get("phrases") or []):
-                        tx = (ph.get("text") or ph.get("translated_text") or ph.get("texte") or "").strip()
-                        if tx:
-                            parts.append(tx)
-                    text = " ".join(parts).strip()
+                text = toc_line_text(ln)
                 if not text:
                     continue
                 try:
@@ -972,11 +1417,32 @@ class LayoutV2Builder:
         page_num_right_x_candidates = []
         pending = []
 
-        def flush_pending(page_value="", page_bbox=None):
+        def union_bbox(entries):
+            boxes = []
+            for item in entries:
+                bb = item.get("bbox") or []
+                if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                    continue
+                try:
+                    boxes.append([float(v) for v in bb])
+                except Exception:
+                    continue
+            if not boxes:
+                return None
+            x0 = min(bb[0] for bb in boxes)
+            y0 = min(bb[1] for bb in boxes)
+            x1 = max(bb[2] for bb in boxes)
+            y1 = max(bb[3] for bb in boxes)
+            return [x0, y0, x1, y1]
+
+        def flush_pending(page_value="", page_bbox=None, page_style=None):
             nonlocal pending
             if not pending:
                 return
             label_text = " ".join((p.get("text") or "").strip() for p in pending if (p.get("text") or "").strip()).strip()
+            inline_page_bbox = None
+            if re.search(r"\.{2,}\s*(\d{2,4}|[ivxlcdm]+)\s*$", label_text, flags=re.I) and pending:
+                inline_page_bbox = pending[-1].get("bbox")
             marker, label_text = self._extract_leading_marker(label_text)
             best_style = {}
             if pending:
@@ -998,45 +1464,60 @@ class LayoutV2Builder:
                     "page": (page_value or "").strip(),
                     "role": role,
                     "style": best_style,
+                    "label_bbox": union_bbox(pending),
+                    "page_bbox": [float(v) for v in (inline_page_bbox or page_bbox)] if (inline_page_bbox or page_bbox) else None,
+                    "page_style": dict(page_style) if isinstance(page_style, dict) and page_style else {},
                 }
             )
-            if page_bbox:
+            if inline_page_bbox:
+                page_num_right_x_candidates.append(float(inline_page_bbox[2]))
+            elif page_bbox:
                 page_num_right_x_candidates.append(float(page_bbox[2]))
             pending = []
 
         for entry in flat_lines:
             text = (entry.get("text") or "").strip()
             if re.fullmatch(r"\d{1,3}|[ivxlcdm]+", text, flags=re.I):
-                flush_pending(text, page_bbox=entry.get("bbox"))
+                flush_pending(text, page_bbox=entry.get("bbox"), page_style=entry.get("style"))
                 continue
+            if pending and looks_like_standalone_toc_row(entry) and not same_visual_row(pending[-1], entry):
+                flush_pending("", page_bbox=None, page_style=None)
             pending.append(entry)
+            _, inline_page = self._extract_toc_trailing_page(text)
+            if inline_page:
+                flush_pending(inline_page, page_bbox=inline_page_bbox(entry, inline_page), page_style=entry.get("style"))
 
-        flush_pending("", page_bbox=None)
+        flush_pending("", page_bbox=None, page_style=None)
 
         if page_num_right_x_candidates:
             page_num_right_x = float(statistics.median(page_num_right_x_candidates))
         else:
             page_num_right_x = col_right
 
-        current_chapter = ""
+        merged = self._split_compound_toc_rows(merged)
+        for row in merged:
+            label_text = str(row.get("label") or "").strip()
+            marker, label_text = self._extract_leading_marker(label_text)
+            if marker:
+                row["marker"] = marker
+            row["label"] = label_text.strip()
+            role = infer_toc_role(
+                label_text=row.get("label") or "",
+                marker=row.get("marker") or "",
+                indent_level=int(row.get("indent_level", 0) or 0),
+                style=row.get("style") or {},
+                page_value=row.get("page") or "",
+            )
+            row["role"] = role
+
         for idx, row in enumerate(merged):
-            label = str(row.get("label") or "").strip()
             role = str(row.get("role") or "").strip().lower()
             row_style, row_tone = infer_toc_profile(role)
             row["translation_style"] = row.get("translation_style") or row_style
             row["translation_tone"] = row.get("translation_tone") or row_tone
-            m = re.match(r"^(\d+)\.\d+\b", label)
-            if m:
-                current_chapter = m.group(1)
-            if role == "chapter_title":
-                if not current_chapter:
-                    for nxt in merged[idx + 1:]:
-                        nm = re.match(r"^(\d+)\.\d+\b", str(nxt.get("label") or "").strip())
-                        if nm:
-                            current_chapter = nm.group(1)
-                            break
-                if current_chapter:
-                    row["chapter_number"] = current_chapter
+        self._normalize_toc_rows(merged)
+        self._annotate_toc_chapter_numbers(merged)
+        self._annotate_toc_source_bands(merged)
 
         tab_stops = {
             "page_num_right_x": page_num_right_x,
@@ -1066,7 +1547,7 @@ class LayoutV2Builder:
 
     def _extract_leading_marker(self, label):
         s = (label or "").strip()
-        m = re.match(r"^([•■·\-\u2022])\s+(.*)$", s)
+        m = re.match(r"^([•■·\-\u2022])\s*(.*)$", s)
         if m:
-            return m.group(1), m.group(2)
+            return m.group(1), m.group(2).strip()
         return "", s

@@ -216,6 +216,40 @@ class CoverageValidatorTests(unittest.TestCase):
         self.assertEqual(reason, "header_compact_match")
         self.assertEqual(expected, "CHAPITRE 6")
 
+    def test_middle_dot_ocr_noise_does_not_break_rendered_sentence_match(self):
+        status, reason, expected = _classify_rendered_presence(
+            {
+                "translated_text": "Visit the book's website at www.manning.com/books/deep-learning-for-vision-",
+                "source_text": "Visit the book's website at www.manning.com/books/deep-learning-for-vision-",
+                "translation_strategy": "exact_preserve",
+                "coverage_required": "strict",
+                "translatable": False,
+                "preserve_sentence_integrity": True,
+            },
+            "Visit the book·s website at www.manning.com/books/deep-learning-for-vision-",
+            full_text="",
+        )
+        self.assertEqual(status, "covered")
+        self.assertEqual(reason, "substring_match")
+        self.assertTrue(expected.startswith("Visit the book"))
+
+    def test_reference_like_caption_uses_token_match_when_punctuation_is_noisy(self):
+        status, reason, expected = _classify_rendered_presence(
+            {
+                "translated_text": "An Update to Open Images Now with Bounding Boxes July 2017 http://mng.bz/yyVG",
+                "source_text": "An Update to Open Images Now with Bounding Boxes July 2017 http://mng.bz/yyVG",
+                "translation_strategy": "exact_preserve",
+                "coverage_required": "strict",
+                "translatable": False,
+                "unit_type": "citation",
+            },
+            "·An Update to Open Images·Now with Bounding-Boxes,· July 2017 http://mng.bz/yyVG",
+            full_text="",
+        )
+        self.assertEqual(status, "covered")
+        self.assertEqual(reason, "reference_like_token_match")
+        self.assertIn("Open Images", expected)
+
     def test_decorative_raster_is_not_treated_as_real_image_collision(self):
         page_area = float(600 * 800)
         decorative = fitz.Rect(90, 580, 340, 588)

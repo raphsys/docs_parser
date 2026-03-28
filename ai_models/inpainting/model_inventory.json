@@ -1,0 +1,14 @@
+{
+  "default_model": "lama_fp32",
+  "models": {
+    "lama_fp32": {
+      "backend": "lama_onnx",
+      "license": "Apache-2.0",
+      "source_repo": "Carve/LaMa-ONNX",
+      "filename": "lama_fp32.onnx",
+      "target_path": "lama/lama_fp32.onnx",
+      "input_size": [512, 512],
+      "notes": "Fixed 512x512 input, recommended by the model author for CPU ONNX inference."
+    }
+  }
+}

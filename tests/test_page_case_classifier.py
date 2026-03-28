@@ -2,11 +2,13 @@ import unittest
 
 from page_case_classifier import PageCaseClassifier
 from page_family_registry import get_family_config, get_family_group
+from structure_extractor import LayoutV2Builder
 
 
 class PageCaseClassifierTests(unittest.TestCase):
     def setUp(self):
         self.classifier = PageCaseClassifier()
+        self.layout_builder = LayoutV2Builder()
 
     def test_detects_known_table_page(self):
         page_data = {
@@ -209,6 +211,42 @@ class PageCaseClassifierTests(unittest.TestCase):
         self.assertEqual(result["layout_type"], "annotated_page")
         self.assertIn("regions", result)
         self.assertGreaterEqual(result["features"]["font_size_levels"], 0)
+
+    def test_equation_rule_page_is_not_misdetected_as_toc(self):
+        page_data = {
+            "dimensions": {"width": 420, "height": 600},
+            "blocks": [
+                {
+                    "role": "body",
+                    "bbox": [40, 60, 360, 90],
+                    "lines": [
+                        {"line_text": "Power Rule: d/dx (x^n) = nx^(n-1)"},
+                        {"line_text": "Quotient Rule: d/dx [f(x)/g(x)]"},
+                        {"line_text": "Constant Rule: d/dx c = 0"},
+                        {"line_text": "Product Rule: d/dx [f(x)g(x)]"},
+                        {"line_text": "Chain Rule: d/dx f(g(x))"},
+                        {"line_text": "f(x) = 10x^5 + 4x^7 + 12x"},
+                    ],
+                }
+            ],
+        }
+        lines = [
+            {"bbox": [40, 60 + idx * 20, 360, 76 + idx * 20], "line": ln, "block": page_data["blocks"][0]}
+            for idx, ln in enumerate(page_data["blocks"][0]["lines"])
+        ]
+        self.assertEqual(self.layout_builder._detect_page_role(page_data, lines), "body")
+        result = self.classifier.classify(
+            {
+                **page_data,
+                "images": [],
+                "drawings": [],
+                "non_text_zones": [],
+                "layout": {"columns": [{"x0": 0, "x1": 210}, {"x0": 210, "x1": 420}]},
+            },
+            lines,
+            page_role="body",
+        )
+        self.assertNotEqual(result["page_family"], "toc")
 
 
 if __name__ == "__main__":

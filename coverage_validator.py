@@ -10,6 +10,7 @@ def _normalize_spaces(text):
 def _normalize_text(text):
     s = _normalize_spaces(text).lower()
     s = re.sub(r"[’`]", "'", s)
+    s = s.replace("·", "'")
     s = re.sub(r"[^a-z0-9à-ÿ'\-\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -32,6 +33,19 @@ def _text_signature(text):
         "de", "du", "la", "le", "et", "en", "un", "une", "a", "to", "of",
     }
     return {t for t in toks if len(t) >= 3 and t not in stop}
+
+
+def _is_reference_like_render_unit(unit, expected_text):
+    unit_type = _normalize_spaces((unit or {}).get("unit_type") or "").lower()
+    strategy = _normalize_spaces((unit or {}).get("translation_strategy") or "").lower()
+    expected = _normalize_spaces(expected_text)
+    if unit_type in {"citation", "reference_link"}:
+        return True
+    if re.search(r"(https?://|www\.)", expected, flags=re.IGNORECASE):
+        return True
+    if strategy == "exact_preserve" and len(_tokenize(expected)) >= 6:
+        return True
+    return False
 
 
 def _english_marker_count(text):
@@ -556,6 +570,16 @@ def _classify_rendered_presence(unit, page_text, full_text=""):
     full_ratio = _ordered_subsequence_ratio(expected_tokens, full_tokens)
     if full_ratio >= 1.0:
         return "covered", "document_ordered_token_match", expected
+    if _is_reference_like_render_unit(unit, expected):
+        expected_sig = _text_signature(expected)
+        page_sig = _text_signature(page_text)
+        full_sig = _text_signature(full_text)
+        page_sig_ratio = len(expected_sig & page_sig) / max(1, len(expected_sig))
+        full_sig_ratio = len(expected_sig & full_sig) / max(1, len(expected_sig))
+        if ratio >= 0.6 or page_sig_ratio >= 0.6:
+            return "covered", "reference_like_token_match", expected
+        if full_ratio >= 0.6 or full_sig_ratio >= 0.6:
+            return "covered", "document_reference_like_token_match", expected
     role = _normalize_spaces(unit.get("role") or "").lower()
     if role == "header":
         page_compact = re.sub(r"\s+", "", page_norm)

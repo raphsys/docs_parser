@@ -80,6 +80,36 @@ class PageCaseClassifier:
             return True
         return False
 
+    def _is_equation_like_toc_false_positive(self, text):
+        s = self._block_text({"text": text})
+        if not s:
+            return False
+        if re.search(r"[=<>±×÷∑∫∞≈≠≤≥√∆∂µλΩα-ωΑ-Ω^_]", s):
+            return True
+        if re.search(r"\b[dD][A-Za-z]\s*/\s*d[A-Za-z]\b", s):
+            return True
+        if re.search(r"\b[A-Za-z]\s*/\s*[A-Za-z]\b", s):
+            return True
+        if re.search(r"\bf\([A-Za-z]\)\b", s):
+            return True
+        if len(re.findall(r"[-+*/=]", s)) >= 2:
+            return True
+        return False
+
+    def _is_toc_candidate_line(self, text):
+        s = self._block_text({"text": text})
+        if not s or self._is_equation_like_toc_false_positive(s):
+            return False
+        if re.search(r"\.{2,}\s*\d{1,4}\s*$", s):
+            return True
+        if re.search(r"^\s*\d+(?:\.\d+)*\s+.+\s+\d{1,3}\s*$", s):
+            return True
+        if re.search(r"^\s*[A-Za-zÀ-ÿ].+\s+\d{1,3}\s*$", s) and len(s) <= 110:
+            words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", s)
+            if len(words) >= 2:
+                return True
+        return False
+
     def extract_features(self, page_data, lines, page_role="body"):
         blocks = page_data.get("blocks") or []
         images = page_data.get("images") or []
@@ -243,10 +273,12 @@ class PageCaseClassifier:
                 ):
                     tableish_lines += 1
                     block_has_tableish = True
-                if re.search(r"\.{2,}\s*\d{1,4}$", line_text) or re.search(r"\b\d{1,4}$", line_text):
-                    page_marker_lines += 1
-                if re.search(r"\.{2,}\s*\d{1,4}$", line_text):
+                if self._is_toc_candidate_line(line_text):
                     toc_like_lines += 1
+                    if re.search(r"\d{1,4}\s*$", line_text):
+                        page_marker_lines += 1
+                elif re.fullmatch(r"\d{1,3}|[ivxlcdm]+", line_text, flags=re.I):
+                    page_marker_lines += 1
                 for phrase in line.get("phrases") or []:
                     for span in phrase.get("spans") or []:
                         style = span.get("style") or {}

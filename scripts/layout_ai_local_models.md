@@ -6,11 +6,19 @@ Pour activer `PP-StructureV3` en mode 100% local sur CPU dans ce projet, dépose
 
 Le code utilise maintenant ce chemin par défaut.
 
-Tu peux aussi surcharger avec une variable d’environnement si nécessaire:
+Le plus simple est maintenant:
+
+```bash
+source .docs-parser/bin/activate
+python scripts/download_layout_ai_models.py --profile advanced
+```
+
+Tu peux aussi surcharger avec des variables d’environnement si nécessaire:
 
 ```bash
 export LAYOUT_AI_ENABLE=1
 export LAYOUT_AI_BACKEND=ppstructurev3
+export LAYOUT_AI_PROFILE=advanced
 export LAYOUT_AI_MODELS_ROOT=/chemin/vers/layout_ai_models
 export PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 ```
@@ -74,6 +82,8 @@ PP-LCNet_x1_0_doc_ori/
 UVDoc/
 ```
 
+Quand cet ensemble complet est présent localement, `LayoutAIEnricher` passe automatiquement sur le profil `advanced` si `LAYOUT_AI_PROFILE` n’est pas forcé.
+
 ## Vérification attendue
 
 Quand les modèles minimaux sont présents localement, ce test doit passer:
@@ -87,6 +97,7 @@ print(enricher.status())
 Le statut attendu:
 - `enabled = True`
 - `backend = "ppstructurev3"`
+- `profile = "advanced"` si les modèles complets sont présents, sinon `minimal`
 - `models_root` renseigné
 - `ready = False` avant premier chargement
 

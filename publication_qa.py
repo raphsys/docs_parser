@@ -53,6 +53,50 @@ def _entity_bbox_rect(entity):
         return None
 
 
+def _page_refs(page, fallback_index=0):
+    if not isinstance(page, dict):
+        return {
+            "page_index": max(0, int(fallback_index or 0)),
+            "page_number": max(1, int(fallback_index or 0) + 1),
+        }
+    raw_page_number = page.get("page")
+    raw_page_index = page.get("page_index")
+    descriptor = (page.get("layout_descriptor") or ((page.get("layout") or {}).get("layout_descriptor")) or {})
+    descriptor_page_index = descriptor.get("page_id") if isinstance(descriptor, dict) else None
+    descriptor_page_number = descriptor.get("page_number") if isinstance(descriptor, dict) else None
+
+    try:
+        page_index = int(raw_page_index)
+    except Exception:
+        page_index = None
+    if page_index is None:
+        page_index = max(0, int(fallback_index or 0))
+    if page_index is None:
+        try:
+            page_index = int(descriptor_page_index)
+        except Exception:
+            page_index = None
+
+    try:
+        page_number = int(raw_page_number)
+    except Exception:
+        page_number = None
+    if page_number is None:
+        page_number = max(1, int(fallback_index or 0) + 1)
+    if page_number is None:
+        try:
+            page_number = int(descriptor_page_number)
+        except Exception:
+            page_number = None
+    if page_number is None:
+        page_number = max(1, int(page_index) + 1)
+
+    return {
+        "page_index": max(0, int(page_index)),
+        "page_number": max(1, int(page_number)),
+    }
+
+
 def _page_layout_descriptor_maps(page):
     descriptor = (page or {}).get("layout_descriptor")
     if not isinstance(descriptor, dict):
@@ -140,7 +184,7 @@ def _collect_visual_annotation_regions(pages):
     for page_idx, page in enumerate(pages or []):
         if not isinstance(page, dict):
             continue
-        page_key = int(page.get("page", page_idx) or page_idx)
+        page_key = _page_refs(page, fallback_index=page_idx)["page_index"]
         page_regions = regions_by_page.setdefault(page_key, [])
         element_map, region_map, visual_object_map, visual_group_map = _page_layout_descriptor_maps(page)
         for block in page.get("blocks", []) or []:
@@ -220,7 +264,7 @@ def _collect_locked_equation_regions(pages):
     for page_idx, page in enumerate(pages or []):
         if not isinstance(page, dict):
             continue
-        page_key = int(page.get("page", page_idx) or page_idx)
+        page_key = _page_refs(page, fallback_index=page_idx)["page_index"]
         page_regions = regions_by_page.setdefault(page_key, [])
         for block in page.get("blocks", []) or []:
             role = _norm_lower(block.get("role"))
@@ -287,16 +331,19 @@ def _normalize_spaces(text):
 
 
 def _iter_translated_units(pages):
-    for page in pages or []:
+    for page_idx, page in enumerate(pages or []):
         if not isinstance(page, dict):
             continue
+        refs = _page_refs(page, fallback_index=page_idx)
         if page.get("schema_version") == "layout.v2" and str(page.get("page_role", "")).strip().lower() == "toc":
             rows = ((page.get("toc") or {}).get("toc_rows") or [])
             for row in rows:
                 label = _normalize_spaces(row.get("translated_label") or row.get("label") or "")
                 if label:
                     yield {
-                        "page_id": page.get("page", 0),
+                        "page_id": refs["page_number"],
+                        "page_number": refs["page_number"],
+                        "page_index": refs["page_index"],
                         "role": "toc_label",
                         "strategy": "layout_constrained",
                         "source_text": _normalize_spaces(row.get("label") or ""),
@@ -320,7 +367,9 @@ def _iter_translated_units(pages):
                         },
                     )
                     yield {
-                        "page_id": page.get("page", 0),
+                        "page_id": refs["page_number"],
+                        "page_number": refs["page_number"],
+                        "page_index": refs["page_index"],
                         "role": phrase.get("role") or role,
                         "strategy": phrase.get("translation_strategy") or block.get("translation_strategy") or "semantic_reflow",
                         "unit_type": phrase.get("unit_type") or line.get("unit_type") or block.get("unit_type") or "",
@@ -367,6 +416,8 @@ def _english_leak_count(pages, target_lang="fr"):
             flagged.append(
                 {
                     "page_id": unit["page_id"],
+                    "page_number": unit.get("page_number", unit["page_id"]),
+                    "page_index": unit.get("page_index", 0),
                     "role": unit["role"],
                     "strategy": unit["strategy"],
                     "source_text": unit["source_text"],

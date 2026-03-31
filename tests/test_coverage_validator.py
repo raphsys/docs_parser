@@ -3,7 +3,7 @@ from pathlib import Path
 
 import fitz
 
-from coverage_validator import _classify_rendered_presence, _classify_unit_status, analyze_rendered_text_coverage
+from coverage_validator import _classify_rendered_presence, _classify_unit_status, _page_index_for_unit, analyze_document_coverage, analyze_rendered_text_coverage
 from publication_qa import _english_leak_count, _is_decorative_raster
 
 
@@ -361,6 +361,305 @@ class CoverageValidatorTests(unittest.TestCase):
         doc.close()
         report = analyze_rendered_text_coverage([], translated_pages, str(self.pdf_path))
         self.assertEqual(report["summary"]["rendered_missing_units"], 0)
+
+    def test_page_index_for_unit_prefers_explicit_page_index(self):
+        self.assertEqual(_page_index_for_unit({"page_id": 25, "page_index": 4}, 25), 4)
+
+    def test_rendered_coverage_uses_page_index_derived_from_page_number(self):
+        doc = fitz.open()
+        page1 = doc.new_page()
+        page1.insert_text((72, 72), "first page")
+        page2 = doc.new_page()
+        page2.insert_text((72, 72), "Bonjour le monde")
+        doc.save(self.pdf_path)
+        doc.close()
+
+        translated_pages = [
+            {
+                "page": 2,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "u_page_refs",
+                                        "text": "Hello world",
+                                        "raw_text": "Hello world",
+                                        "translated_text": "Bonjour le monde",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        report = analyze_rendered_text_coverage([], translated_pages, str(self.pdf_path))
+        self.assertEqual(report["summary"]["rendered_missing_units"], 0)
+        self.assertEqual(report["summary"]["rendered_warning_units"], 0)
+
+    def test_document_coverage_matches_duplicate_unit_ids_by_page_index(self):
+        source_pages = [
+            {
+                "page": 1,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "dup",
+                                        "text": "First source",
+                                        "raw_text": "First source",
+                                        "translated_text": "Premier",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "page": 2,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "dup",
+                                        "text": "Second source",
+                                        "raw_text": "Second source",
+                                        "translated_text": "Deuxieme",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        translated_pages = [
+            {
+                "page": 1,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "dup",
+                                        "text": "First source",
+                                        "raw_text": "First source",
+                                        "translated_text": "Premier",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "page": 2,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "dup",
+                                        "text": "Second source",
+                                        "raw_text": "Second source",
+                                        "translated_text": "Deuxieme",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        report = analyze_document_coverage(source_pages, translated_pages)
+        self.assertEqual(report["summary"]["missing_units"], 0)
+        self.assertEqual(report["summary"]["warning_units"], 0)
+
+    def test_document_coverage_exposes_page_histogram(self):
+        source_pages = [
+            {
+                "page": 3,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "warn_hist",
+                                        "text": "Deep Learning for",
+                                        "raw_text": "Deep Learning for",
+                                        "translated_text": "",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        translated_pages = [
+            {
+                "page": 3,
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "warn_hist",
+                                        "text": "Deep Learning for",
+                                        "raw_text": "Deep Learning for",
+                                        "translated_text": "4",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        report = analyze_document_coverage(source_pages, translated_pages)
+        self.assertEqual(report["findings_total"], 1)
+        self.assertEqual(report["findings_by_page"], {3: 1})
+        self.assertEqual(report["findings_by_reason"], {"overcompressed": 1})
+
+    def test_document_coverage_prefers_fallback_index_over_stale_descriptor_page_id(self):
+        source_pages = [
+            {
+                "layout_descriptor": {"page_id": 0},
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "stale_desc",
+                                        "text": "Needs more translation",
+                                        "raw_text": "Needs more translation",
+                                        "translated_text": "",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "layout_descriptor": {"page_id": 0},
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "stale_desc",
+                                        "text": "Needs more translation",
+                                        "raw_text": "Needs more translation",
+                                        "translated_text": "",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        translated_pages = [
+            {
+                "layout_descriptor": {"page_id": 0},
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "stale_desc",
+                                        "text": "Needs more translation",
+                                        "raw_text": "Needs more translation",
+                                        "translated_text": "4",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "layout_descriptor": {"page_id": 0},
+                "blocks": [
+                    {
+                        "role": "body",
+                        "lines": [
+                            {
+                                "phrases": [
+                                    {
+                                        "unit_id": "stale_desc",
+                                        "text": "Needs more translation",
+                                        "raw_text": "Needs more translation",
+                                        "translated_text": "4",
+                                        "coverage_required": "strict",
+                                        "translatable": True,
+                                        "translation_strategy": "layout_constrained",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        report = analyze_document_coverage(source_pages, translated_pages)
+        self.assertEqual(report["findings_total"], 2)
+        self.assertEqual(report["findings_by_page"], {1: 1, 2: 1})
 
 
 if __name__ == "__main__":

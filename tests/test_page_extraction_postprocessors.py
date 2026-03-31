@@ -219,6 +219,43 @@ class PageExtractionPostprocessorTests(unittest.TestCase):
         self.assertFalse(info["changed"])
         self.assertEqual(len(out["blocks"]), 2)
 
+    def test_layout_ai_structure_adds_native_hints_without_merging(self):
+        page = {
+            "dimensions": {"width": 700, "height": 1000},
+            "layout_type": "double_column",
+            "document_type": "book_page",
+            "page_family": "body_text_two_column_sectioned",
+            "layout_ai_structure": {
+                "regions": [
+                    {"id": "ai_r0", "type": "title", "bbox": [70, 60, 330, 104], "source": "layout_ai_parsing"},
+                    {"id": "ai_r1", "type": "text", "bbox": [70, 130, 330, 230], "source": "layout_ai_parsing"},
+                ],
+                "parsing_blocks": [
+                    {"id": "pb0", "label": "doc_title", "bbox": [70, 60, 330, 104], "text": "Introduction"},
+                    {"id": "pb1", "label": "text", "bbox": [70, 130, 330, 230], "text": "First body paragraph"},
+                ],
+                "table_regions": [],
+                "formula_regions": [],
+                "chart_regions": [],
+                "seal_regions": [],
+                "ocr_lines": [],
+            },
+            "blocks": [
+                _line_block("h1", "title", [80, 64, 320, 100], "Introduction", size=13),
+                _line_block("p1", "body", [82, 140, 318, 220], "First body paragraph", size=11),
+            ],
+        }
+        out, info = apply_page_extraction_postprocessors(page)
+        self.assertFalse(info["changed"])
+        native_ai = out.get("native_structure", {}).get("layout_ai") or {}
+        self.assertEqual(len(native_ai.get("parsing_groups") or []), 2)
+        title_block = next(blk for blk in out["blocks"] if blk.get("id") == "h1")
+        body_block = next(blk for blk in out["blocks"] if blk.get("id") == "p1")
+        self.assertEqual((title_block.get("structure_hints") or {}).get("band_role_hint"), "title_band")
+        self.assertEqual((title_block.get("structure_hints") or {}).get("structural_role_hint"), "section_title")
+        self.assertEqual((body_block.get("structure_hints") or {}).get("band_role_hint"), "text_band")
+        self.assertEqual((body_block.get("structure_hints") or {}).get("layout_behavior_hint"), "flow_in_band")
+
 
 if __name__ == "__main__":
     unittest.main()

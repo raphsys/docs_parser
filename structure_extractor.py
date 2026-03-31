@@ -5,8 +5,10 @@ import re
 import statistics
 from PIL import Image, ImageOps
 from page_case_classifier import PageCaseClassifier
+from page_case_classifier_v2 import PageCaseClassifierV2
 from page_family_registry import get_family_config
 from layout_descriptor import LayoutDescriptorBuilder
+from layout_descriptor_v3 import LayoutDescriptorBuilderV3
 
 class VisualAttributeExtractor:
     def analyze(self, pil_image, bbox, text=""):
@@ -500,7 +502,9 @@ class LayoutV2Builder:
 
     def __init__(self):
         self.page_case_classifier = PageCaseClassifier()
+        self.page_case_classifier_v2 = PageCaseClassifierV2()
         self.layout_descriptor_builder = LayoutDescriptorBuilder()
+        self.layout_descriptor_builder_v3 = LayoutDescriptorBuilderV3()
 
     def build(self, page_data):
         """
@@ -567,13 +571,11 @@ class LayoutV2Builder:
         page_data["layout"]["translation_style"] = page_data["translation_style"]
         page_data["layout"]["translation_tone"] = page_data["translation_tone"]
 
-        layout_descriptor = self.layout_descriptor_builder.build(page_data)
-        page_data["layout_descriptor"] = layout_descriptor
-        page_data["layout"]["layout_descriptor"] = layout_descriptor
-        page_data["layout"]["descriptor_version"] = layout_descriptor.get("descriptor_version")
+        page_case_v2 = self.page_case_classifier_v2.classify(page_data, all_lines, page_role=page_role)
+        page_data["page_case_v2"] = page_case_v2
+        page_data["layout"]["page_case_v2"] = page_case_v2
 
-        self._inject_indent_levels(page_data, columns, margins)
-        self._annotate_block_translation_profiles(page_data)
+        self._split_abbreviation_blocks(page_data)
 
         if page_role == "toc":
             toc_rows, tab_stops = self._build_toc_rows(page_data, columns, margins)
@@ -581,7 +583,96 @@ class LayoutV2Builder:
                 "toc_rows": toc_rows,
                 "tab_stops": tab_stops,
             }
+
+        layout_descriptor = self.layout_descriptor_builder.build(page_data)
+        page_data["layout_descriptor"] = layout_descriptor
+        page_data["layout"]["layout_descriptor"] = layout_descriptor
+        page_data["layout"]["descriptor_version"] = layout_descriptor.get("descriptor_version")
+        layout_descriptor_v3 = self.layout_descriptor_builder_v3.build(page_data)
+        page_data["layout_descriptor_v3"] = layout_descriptor_v3
+        page_data["layout"]["layout_descriptor_v3"] = layout_descriptor_v3
+        page_data["layout"]["descriptor_v3_version"] = layout_descriptor_v3.get("descriptor_version")
+
+        self._inject_indent_levels(page_data, columns, margins)
+        self._annotate_block_translation_profiles(page_data)
         return page_data
+
+    def _looks_like_abbreviation_heading(self, text):
+        s = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+        return bool(re.search(r"\b(abbreviations?|acronyms?|nomenclature|glossary)\b", s))
+
+    def _line_visible_text(self, line):
+        if not isinstance(line, dict):
+            return ""
+        text = str(line.get("line_text") or "").strip()
+        if text:
+            return re.sub(r"\s+", " ", text)
+        parts = []
+        for phrase in line.get("phrases") or []:
+            if not isinstance(phrase, dict):
+                continue
+            txt = str(phrase.get("texte") or "").strip()
+            if txt:
+                parts.append(txt)
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+    def _line_primary_style(self, line):
+        if not isinstance(line, dict):
+            return {}
+        for phrase in line.get("phrases") or []:
+            for span in phrase.get("spans") or []:
+                if isinstance(span, dict) and isinstance(span.get("style"), dict):
+                    return dict(span.get("style") or {})
+        return {}
+
+    def _split_abbreviation_blocks(self, page_data):
+        if not isinstance(page_data, dict):
+            return
+        blocks = page_data.get("blocks") or []
+        if not blocks:
+            return
+        if not any(self._looks_like_abbreviation_heading(block.get("text") or "") for block in blocks if isinstance(block, dict)):
+            return
+
+        split_blocks = []
+        changed = False
+        for block in blocks:
+            if not isinstance(block, dict):
+                split_blocks.append(block)
+                continue
+            role = str(block.get("role") or "").strip().lower()
+            lines = [line for line in (block.get("lines") or []) if isinstance(line, dict)]
+            if role != "body" or len(lines) < 8:
+                split_blocks.append(block)
+                continue
+            line_texts = [self._line_visible_text(line) for line in lines]
+            non_empty = [txt for txt in line_texts if txt]
+            if len(non_empty) < 6:
+                split_blocks.append(block)
+                continue
+            short_like = sum(1 for txt in non_empty if len(txt) <= 18 and len(re.findall(r"[A-Za-z0-9]", txt)) >= 2)
+            if short_like < max(4, int(len(non_empty) * 0.18)):
+                split_blocks.append(block)
+                continue
+
+            changed = True
+            base_id = str(block.get("id") or f"abbr_{len(split_blocks)}")
+            for idx, line in enumerate(lines):
+                text = line_texts[idx]
+                bbox = line.get("bbox") if isinstance(line.get("bbox"), (list, tuple)) and len(line.get("bbox")) == 4 else block.get("bbox")
+                split_blocks.append(
+                    {
+                        **{k: v for k, v in block.items() if k not in {"bbox", "text", "translated_text", "style", "lines"}},
+                        "id": f"{base_id}_abbr_{idx}",
+                        "bbox": list(bbox) if isinstance(bbox, (list, tuple)) else block.get("bbox"),
+                        "text": text,
+                        "translated_text": None,
+                        "style": self._line_primary_style(line),
+                        "lines": [line],
+                    }
+                )
+        if changed:
+            page_data["blocks"] = split_blocks
 
     def _toc_section_chapter_number(self, label):
         m = re.match(r"^(\d+)\.\d+\b", str(label or "").strip())
@@ -616,6 +707,35 @@ class LayoutV2Builder:
     def _normalize_toc_rows(self, rows):
         if not isinstance(rows, list):
             return rows
+        def continuation_candidate(label, next_label):
+            left = str(label or "").strip()
+            right = str(next_label or "").strip()
+            if not left or not right:
+                return False
+            if re.match(r"^[a-zà-ÿ]", right):
+                return True
+            tail = re.sub(r"[^\wÀ-ÿ'-]+$", "", left.split()[-1].lower()) if left.split() else ""
+            return tail in {
+                "the",
+                "a",
+                "an",
+                "of",
+                "and",
+                "in",
+                "to",
+                "for",
+                "with",
+                "using",
+                "by",
+                "de",
+                "du",
+                "des",
+                "la",
+                "le",
+                "les",
+                "d",
+            }
+
         for row in rows:
             label = self._normalize_toc_spaced_caps(row.get("label") or "")
             label, trailing_page = self._extract_toc_trailing_page(label)
@@ -641,6 +761,34 @@ class LayoutV2Builder:
             row["label"] = label
             row["page"] = page_value
             row["role"] = role
+        compact_rows = []
+        idx = 0
+        while idx < len(rows):
+            row = rows[idx]
+            label = str(row.get("label") or "").strip()
+            page_value = str(row.get("page") or "").strip()
+            role = str(row.get("role") or "").strip().lower()
+            if not label and not page_value:
+                idx += 1
+                continue
+            if label and not page_value and idx + 1 < len(rows):
+                nxt = rows[idx + 1]
+                next_label = str(nxt.get("label") or "").strip()
+                next_page = str(nxt.get("page") or "").strip()
+                next_role = str(nxt.get("role") or "").strip().lower()
+                if next_label and next_page and continuation_candidate(label, next_label):
+                    row["label"] = re.sub(r"\s+", " ", f"{label} {next_label}").strip()
+                    row["page"] = next_page
+                    if role == "subentry_marker" and next_role:
+                        row["role"] = next_role
+                    if nxt.get("page_bbox"):
+                        row["page_bbox"] = nxt.get("page_bbox")
+                    if nxt.get("page_style"):
+                        row["page_style"] = nxt.get("page_style")
+                    idx += 1
+            compact_rows.append(row)
+            idx += 1
+        rows[:] = compact_rows
         return rows
 
     def _normalize_toc_inline_text(self, text):

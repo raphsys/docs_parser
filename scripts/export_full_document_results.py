@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import copy
+import fcntl
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -20,6 +23,17 @@ def _ensure_clean_dir(path: Path):
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _json_default(value):
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 def _norm_bbox(bbox):
@@ -162,6 +176,34 @@ def _write_descriptor_outputs(pages, out_dir: Path):
     )
 
 
+def _write_page_payloads(pages, out_path: Path):
+    normalized_pages = []
+    for page_idx, page in enumerate(pages or []):
+        if not isinstance(page, dict):
+            normalized_pages.append(page)
+            continue
+        structure = page.get("structure")
+        if isinstance(structure, dict):
+            normalized = copy.deepcopy(structure)
+            if normalized.get("page") in {None, ""}:
+                normalized["page"] = page.get("page") if page.get("page") not in {None, ""} else (page_idx + 1)
+            if normalized.get("page_index") in {None, ""}:
+                normalized["page_index"] = page_idx
+            normalized_pages.append(normalized)
+            continue
+        normalized = copy.deepcopy(page)
+        if isinstance(normalized, dict):
+            if normalized.get("page") in {None, ""}:
+                normalized["page"] = page_idx + 1
+            if normalized.get("page_index") in {None, ""}:
+                normalized["page_index"] = page_idx
+        normalized_pages.append(normalized)
+    out_path.write_text(
+        json.dumps({"pages": normalized_pages}, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+
+
 def _write_extraction_overlay_pdf(pdf_path: Path, pages, out_pdf: Path):
     src = fitz.open(pdf_path)
     out = fitz.open()
@@ -203,17 +245,60 @@ def _write_extraction_overlay_pdf(pdf_path: Path, pages, out_pdf: Path):
         src.close()
 
 
+def _clear_previous_reconstruct_artifacts():
+    results_dir = ROOT / "ocr_results"
+    for pattern in (
+        "reconstructed_output.pdf",
+        "reconstructed_output_style_audit.json",
+        "reconstructed_output_layout_debug_p*.jpg",
+    ):
+        for path in results_dir.glob(pattern):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class _ReconstructLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("w", encoding="utf-8")
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
 async def _write_reconstructed_outputs(pages, out_dir: Path):
-    response = await ocr_server.reconstruct_document(
-        {"pages": pages},
-        target_lang=args.target_lang,
-        debug_compare=True,
-    )
-    payload = json.loads(response.body.decode("utf-8"))
-    src_pdf = ROOT / "ocr_results" / "reconstructed_output.pdf"
-    dst_pdf = out_dir / f"{args.target_lang}_translated_reconstructed.pdf"
-    if src_pdf.exists():
-        shutil.copy2(src_pdf, dst_pdf)
+    lock_path = ROOT / "ocr_results" / "reconstructed_output.lock"
+    with _ReconstructLock(lock_path):
+        _clear_previous_reconstruct_artifacts()
+        response = await ocr_server.reconstruct_document(
+            {"pages": pages},
+            target_lang=args.target_lang,
+            debug_compare=True,
+            include_debug_pages=True,
+        )
+        payload = json.loads(response.body.decode("utf-8"))
+        src_pdf = ROOT / "ocr_results" / "reconstructed_output.pdf"
+        dst_pdf = out_dir / f"{args.target_lang}_translated_reconstructed.pdf"
+        if src_pdf.exists():
+            shutil.copy2(src_pdf, dst_pdf)
+        src_audit = ROOT / "ocr_results" / f"{src_pdf.stem}_style_audit.json"
+        if src_audit.exists():
+            shutil.copy2(src_audit, out_dir / f"{dst_pdf.stem}_style_audit.json")
+        for debug_img in (ROOT / "ocr_results").glob(f"{src_pdf.stem}_layout_debug_p*.jpg"):
+            shutil.copy2(debug_img, out_dir / debug_img.name.replace(src_pdf.stem, dst_pdf.stem, 1))
 
     for name in ("coverage_report", "publication_qa", "visual_compare"):
         if payload.get(name) is not None:
@@ -221,6 +306,7 @@ async def _write_reconstructed_outputs(pages, out_dir: Path):
                 json.dumps(payload.get(name), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+    return payload
 
 
 async def main():
@@ -230,12 +316,14 @@ async def main():
     extraction_dir = export_root / "extraction_bboxes"
     classifier_dir = export_root / "classifier"
     descriptor_dir = export_root / "descriptors"
+    payloads_dir = export_root / "payloads"
     reconstructed_dir = export_root / "reconstructed"
 
     _ensure_clean_dir(export_root)
     extraction_dir.mkdir(parents=True, exist_ok=True)
     classifier_dir.mkdir(parents=True, exist_ok=True)
     descriptor_dir.mkdir(parents=True, exist_ok=True)
+    payloads_dir.mkdir(parents=True, exist_ok=True)
     reconstructed_dir.mkdir(parents=True, exist_ok=True)
 
     print("[export] starting extraction", flush=True)
@@ -258,7 +346,20 @@ async def main():
     print("[export] writing descriptor outputs", flush=True)
     _write_descriptor_outputs(pages, descriptor_dir)
     print("[export] reconstructing translated pdf", flush=True)
-    await _write_reconstructed_outputs(pages, reconstructed_dir)
+    payload = await _write_reconstructed_outputs(pages, reconstructed_dir)
+    print("[export] writing extracted payloads", flush=True)
+    source_pages = payload.get("source_pages")
+    if isinstance(source_pages, list):
+        _write_page_payloads(source_pages, payloads_dir / "source_pages.json")
+    else:
+        extracted_pages = copy.deepcopy(pages)
+        _write_page_payloads(extracted_pages, payloads_dir / "source_pages.json")
+    print("[export] writing translated payloads", flush=True)
+    translated_pages = payload.get("translated_pages")
+    if isinstance(translated_pages, list):
+        _write_page_payloads(translated_pages, payloads_dir / "translated_pages.json")
+    else:
+        _write_page_payloads(pages, payloads_dir / "translated_pages.json")
     print("[export] reconstruction done", flush=True)
 
     manifest = {
@@ -269,6 +370,7 @@ async def main():
             "extraction_bboxes": str(extraction_dir.relative_to(ROOT)),
             "classifier": str(classifier_dir.relative_to(ROOT)),
             "descriptors": str(descriptor_dir.relative_to(ROOT)),
+            "payloads": str(payloads_dir.relative_to(ROOT)),
             "reconstructed": str(reconstructed_dir.relative_to(ROOT)),
         },
     }

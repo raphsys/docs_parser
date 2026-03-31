@@ -30,4 +30,4 @@ transformers==4.57.6
 # Layout AI / PP-StructureV3 local pipeline
 onnxruntime==1.24.4
 paddlepaddle==3.2.0
-paddlex==3.3.9
+paddlex[ocr]==3.3.9

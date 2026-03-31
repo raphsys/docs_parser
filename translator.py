@@ -67,8 +67,9 @@ class DocumentTranslator:
         # Remove invisible/control separators that frequently appear in PDF extraction
         # and break both translation quality and reflow.
         s = re.sub(r"[\u00AD\u200B-\u200F\u2060\uFEFF]", "", s)
+        s = re.sub(r"[\x00-\x08\x0B-\x1F\x7F]", "", s)
         # Drop remaining Unicode format chars (Cf) conservatively.
-        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+        s = "".join(ch for ch in s if unicodedata.category(ch) not in {"Cf", "Cc"})
         return s
 
     def _contains_invisible_chars(self, text):
@@ -479,7 +480,23 @@ class DocumentTranslator:
         coverage_required = self._normalize_spaces(unit.get("coverage_required") or "strict").lower() or "strict"
         unit_type = self._normalize_spaces(unit.get("unit_type") or "").lower()
         unit_text = self._translation_contract_unit_text(unit)
+        profile = classify_block_typology(unit, context=context)
+        if profile.get("structural_role") == "abbreviation_key":
+            return {
+                "strategy": "exact_preserve",
+                "translatable": False,
+                "coverage_required": "strict",
+                "unit_type": unit_type,
+            }
+        if profile.get("structural_role") == "abbreviation_value" and strategy == "exact_preserve":
+            strategy = "layout_constrained"
+            translatable = True
+            coverage_required = "strict"
         if unit_type == "code_visible" and strategy == "exact_preserve" and self._should_relax_code_visible_contract(unit, unit_text, context=context):
+            strategy = "layout_constrained"
+            translatable = True
+            coverage_required = "strict"
+        elif strategy == "exact_preserve" and self._should_relax_editorial_exact_preserve_contract(unit, unit_text, context=context):
             strategy = "layout_constrained"
             translatable = True
             coverage_required = "strict"
@@ -489,6 +506,51 @@ class DocumentTranslator:
             "coverage_required": coverage_required,
             "unit_type": unit_type,
         }
+
+    def _should_relax_editorial_exact_preserve_contract(self, unit, unit_text, context=None):
+        src = self._normalize_spaces(unit_text)
+        if not src:
+            return False
+        ctx = context if isinstance(context, dict) else {}
+        block_role = self._normalize_spaces(ctx.get("block_role") or ctx.get("role") or unit.get("role") or "body").lower()
+        if block_role not in {"body", "title", "section_heading", "figure_caption"}:
+            return False
+        layout_type = self._normalize_spaces(ctx.get("layout_type") or "").lower()
+        document_type = self._normalize_spaces(ctx.get("document_type") or "").lower()
+        page_family = self._normalize_spaces(ctx.get("page_family") or "").lower()
+        if layout_type not in {"double_column", "single_column", "text_heavy"}:
+            return False
+        if document_type not in {"book_page", "manual_guide", "scientific_paper"} and page_family not in {
+            "body_text_two_column",
+            "body_text_two_column_sectioned",
+            "body_text_two_column_equations",
+        }:
+            return False
+        if self._looks_like_programming_code_line(src):
+            return False
+        if self._is_reference_like_text(src):
+            return False
+        if re.search(r"(https?://\S+|www\.\S+|[\w\.-]+@[\w\.-]+\.\w+|doi:\s*\S+|arxiv:\s*\S+)", src, flags=re.IGNORECASE):
+            return False
+        if re.search(r"\[[0-9,\-\s]+\]", src):
+            return False
+        if re.search(r"\([A-Z][A-Za-z\-]+,\s*(19|20)\d{2}\)", src):
+            return False
+        if re.search(r"(et al\.|vol\.|no\.|pp\.|isbn|issn)", src, flags=re.IGNORECASE):
+            return False
+        if self._should_preserve_equation_role_text(src):
+            return False
+        words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", src)
+        if len(words) < 5:
+            return False
+        uppercase_ratio = (
+            sum(1 for ch in src if ch.isalpha() and ch.isupper())
+            / max(1, sum(1 for ch in src if ch.isalpha()))
+        )
+        if uppercase_ratio >= 0.72:
+            return False
+        sentence_like = bool(re.search(r"[a-zà-ÿ]", src) and (" " in src))
+        return sentence_like
 
     def _translation_contract_unit_text(self, unit):
         if not isinstance(unit, dict):
@@ -534,6 +596,53 @@ class DocumentTranslator:
             if line_text:
                 collected.append(line_text)
         return self._normalize_spaces(" ".join(collected))
+
+    def _looks_like_abbreviation_key_text(self, text):
+        src = self._normalize_spaces(text)
+        if not src:
+            return False
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-/\.]*", src)
+        if not words or len(words) > 4:
+            return False
+        alpha_chars = [ch for ch in src if ch.isalpha()]
+        if not alpha_chars:
+            return False
+        upper_ratio = sum(1 for ch in alpha_chars if ch.isupper()) / max(1, len(alpha_chars))
+        if upper_ratio < 0.55:
+            return False
+        if len(src) > 24:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-/\.\s]*", src))
+
+    def _looks_like_abbreviation_page(self, structure):
+        if not isinstance(structure, dict):
+            return False
+        blocks = structure.get("blocks", []) or []
+        if not blocks:
+            return False
+        heading_hits = 0
+        acronym_like = 0
+        body_seen = 0
+        for block in blocks[:40]:
+            if not isinstance(block, dict):
+                continue
+            text = self._translation_contract_unit_text(block)
+            if not text:
+                continue
+            role = self._normalize_spaces(block.get("role") or "body").lower()
+            if role in {"header", "title", "section_heading"} and re.search(
+                r"\b(abbreviations?|acronyms?|glossary|nomenclature)\b",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                heading_hits += 1
+            if role == "body":
+                body_seen += 1
+                if self._looks_like_abbreviation_key_text(text):
+                    acronym_like += 1
+        if heading_hits >= 1 and acronym_like >= 4:
+            return True
+        return body_seen >= 10 and acronym_like >= max(4, int(body_seen * 0.25))
 
     def _code_visible_structure_profile(self, unit, context=None):
         return classify_block_typology(unit, context=context)
@@ -619,7 +728,7 @@ class DocumentTranslator:
             return True
         if re.search(r"\b(?:input|output|inputs|outputs|activation|name|summary)\s*=", src):
             return True
-        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", src):
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]{1,}\.[A-Za-z_][A-Za-z0-9_]{1,}", src):
             return True
         return False
 
@@ -1201,6 +1310,7 @@ class DocumentTranslator:
         blacklist = ["MANNING", "M A N N I N G", "O REILLY", "PACKT", "PEARSON"]
         tech_dict = {"Deep Learning": "Apprentissage profond", "Vision Systems": "Systèmes de vision"}
         tgt_code = self._normalize_lang_code(target_lang)
+        abbreviation_page = self._looks_like_abbreviation_page(structure)
         page_family = str(structure.get("page_family") or structure.get("layout", {}).get("page_family") or "").strip().lower()
         page_family_group = str(structure.get("page_family_group") or structure.get("layout", {}).get("page_family_group") or page_family).strip().lower()
         document_type = str(structure.get("document_type") or structure.get("layout", {}).get("document_type") or "").strip().lower()
@@ -1253,6 +1363,18 @@ class DocumentTranslator:
                 self._normalize_spaces((ph.get("texte") or ""))
                 for ln in block_lines for ph in (ln.get("phrases", []) or [])
             ))
+            if abbreviation_page and role_lc == "body":
+                if self._looks_like_abbreviation_key_text(block_text_preview):
+                    block_contract = {
+                        "strategy": "exact_preserve",
+                        "translatable": False,
+                        "coverage_required": "strict",
+                        "unit_type": block_unit_type or "abbreviation_key",
+                    }
+                elif block_contract["strategy"] == "exact_preserve":
+                    block_contract["strategy"] = "layout_constrained"
+                    block_contract["translatable"] = True
+                    block_contract["coverage_required"] = "strict"
             is_programming_code_line = bool(
                 role_lc in {"equation_inline", "equation_block"}
                 and self._looks_like_programming_code_line(block_text_preview)
@@ -1437,6 +1559,7 @@ class DocumentTranslator:
                     phrase["texte_original"] = preserve_text
                     phrase["translated_text"] = preserve_text
                     phrase["texte"] = preserve_text
+                    self._backfill_phrase_span_translations(phrase, preserve_text)
                     continue
                 if phrase_contract["strategy"] == "layout_constrained":
                     short_annotated_title = bool(
@@ -1592,6 +1715,7 @@ class DocumentTranslator:
                     for span in phrase.get("spans", []):
                         span["texte_original"] = span.get("texte", "")
                         self._normalize_span_style(span, role=block_role)
+                    self._backfill_phrase_span_translations(phrase, translated_phrase)
                     continue
 
                 wc = len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", orig_phrase_text))
@@ -1654,6 +1778,8 @@ class DocumentTranslator:
                     span["texte_original"] = span.get("texte", "")
                     # Keep span text untouched to preserve OCR/native source record.
                     self._normalize_span_style(span, role=block_role)
+                if phrase_contract["strategy"] == "layout_constrained":
+                    self._backfill_phrase_span_translations(phrase, translated_phrase)
 
             for line in block.get("lines", []):
                 translated_line = self._normalize_spaces(" ".join(
@@ -1791,6 +1917,280 @@ class DocumentTranslator:
             return "", s
         return m.group(1), self._normalize_spaces(m.group(2))
 
+    def _toc_canonical_entities_fr(self):
+        return [
+            (r"\bYOLOv?\d*\b", None),
+            (r"\bR-CNNs?\b", "R-CNN"),
+            (r"\bSSD\b", "SSD"),
+            (r"\bDCGAN\b", "DCGAN"),
+            (r"\bSRGAN\b", "SRGAN"),
+            (r"\bGANs?\b", "GAN"),
+            (r"\bGoogLeNet\b", "GoogLeNet"),
+            (r"\bResNet\b", "ResNet"),
+            (r"\bAlexNet\b", "AlexNet"),
+            (r"\bVGGNet\b", "VGGNet"),
+            (r"\bLeNet(?:-5)?\b", None),
+            (r"\bImageNet\b", "ImageNet"),
+            (r"\bFashion-MNIST\b", "Fashion-MNIST"),
+            (r"\bMNIST\b", "MNIST"),
+            (r"\bCIFAR\b", "CIFAR"),
+            (r"\bMS COCO\b", "MS COCO"),
+            (r"\bGoogle Open Images\b", "Google Open Images"),
+            (r"\bKaggle\b", "Kaggle"),
+            (r"\bInception\b", "Inception"),
+            (r"\bDeepDream\b", "DeepDream"),
+        ]
+
+    def _toc_extract_entities_fr(self, text):
+        src = self._normalize_spaces(text)
+        found = []
+        for pattern, canonical in self._toc_canonical_entities_fr():
+            for match in re.finditer(pattern, src, flags=re.IGNORECASE):
+                value = canonical or match.group(0)
+                if value not in found:
+                    found.append(value)
+        return found
+
+    def _toc_entity_fr(self, text):
+        entities = self._toc_extract_entities_fr(text)
+        return entities[0] if entities else ""
+
+    def _toc_concept_glossary_fr(self):
+        return {
+            "perceptron": "perceptron",
+            "multilayer perceptron": "perceptron multicouche",
+            "error function": "fonction d'erreur",
+            "optimization": "optimisation",
+            "deepdream algorithm": "algorithme DeepDream",
+            "visual embeddings": "embeddings visuels",
+            "feature extractor": "extracteur de caractéristiques",
+            "computer vision": "vision par ordinateur",
+            "neural network": "réseau de neurones",
+            "neural networks": "réseaux de neurones",
+            "deep learning": "apprentissage profond",
+        }
+
+    def _toc_strip_english_article(self, subject):
+        text = self._normalize_spaces(subject)
+        if not text:
+            return "", ""
+        match = re.match(r"^(a|an|the)\s+(.+)$", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).lower(), self._normalize_spaces(match.group(2))
+        return "", text
+
+    def _toc_is_safe_pattern_subject(self, subject):
+        text = self._normalize_spaces(subject)
+        if not text:
+            return False
+        stripped = self._toc_strip_english_article(text)[1]
+        if self._toc_extract_entities_fr(stripped):
+            return True
+        if stripped.lower() in self._toc_concept_glossary_fr():
+            return True
+        if re.search(r"\b[A-Z]{2,}(?:v\d+)?\b", stripped):
+            return True
+        if re.search(r"\b[A-Z][A-Za-z0-9]+(?:Net|GAN|CNN|RNN|YOLO|SSD|R-CNN)\b", stripped):
+            return True
+        return False
+
+    def _toc_indefinite_article_fr(self, subject):
+        token = self._normalize_spaces(subject).lower()
+        if not token:
+            return "un"
+        feminine_starts = (
+            "architecture",
+            "fonction",
+            "caractéristique",
+            "couche",
+            "vision",
+            "optimisation",
+            "erreur",
+            "méthode",
+            "application",
+        )
+        if token.startswith(feminine_starts) or re.match(r".*(tion|sion|té|ance|ence|ure|ie)$", token):
+            return "une"
+        return "un"
+
+    def _toc_defined_article_fr(self, subject):
+        token = self._normalize_spaces(subject).lower()
+        if not token:
+            return "le"
+        if re.match(r"^[aeiouyà-öø-ÿh]", token):
+            return "l'"
+        feminine_starts = (
+            "architecture",
+            "fonction",
+            "caractéristique",
+            "couche",
+            "vision",
+            "optimisation",
+            "erreur",
+            "méthode",
+            "application",
+        )
+        if token.startswith(feminine_starts) or re.match(r".*(tion|sion|té|ance|ence|ure|ie)$", token):
+            return "la"
+        return "le"
+
+    def _toc_article_fr(self, subject):
+        token = self._normalize_spaces(subject)
+        if not token:
+            return "de "
+        if re.fullmatch(r"[A-Z]{2,}(?:-[A-Z]+)?", token):
+            return "du "
+        if re.match(r"^[A-Z]{2,}[A-Za-z0-9\-]*", token):
+            return "de "
+        if token[0].islower():
+            defined = self._toc_defined_article_fr(token)
+            if defined == "l'":
+                return "de l'"
+            if defined == "la":
+                return "de la "
+            return "du "
+        return "d'" if re.match(r"^[AEIOUYaeiouyÀ-ÖØ-öø-ÿ]", token) else "de "
+
+    def _toc_translate_subject_fr(self, subject):
+        article, text = self._toc_strip_english_article(subject)
+        if not text:
+            return text
+        out = ""
+        entity = self._toc_entity_fr(text)
+        if entity and self._normalize_spaces(text).lower() == entity.lower():
+            out = entity
+        concept = self._toc_concept_glossary_fr().get(text.lower())
+        if concept:
+            out = concept
+        replacements = [
+            (r"\bdeep learning\b", "apprentissage profond"),
+            (r"\bneural networks?\b", "réseaux de neurones"),
+            (r"\bcomputer vision\b", "vision par ordinateur"),
+            (r"\bvisual embeddings\b", "embeddings visuels"),
+            (r"\bfeature extractor\b", "extracteur de caractéristiques"),
+            (r"\bfeatures?\b", "caractéristiques"),
+            (r"\bgrayscale\b", "niveaux de gris"),
+            (r"\bmini-batch\b", "mini-lots"),
+            (r"\bbackpropagation\b", "rétropropagation"),
+            (r"\bself-driving car\b", "voiture autonome"),
+            (r"\bhigh-level\b", "générale"),
+        ]
+        if not out:
+            out = text
+        for pattern, repl in replacements:
+            out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+        for entity in self._toc_extract_entities_fr(text):
+            out = re.sub(re.escape(entity), entity, out, flags=re.IGNORECASE)
+        if article == "the" and out and out[0].islower():
+            defined = self._toc_defined_article_fr(out)
+            if defined == "l'":
+                out = f"{defined}{out}"
+            else:
+                out = f"{defined} {out}"
+        return self._normalize_spaces(out)
+
+    def _translate_toc_pattern_fr(self, label, role=""):
+        s = self._normalize_spaces(label)
+        if not s:
+            return s
+        role_lc = self._normalize_spaces(role).lower()
+        if role_lc == "part_title" and s.lower().startswith("part "):
+            rest = self._normalize_spaces(re.sub(r"^part\b", "", s, flags=re.IGNORECASE))
+            rest = self._normalize_spaces(re.sub(r"^\d+\b", "", rest))
+            rest = self._toc_translate_subject_fr(rest)
+            rest = re.sub(r"\bimage classification\b", "classification d'images", rest, flags=re.IGNORECASE)
+            rest = re.sub(r"\band\b", "et", rest, flags=re.IGNORECASE)
+            rest = re.sub(r"\bdetection\b", "détection", rest, flags=re.IGNORECASE)
+            return self._normalize_spaces(f"Partie {rest}")
+
+        m = re.fullmatch(r"what is (.+)\?", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            article, stripped = self._toc_strip_english_article(raw_subject)
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(stripped)
+            if article in {"a", "an"}:
+                indef = self._toc_indefinite_article_fr(subject)
+                contract = "qu'" if re.match(r"^[aeiouyà-öø-ÿh]", indef) else "que "
+                sep = "" if contract.endswith("'") else ""
+                return self._normalize_spaces(f"Qu'est-ce {contract}{indef} {subject} ?")
+            if article == "the":
+                if re.match(r"^(l'|le |la |les )", subject, flags=re.IGNORECASE):
+                    return self._normalize_spaces(f"Qu'est-ce que {subject} ?")
+                defined = self._toc_defined_article_fr(subject)
+                if defined == "l'":
+                    return self._normalize_spaces(f"Qu'est-ce que {defined}{subject} ?")
+                return self._normalize_spaces(f"Qu'est-ce que {defined} {subject} ?")
+            if article == "" and subject and subject[0].islower():
+                defined = self._toc_defined_article_fr(subject)
+                if defined == "l'":
+                    return self._normalize_spaces(f"Qu'est-ce que {defined}{subject} ?")
+                return self._normalize_spaces(f"Qu'est-ce que {defined} {subject} ?")
+            return self._normalize_spaces(f"Qu'est-ce que {subject} ?")
+
+        m = re.fullmatch(r"how (?:does )?(.+?) work[s]?", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            return self._normalize_spaces(f"Fonctionnement de {subject}")
+
+        m = re.fullmatch(r"applications of (.+)", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            return self._normalize_spaces(f"Applications des {subject}")
+
+        m = re.fullmatch(r"novel features of (.+)", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            return self._normalize_spaces(f"Nouvelles caractéristiques {self._toc_article_fr(subject)}{subject}")
+
+        m = re.fullmatch(r"architecture of (.+)", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            return self._normalize_spaces(f"Architecture {self._toc_article_fr(subject)}{subject}")
+
+        m = re.fullmatch(r"high-level (.+?) architecture", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            return self._normalize_spaces(f"Architecture générale {self._toc_article_fr(subject)}{subject}")
+
+        m = re.fullmatch(r"(.+?) architecture", s, flags=re.IGNORECASE)
+        if m:
+            raw_subject = self._normalize_spaces(m.group(1))
+            if not self._toc_is_safe_pattern_subject(raw_subject):
+                return ""
+            subject = self._toc_translate_subject_fr(raw_subject)
+            if subject.upper() in {"CNN", "RNN", "MLP"}:
+                return f"Architecture des {subject.upper()}"
+            if subject.lower() == "network":
+                return "Architecture du réseau"
+            return self._normalize_spaces(f"Architecture {self._toc_article_fr(subject)}{subject}")
+
+        m = re.fullmatch(r"single-shot detector \(([^)]+)\)", s, flags=re.IGNORECASE)
+        if m:
+            return f"Détecteur à prise unique ({m.group(1).upper()})"
+
+        m = re.fullmatch(r"you only look once \(([^)]+)\)", s, flags=re.IGNORECASE)
+        if m:
+            return f"{m.group(1).upper()} (You Only Look Once)"
+
+        return ""
+
     def _translate_toc_short_label_fr(self, label, role=""):
         s = self._normalize_spaces(label)
         if not s:
@@ -1802,6 +2202,7 @@ class DocumentTranslator:
             "lenet architecture": "Architecture de LeNet",
             "alexnet architecture": "Architecture d'AlexNet",
             "vggnet architecture": "Architecture de VGGNet",
+            "multi-scale feature layers": "Couches de caractéristiques multi-échelles",
             "kaggle": "Kaggle",
             "fashion-mnist": "Fashion-MNIST",
             "google open images": "Google Open Images",
@@ -1813,6 +2214,13 @@ class DocumentTranslator:
             "googlenet": "GoogLeNet",
             "resnet": "ResNet",
             "cnn design patterns": "Modèles de conception des CNN",
+            "converting color images to grayscale to reduce computation complexity": "Conversion des images couleur en niveaux de gris pour réduire la complexité de calcul",
+            "what is a feature in computer vision?": "Qu'est-ce qu'une caractéristique en vision par ordinateur ?",
+            "deep learning and neural networks": "Apprentissage profond et réseaux de neurones",
+            "mini-batch gradient descent": "Descente de gradient par mini-lots",
+            "what is backpropagation?": "Qu'est-ce que la rétropropagation ?",
+            "backpropagation takeaways": "Points clés sur la rétropropagation",
+            "applications of visual embeddings": "Applications des embeddings visuels",
             "gradient descent with momentum": "Descente de gradient avec momentum",
             "dropout layers": "Couches dropout",
             "the covariate shift problem": "Le problème du décalage de covariance",
@@ -1822,22 +2230,9 @@ class DocumentTranslator:
         mapped = exact.get(s.lower())
         if mapped:
             return mapped
-        if role_lc == "part_title" and s.lower().startswith("part "):
-            rest = self._normalize_spaces(re.sub(r"^part\b", "", s, flags=re.IGNORECASE))
-            rest = self._normalize_spaces(re.sub(r"^\d+\b", "", rest))
-            rest = re.sub(r"\bimage classification\b", "classification d'images", rest, flags=re.IGNORECASE)
-            rest = re.sub(r"\band\b", "et", rest, flags=re.IGNORECASE)
-            rest = re.sub(r"\bdetection\b", "détection", rest, flags=re.IGNORECASE)
-            return self._normalize_spaces(f"Partie {rest}")
-        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9\-']+)\s+architecture", s, flags=re.IGNORECASE)
-        if m:
-            subject = m.group(1)
-            if subject.upper() in {"CNN", "RNN", "MLP"}:
-                return f"Architecture des {subject.upper()}"
-            if subject.lower() == "network":
-                return "Architecture du réseau"
-            article = "d'" if re.match(r"^[AEIOUYaeiouy]", subject) else "de "
-            return f"Architecture {article}{subject}"
+        pattern_translation = self._translate_toc_pattern_fr(s, role=role_lc)
+        if pattern_translation:
+            return pattern_translation
         return ""
 
     def _postprocess_toc_label_fr(self, source_label, translated, role=""):
@@ -1864,6 +2259,23 @@ class DocumentTranslator:
         if src_lc in exact_keep:
             return exact_keep[src_lc]
 
+        for entity in self._toc_extract_entities_fr(src):
+            out = re.sub(re.escape(entity), entity, out, flags=re.IGNORECASE)
+
+        generic_pairs = [
+            (r"\bfonctionnalit[ée]s?\b", "caractéristiques"),
+            (r"\bvision\s+de\s+l['’]ordinateur\b", "vision par ordinateur"),
+            (r"\bapprentissage\s+approfondi\b", "apprentissage profond"),
+            (r"\bgrayscale\b", "niveaux de gris"),
+            (r"\bmini-bateau\b", "mini-lots"),
+            (r"\bcaracteristiques?\b", "caractéristiques"),
+            (r"\bmulti-echelles\b", "multi-échelles"),
+            (r"\bembo[îi]tements?\s+visuels\b", "embeddings visuels"),
+            (r"\bdetecteur\b", "Détecteur"),
+        ]
+        for pattern, repl in generic_pairs:
+            out = re.sub(pattern, repl, out, flags=re.IGNORECASE)
+
         if "inception" in src_lc:
             out = re.sub(r"\baccueil\b", "Inception", out, flags=re.IGNORECASE)
             out = re.sub(r"\bde l['’]Inception\b", "d'Inception", out, flags=re.IGNORECASE)
@@ -1872,6 +2284,42 @@ class DocumentTranslator:
             out = re.sub(r"\bmodule\s+Inception\s*:\s*version\s+naive\b", "Module Inception : version naive", out, flags=re.IGNORECASE)
             out = re.sub(r"\bperformances?\s+d['’]Inception\b", "Performances d'Inception", out, flags=re.IGNORECASE)
             out = re.sub(r"\bnouvelles?\s+caract[ée]ristiques\s+de l['’]Inception\b", "Nouvelles caractéristiques d'Inception", out, flags=re.IGNORECASE)
+        if "novel features of alexnet" in src_lc:
+            out = re.sub(r"\bnouvelles?\s+(?:fonctionnalit[ée]s?|caract[ée]ristiques)\s+d['’]AlexNet\b", "Nouvelles caractéristiques d'AlexNet", out, flags=re.IGNORECASE)
+        if "novel features of vggnet" in src_lc:
+            out = re.sub(r"\bnouvelles?\s+(?:fonctionnalit[ée]s?|caract[ée]ristiques)\s+de\s+VGGNet\b", "Nouvelles caractéristiques de VGGNet", out, flags=re.IGNORECASE)
+        if "what is a feature in computer vision" in src_lc:
+            out = re.sub(r"\bfonctionnalit[ée]\s+dans\s+la\s+vision\s+de\s+l['’]ordinateur\b", "caractéristique en vision par ordinateur", out, flags=re.IGNORECASE)
+        if "converting color images to grayscale" in src_lc:
+            out = re.sub(r"\bgrayscale\b", "niveaux de gris", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bimages?\s+de\s+couleur\b", "images couleur", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bcomplexit[ée]\s+du\s+calcul\b", "complexité de calcul", out, flags=re.IGNORECASE)
+        if "deep learning and neural networks" in src_lc:
+            out = re.sub(r"\br[ée]seaux?\s+d['’]apprentissage\s+approfondi\s+et\s+de\s+neurones\b", "Apprentissage profond et réseaux de neurones", out, flags=re.IGNORECASE)
+        if "mini-batch gradient descent" in src_lc:
+            out = re.sub(r"\bdescente\s+de\s+la\s+pente\s+de\s+la\s+mini-bateau\b", "Descente de gradient par mini-lots", out, flags=re.IGNORECASE)
+        if "what is backpropagation" in src_lc:
+            out = re.sub(r"\bpropagande\s+de\s+dos\b", "rétropropagation", out, flags=re.IGNORECASE)
+        if "backpropagation takeaways" in src_lc:
+            out = re.sub(r"\bprises?\s+de\s+propagande\s+arri[èe]re\b", "Points clés sur la rétropropagation", out, flags=re.IGNORECASE)
+        if "single-shot detector" in src_lc:
+            out = re.sub(r"\bd[ée]tecteur?\s+a\s+prise\s+unique\b", "Détecteur à prise unique", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bdetecteur\b", "Détecteur", out, flags=re.IGNORECASE)
+        if "high-level ssd architecture" in src_lc:
+            out = re.sub(r"\bhigh-level\s+ssd\s+architecture\b", "Architecture générale du SSD", out, flags=re.IGNORECASE)
+        if "multi-scale feature layers" in src_lc:
+            out = re.sub(r"\bcouches?\s+de\s+caracteristiques?\s+multi-echelles\b", "Couches de caractéristiques multi-échelles", out, flags=re.IGNORECASE)
+        if "you only look once" in src_lc:
+            out = re.sub(r"\btu\s+ne\s+regardes\s+qu['’]une\s+fois\s+\(YOLO\)\b", "YOLO (You Only Look Once)", out, flags=re.IGNORECASE)
+        if "project: train an ssd network in a self-driving car application" in src_lc:
+            out = re.sub(r"\bprojet\s*:\s*former\s+un\s+r[ée]seau\s+ssd\s+dans\s+une\s+application\s+auto-conduite\b", "Projet : entraîner un réseau SSD pour une application de voiture autonome", out, flags=re.IGNORECASE)
+        if "applications of visual embeddings" in src_lc:
+            out = re.sub(r"\bapplications\s+des\s+embo[îi]tements\s+visuels\b", "Applications des embeddings visuels", out, flags=re.IGNORECASE)
+
+        out = re.sub(r"\bMise\s+en\s+·uvre\b", "Mise en œuvre", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bImpl[ée]mentation\s+de\s+DeepDream\s+à\s+Keras\b", "Implémentation de DeepDream à Keras", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bd['’]([A-Z][A-Za-z0-9\-]+)\s+\1\b", r"d'\1", out)
+        out = re.sub(r"\b([A-Z][A-Za-z0-9\-]+)\s+\1(?=\d)", r"\1 ", out)
 
         if "pretrained network" in src_lc:
             out = re.sub(
@@ -1998,9 +2446,51 @@ class DocumentTranslator:
             return False
         return bool(re.fullmatch(r"(?:\d+[.)]?|[•▪◦·\-\*])", t))
 
+    def _looks_like_contents_block(self, block):
+        if not isinstance(block, dict):
+            return False
+        if (block.get("role") or "body").lower() != "body":
+            return False
+        lines = block.get("lines", []) or []
+        if len(lines) < 6:
+            return False
+        content_lines = []
+        indented_lines = 0
+        short_lines = 0
+        punctuated_lines = 0
+        chapterish_lines = 0
+        for ln in lines:
+            ltxt = self._line_text_for_translation(ln)
+            if not ltxt or self._is_marker_only_line(ltxt):
+                continue
+            content_lines.append(ltxt)
+            words = re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", ltxt)
+            if len(words) <= 8:
+                short_lines += 1
+            if re.search(r"[.!?:;]\s*$", ltxt):
+                punctuated_lines += 1
+            if re.match(r"^(?:chapter|appendix|part|preface|acknowledg(?:e)?ments?)\b", ltxt, flags=re.IGNORECASE):
+                chapterish_lines += 1
+            try:
+                if float(ln.get("indent_px", 0.0) or 0.0) >= 60.0:
+                    indented_lines += 1
+            except Exception:
+                pass
+        if len(content_lines) < 6:
+            return False
+        if punctuated_lines >= max(2, int(len(content_lines) * 0.35)):
+            return False
+        if short_lines < max(4, int(len(content_lines) * 0.55)):
+            return False
+        if indented_lines < max(2, int(len(content_lines) * 0.25)):
+            return False
+        return chapterish_lines >= 1 or len(content_lines) >= 8
+
     def _should_translate_block_as_paragraph(self, block):
         role = (block.get("role") or "body").lower()
         if role != "body":
+            return False
+        if self._looks_like_contents_block(block):
             return False
         for line in block.get("lines", []) or []:
             if (line.get("translation_strategy") or "").strip().lower() in {"layout_constrained", "exact_preserve"}:
@@ -2029,6 +2519,8 @@ class DocumentTranslator:
     def _looks_like_editorial_narrative_block(self, block):
         role = (block.get("role") or "body").lower()
         if role != "body":
+            return False
+        if self._looks_like_contents_block(block):
             return False
         lines = block.get("lines", []) or []
         if len(lines) < 2:
@@ -2207,34 +2699,99 @@ class DocumentTranslator:
         if not words:
             return list(source_lines)
         counts = []
+        weights = []
         dynamic_idx = []
+
+        def _token_char_len(seq):
+            if not seq:
+                return 0
+            return sum(len(str(x)) for x in seq) + max(0, len(seq) - 1)
+
         for i, src in enumerate(source_lines):
             s = self._normalize_spaces(src)
             marker = (source_markers[i] if i < len(source_markers) else "").strip()
             is_marker_only = bool(re.fullmatch(r"(?:\d+[.)]?|[•▪◦·\-\*])", s))
             if is_marker_only:
                 counts.append(0)
+                weights.append(0.0)
                 continue
             wc = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", s))
             wc = max(1, wc)
             # Do not translate marker itself; reserve one token for non-marker text when marker exists.
             if marker and re.match(r"^\s*(?:[•▪◦·\-\*]|\d+[.)])\s+", s):
                 wc = max(1, wc - 1)
+                s = re.sub(r"^\s*(?:[•▪◦·\-\*]|\d+[.)])\s+", "", s).strip()
             counts.append(wc)
+            char_len = max(1, len(s))
+            weights.append(max(float(wc), char_len / 5.5))
             dynamic_idx.append(i)
         if not dynamic_idx:
             return list(source_lines)
-        total = max(1, sum(counts[i] for i in dynamic_idx))
+        total_weight = max(1.0, sum(weights[i] for i in dynamic_idx))
         target = [0] * len(source_lines)
         rem = len(words)
+        cursor = 0
         for pos, i in enumerate(dynamic_idx):
             if pos == len(dynamic_idx) - 1:
                 take = rem
             else:
-                take = max(1, int(round(len(words) * (counts[i] / total))))
-                take = min(take, rem - max(1, len(dynamic_idx) - pos - 1))
+                remaining_slots = len(dynamic_idx) - pos
+                remaining_words = words[cursor:]
+                remaining_chars = max(1, _token_char_len(remaining_words))
+                target_chars = remaining_chars * (weights[i] / max(1.0, total_weight))
+                min_take = 1
+                if rem - (remaining_slots - 1) >= 2 and weights[i] >= 3.5:
+                    min_take = 2
+                if rem - (remaining_slots - 1) * 2 >= 3 and weights[i] >= 5.5:
+                    min_take = 3
+                max_take = rem - max(1, remaining_slots - 1)
+                take = min(max_take, min_take)
+                current_chars = _token_char_len(words[cursor:cursor + take])
+                while take < max_take:
+                    next_chars = _token_char_len(words[cursor:cursor + take + 1])
+                    if current_chars < target_chars * 0.82:
+                        take += 1
+                        current_chars = next_chars
+                        continue
+                    diff_now = abs(current_chars - target_chars)
+                    diff_next = abs(next_chars - target_chars)
+                    if diff_next <= diff_now:
+                        take += 1
+                        current_chars = next_chars
+                        continue
+                    break
             target[i] = take
             rem -= take
+            cursor += take
+            total_weight = max(1.0, total_weight - weights[i])
+
+        # Smooth pathological one-word lines on editorial paragraphs.
+        target_by_pos = [target[i] for i in dynamic_idx]
+        line_weights = [weights[i] for i in dynamic_idx]
+        for _ in range(max(1, len(target_by_pos) * 2)):
+            changed = False
+            for pos in range(len(target_by_pos) - 1):
+                if (
+                    line_weights[pos] >= 3.5
+                    and target_by_pos[pos] <= 1
+                    and target_by_pos[pos + 1] >= 3
+                ):
+                    target_by_pos[pos] += 1
+                    target_by_pos[pos + 1] -= 1
+                    changed = True
+                elif (
+                    line_weights[pos + 1] >= 3.5
+                    and target_by_pos[pos] >= 4
+                    and target_by_pos[pos + 1] <= 1
+                ):
+                    target_by_pos[pos] -= 1
+                    target_by_pos[pos + 1] += 1
+                    changed = True
+            if not changed:
+                break
+        for pos, i in enumerate(dynamic_idx):
+            target[i] = max(0, target_by_pos[pos])
+
         out = []
         k = 0
         for i, src in enumerate(source_lines):
@@ -4124,6 +4681,108 @@ class DocumentTranslator:
     def _normalize_spaces(self, text):
         s = self._strip_invisible_chars(text or "")
         return re.sub(r"\s+", " ", s).strip()
+
+    def _span_style_signature(self, span):
+        if not isinstance(span, dict):
+            return ("", False, False, False, "")
+        style = span.get("style") if isinstance(span.get("style"), dict) else {}
+        flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
+        font_key = str(style.get("font_key_normalized") or style.get("font") or "").strip().lower()
+        font_key = re.sub(r"[^a-z0-9]+", "", font_key)
+        return (
+            font_key,
+            bool(flags.get("bold")),
+            bool(flags.get("italic")),
+            bool(flags.get("monospace")),
+            str(style.get("color") or "").strip().lower(),
+        )
+
+    def _partition_translated_phrase_to_spans(self, translated_text, spans):
+        text = self._normalize_spaces(translated_text)
+        visible_spans = [
+            sp for sp in (spans or [])
+            if isinstance(sp, dict)
+            and not sp.get("skip_render")
+            and self._normalize_spaces(sp.get("texte") or "")
+        ]
+        if not text or len(visible_spans) < 2:
+            return []
+        tokens = text.split()
+        if len(tokens) < len(visible_spans):
+            return []
+        weights = []
+        for sp in visible_spans:
+            source_text = self._normalize_spaces(sp.get("texte") or "")
+            word_count = max(1, len(source_text.split()))
+            char_count = max(1, len(re.sub(r"\s+", "", source_text)))
+            weights.append(max(float(word_count), char_count / 8.0))
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            return []
+        total_tokens = len(tokens)
+        boundaries = []
+        cumulative = 0.0
+        prev = 0
+        for idx, weight in enumerate(weights[:-1], start=1):
+            cumulative += weight
+            raw_boundary = int(round(total_tokens * cumulative / total_weight))
+            remaining_segments = len(weights) - idx
+            lower = prev + 1
+            upper = total_tokens - remaining_segments
+            boundary = max(lower, min(upper, raw_boundary))
+            boundaries.append(boundary)
+            prev = boundary
+        parts = []
+        start = 0
+        for boundary in boundaries + [total_tokens]:
+            part = " ".join(tokens[start:boundary]).strip()
+            if not part:
+                return []
+            parts.append(part)
+            start = boundary
+        return parts if len(parts) == len(visible_spans) else []
+
+    def _backfill_phrase_span_translations(self, phrase, translated_text=None):
+        if not isinstance(phrase, dict):
+            return
+        spans = phrase.get("spans", []) or []
+        if not spans:
+            return
+        visible_spans = [
+            sp for sp in spans
+            if isinstance(sp, dict)
+            and not sp.get("skip_render")
+            and self._normalize_spaces(sp.get("texte") or "")
+        ]
+        if not visible_spans:
+            return
+        for sp in visible_spans:
+            sp["texte_original"] = sp.get("texte", "")
+        if len(visible_spans) == 1:
+            if not self._normalize_spaces(visible_spans[0].get("translated_text") or ""):
+                visible_spans[0]["translated_text"] = self._normalize_spaces(
+                    translated_text or phrase.get("translated_text") or phrase.get("texte") or visible_spans[0].get("texte") or ""
+                )
+            return
+        if all(self._normalize_spaces(sp.get("translated_text") or "") for sp in visible_spans):
+            return
+        style_signatures = {self._span_style_signature(sp) for sp in visible_spans}
+        if len(style_signatures) < 2:
+            return
+        target_text = self._normalize_spaces(translated_text or phrase.get("translated_text") or phrase.get("texte") or "")
+        if not target_text:
+            return
+        source_joined = self._normalize_spaces(" ".join(self._normalize_spaces(sp.get("texte") or "") for sp in visible_spans))
+        if target_text == source_joined:
+            for sp in visible_spans:
+                if not self._normalize_spaces(sp.get("translated_text") or ""):
+                    sp["translated_text"] = self._normalize_spaces(sp.get("texte") or "")
+            return
+        parts = self._partition_translated_phrase_to_spans(target_text, visible_spans)
+        if not parts:
+            return
+        for sp, part in zip(visible_spans, parts):
+            sp["translated_text"] = part
 
     def _dedupe_sentence_runs(self, text):
         s = self._normalize_spaces(text)

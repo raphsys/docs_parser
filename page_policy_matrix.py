@@ -395,6 +395,22 @@ class PagePolicyMatrix:
             }
 
         if page_family in {"body_text_two_column_equations"} and role == "body":
+            if unit_type == "narrative_body" and self._word_count(txt) >= 12:
+                return {
+                    "unit_type": unit_type,
+                    "translatable": True,
+                    "translation_strategy": "layout_constrained",
+                    "coverage_required": "strict",
+                    "render_policy": "paragraph_flow",
+                }
+            if unit_type in {"reference_link", "citation", "formula", "formula_label"}:
+                return {
+                    "unit_type": unit_type,
+                    "translatable": unit_type not in {"reference_link", "formula"},
+                    "translation_strategy": "layout_constrained" if unit_type in {"citation", "formula_label"} else "exact_preserve",
+                    "coverage_required": "strict",
+                    "render_policy": "anchored_text" if unit_type in {"citation", "formula_label"} else "fixed_preserve",
+                }
             return {
                 "unit_type": unit_type,
                 "translatable": True,

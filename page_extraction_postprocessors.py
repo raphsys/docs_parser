@@ -14,6 +14,20 @@ def _bbox_from_rect(r):
     return [int(round(r.x0)), int(round(r.y0)), int(round(r.x1)), int(round(r.y1))]
 
 
+def _intersection_area(r1, r2):
+    x0 = max(float(r1.x0), float(r2.x0))
+    y0 = max(float(r1.y0), float(r2.y0))
+    x1 = min(float(r1.x1), float(r2.x1))
+    y1 = min(float(r1.y1), float(r2.y1))
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _intersection_ratio(r1, r2):
+    inter = _intersection_area(r1, r2)
+    den = max(1.0, min(float(r1.get_area()), float(r2.get_area())))
+    return inter / den
+
+
 def _line_sort_key(line):
     b = line.get("bbox", [0, 0, 0, 0])
     if not isinstance(b, (list, tuple)) or len(b) != 4:
@@ -422,6 +436,147 @@ def _set_structure_hints(block, **kwargs):
             hints[key] = value
     block["structure_hints"] = hints
     return block
+
+
+def _set_structure_hints_if_missing(block, **kwargs):
+    hints = dict(block.get("structure_hints") or {})
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        if key == "group_ids":
+            group_ids = dict(hints.get("group_ids") or {})
+            for gid_key, gid_value in (value or {}).items():
+                if gid_value is None:
+                    continue
+                if gid_key not in group_ids or not group_ids.get(gid_key):
+                    group_ids[gid_key] = gid_value
+            if group_ids:
+                hints["group_ids"] = group_ids
+        elif key not in hints or hints.get(key) in {None, ""}:
+            hints[key] = value
+    block["structure_hints"] = hints
+    return block
+
+
+def _layout_ai_hint_profile(label):
+    lbl = str(label or "").strip().lower()
+    if lbl in {"doc_title", "title", "paragraph_title"}:
+        return ("title_band", "section_title", "anchored")
+    if lbl == "header":
+        return ("header_band", "running_header", "anchored")
+    if lbl == "footer":
+        return ("footer_band", "running_footer", "anchored")
+    if lbl in {"caption", "figure_title", "figure_caption"}:
+        return ("caption_band", "figure_caption", "anchored")
+    if lbl == "table":
+        return ("table_band", None, "locked_in_table")
+    if lbl == "formula":
+        return (None, "formula_block", "anchored")
+    if lbl in {"text", "reference", "abstract", "content", "list"}:
+        return ("text_band", "body_paragraph", "flow_in_band")
+    return (None, None, None)
+
+
+def _annotate_layout_ai_native_structure(page_data):
+    layout_ai = page_data.get("layout_ai_structure") or {}
+    blocks = list(page_data.get("blocks") or [])
+    if not layout_ai or not blocks:
+        return None
+
+    parsing_blocks = list(layout_ai.get("parsing_blocks") or [])
+    table_regions = list(layout_ai.get("table_regions") or [])
+    formula_regions = list(layout_ai.get("formula_regions") or [])
+    chart_regions = list(layout_ai.get("chart_regions") or [])
+    ai_regions = list(layout_ai.get("regions") or [])
+
+    def link_blocks_to_region(region_bbox, min_ratio=0.45):
+        rect = _rect_from_bbox(region_bbox or [0, 0, 0, 0])
+        if rect.get_area() <= 0:
+            return []
+        linked = []
+        for block in blocks:
+            block_rect = _rect_from_bbox(block.get("bbox", [0, 0, 0, 0]))
+            if block_rect.get_area() <= 0:
+                continue
+            if _intersection_ratio(rect, block_rect) >= min_ratio or _intersection_ratio(block_rect, rect) >= min_ratio:
+                linked.append(block)
+        return linked
+
+    parsing_groups = []
+    for idx, item in enumerate(parsing_blocks):
+        bbox = item.get("bbox") or []
+        linked_blocks = link_blocks_to_region(bbox, min_ratio=0.45)
+        label = str(item.get("label") or "").strip().lower()
+        band_role, structural_role, behavior = _layout_ai_hint_profile(label)
+        group_id = f"layout_ai_group_{idx}"
+        linked_ids = []
+        for block in linked_blocks:
+            _set_structure_hints_if_missing(
+                block,
+                band_role_hint=band_role,
+                structural_role_hint=structural_role,
+                layout_behavior_hint=behavior,
+                group_ids={"layout_ai_group_id": group_id},
+            )
+            linked_ids.append(str(block.get("id") or ""))
+        parsing_groups.append(
+            {
+                "id": group_id,
+                "label": label,
+                "bbox": list(bbox),
+                "text": str(item.get("text") or "").strip(),
+                "text_line_height": float(item.get("text_line_height") or 0.0),
+                "text_line_width": float(item.get("text_line_width") or 0.0),
+                "block_height": float(item.get("block_height") or 0.0),
+                "block_width": float(item.get("block_width") or 0.0),
+                "block_ids": linked_ids,
+            }
+        )
+        for block in linked_blocks:
+            _set_structure_hints_if_missing(
+                block,
+                layout_ai_label_hint=label,
+                layout_ai_text_line_height_hint=float(item.get("text_line_height") or 0.0),
+                layout_ai_text_line_width_hint=float(item.get("text_line_width") or 0.0),
+                layout_ai_block_height_hint=float(item.get("block_height") or 0.0),
+                layout_ai_block_width_hint=float(item.get("block_width") or 0.0),
+            )
+
+    for idx, region in enumerate(table_regions):
+        for block in link_blocks_to_region(region.get("bbox"), min_ratio=0.42):
+            _set_structure_hints_if_missing(
+                block,
+                band_role_hint="table_band",
+                layout_behavior_hint="locked_in_table",
+                group_ids={"layout_ai_table_group_id": f"layout_ai_table_{idx}"},
+            )
+    for idx, region in enumerate(formula_regions):
+        for block in link_blocks_to_region(region.get("bbox"), min_ratio=0.40):
+            _set_structure_hints_if_missing(
+                block,
+                structural_role_hint="formula_block",
+                layout_behavior_hint="anchored",
+                group_ids={"layout_ai_formula_group_id": f"layout_ai_formula_{idx}"},
+            )
+    for idx, region in enumerate(chart_regions):
+        for block in link_blocks_to_region(region.get("bbox"), min_ratio=0.40):
+            _set_structure_hints_if_missing(
+                block,
+                band_role_hint="annotation_band",
+                layout_behavior_hint="anchored",
+                attachment_target_hint="chart_main",
+                group_ids={"layout_ai_chart_group_id": f"layout_ai_chart_{idx}"},
+            )
+
+    if not parsing_groups and not table_regions and not formula_regions and not chart_regions and not ai_regions:
+        return None
+    return {
+        "parsing_groups": parsing_groups,
+        "table_regions": [{"id": f"layout_ai_table_{idx}", "bbox": list((region or {}).get("bbox") or [])} for idx, region in enumerate(table_regions)],
+        "formula_regions": [{"id": f"layout_ai_formula_{idx}", "bbox": list((region or {}).get("bbox") or [])} for idx, region in enumerate(formula_regions)],
+        "chart_regions": [{"id": f"layout_ai_chart_{idx}", "bbox": list((region or {}).get("bbox") or [])} for idx, region in enumerate(chart_regions)],
+        "region_count": len(ai_regions),
+    }
 
 
 def _cluster_positions(values, tolerance):
@@ -1064,6 +1219,7 @@ def apply_page_extraction_postprocessors(page_data):
         "table": None,
         "annotations": None,
         "chart": None,
+        "layout_ai": None,
     }
     if layout_type == "table_dominant" or page_family in {"table_page", "table_diagram_example"} or document_type in {"form", "invoice", "receipt"}:
         native_structure["table"] = _annotate_table_native_structure(work)
@@ -1071,6 +1227,7 @@ def apply_page_extraction_postprocessors(page_data):
         native_structure["chart"] = _annotate_chart_native_structure(work)
     if layout_type == "annotated_page" or page_family in {"illustrated_label_page", "chart_label_page", "body_with_diagram"}:
         native_structure["annotations"] = _annotate_annotation_native_structure(work, excluded_block_ids=chart_block_ids)
+    native_structure["layout_ai"] = _annotate_layout_ai_native_structure(work)
     work["native_structure"] = native_structure
 
     if changed:

@@ -43,7 +43,7 @@ class LayoutDescriptorBuilder:
         regions = self._build_regions(page_data, width, height)
         region_map = {r["id"]: r for r in regions}
         elements, groups = self._build_elements(page_data, regions)
-        relations = self._build_relations(elements, groups, regions)
+        relations = self._build_relations(page_data, elements, groups, regions)
         constraints = self._build_constraints(page_data, elements, groups, region_map)
         self._enrich_elements_structure(page_data, elements, groups, regions, relations, constraints)
         reading_order = self._build_reading_order(elements)
@@ -51,7 +51,7 @@ class LayoutDescriptorBuilder:
         ai_structure = self._build_ai_structure(page_data, regions, elements, relations)
         native_structure = self._build_native_structure(page_data)
         page_organization = self._build_page_organization(page_data, regions, elements, groups, relations, ai_structure, native_structure)
-        reconstruction_plan = self._build_reconstruction_plan(page_data, regions, elements, groups, constraints, page_organization)
+        reconstruction_plan = self._build_reconstruction_plan(page_data, regions, elements, groups, relations, constraints, page_organization)
         visual_text_model = self._build_visual_text_model(page_data, elements, page_organization)
 
         return {
@@ -817,7 +817,7 @@ class LayoutDescriptorBuilder:
 
         return elements, groups
 
-    def _build_relations(self, elements, groups, regions):
+    def _build_relations(self, page_data, elements, groups, regions):
         relations = []
         elements_by_id = {el["id"]: el for el in elements}
         region_map = {r["id"]: r for r in regions}
@@ -983,7 +983,246 @@ class LayoutDescriptorBuilder:
                 if idx > 0:
                     relations.append(self._rel("continues_as", group["element_ids"][idx - 1], element_id, weight=0.9))
 
+        relation_context = {}
+        for element in top_level:
+            page_region = region_map.get(element.get("page_region_id")) or {}
+            ai_region = region_map.get(element.get("ai_region_id")) or {}
+            relation_context[element["id"]] = {
+                "band_role": self._infer_band_role(page_region, ai_region, element),
+                "region_type": str(page_region.get("type") or "").strip().lower(),
+                "ai_region_type": str(ai_region.get("type") or "").strip().lower(),
+                "style": element.get("style") or {},
+            }
+
+        textish_types = {"text_block", "title", "section_header", "header", "footer", "caption"}
+        textish_top = [el for el in top_level if el.get("type") in textish_types]
+        by_band = {}
+        for element in textish_top:
+            ctx = relation_context.get(element["id"]) or {}
+            band_role = str(ctx.get("band_role") or "").strip().lower()
+            if band_role in {"header_band", "footer_band", "content_band"}:
+                continue
+            bucket_key = (
+                band_role or "unknown_band",
+                str(element.get("column_index")),
+                str(element.get("page_region_id") or ""),
+                str(element.get("ai_region_id") or ""),
+            )
+            by_band.setdefault(bucket_key, []).append(element)
+        for idx, (_, members) in enumerate(sorted(by_band.items(), key=lambda item: str(item[0]))):
+            members.sort(key=lambda el: (el["bbox"][1], el["bbox"][0], el["id"]))
+            if len(members) < 2:
+                continue
+            self._append_group_relations(
+                relations,
+                "same_band",
+                members,
+                group_id=f"rel_same_band_{idx}",
+                weight=0.9,
+            )
+
+        by_same_row = {}
+        for element in textish_top:
+            ctx = relation_context.get(element["id"]) or {}
+            band_role = str(ctx.get("band_role") or "").strip().lower()
+            if band_role in {"content_band", "header_band", "footer_band"}:
+                continue
+            bbox = element.get("bbox") or [0, 0, 0, 0]
+            row_key = (
+                str(element.get("column_index")),
+                band_role or "unknown_band",
+                int(round(((float(bbox[1]) + float(bbox[3])) * 0.5) / 18.0)),
+            )
+            by_same_row.setdefault(row_key, []).append(element)
+        same_row_group_idx = 0
+        for members in by_same_row.values():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda el: (el["bbox"][0], el["bbox"][1], el["id"]))
+            filtered = []
+            for element in members:
+                bbox = element.get("bbox") or [0, 0, 0, 0]
+                if not filtered:
+                    filtered.append(element)
+                    continue
+                prev = filtered[-1]
+                prev_bbox = prev.get("bbox") or [0, 0, 0, 0]
+                v_ov = self._intersection_area(
+                    [0.0, bbox[1], 1.0, bbox[3]],
+                    [0.0, prev_bbox[1], 1.0, prev_bbox[3]],
+                ) / max(1.0, min(float(bbox[3]) - float(bbox[1]), float(prev_bbox[3]) - float(prev_bbox[1])))
+                if v_ov >= 0.45:
+                    filtered.append(element)
+            if len(filtered) < 2:
+                continue
+            self._append_group_relations(
+                relations,
+                "same_row",
+                filtered,
+                group_id=f"rel_same_row_{same_row_group_idx}",
+                weight=0.88,
+            )
+            same_row_group_idx += 1
+
+        body_top = [
+            el for el in top_level
+            if el.get("type") == "text_block" and str(el.get("role") or "").strip().lower() in {"body", "paragraph", "list_item"}
+        ]
+        body_top.sort(key=lambda el: (el.get("column_index", 0), el["bbox"][1], el["bbox"][0], el["id"]))
+        paragraph_chain_idx = 0
+        for idx in range(len(body_top) - 1):
+            cur = body_top[idx]
+            nxt = body_top[idx + 1]
+            if cur.get("column_index") != nxt.get("column_index"):
+                continue
+            cur_ctx = relation_context.get(cur["id"]) or {}
+            nxt_ctx = relation_context.get(nxt["id"]) or {}
+            if cur_ctx.get("band_role") != nxt_ctx.get("band_role"):
+                continue
+            cur_bbox = cur.get("bbox") or [0, 0, 0, 0]
+            nxt_bbox = nxt.get("bbox") or [0, 0, 0, 0]
+            if float(nxt_bbox[1]) < float(cur_bbox[1]):
+                continue
+            if abs(float(cur_bbox[0]) - float(nxt_bbox[0])) > 28.0:
+                continue
+            v_gap = max(0.0, float(nxt_bbox[1]) - float(cur_bbox[3]))
+            if v_gap > max(32.0, min(float(cur_bbox[3]) - float(cur_bbox[1]), float(nxt_bbox[3]) - float(nxt_bbox[1])) * 1.2):
+                continue
+            cur_text = str(((cur.get("text") or {}).get("source_text") or "")).strip()
+            nxt_text = str(((nxt.get("text") or {}).get("source_text") or "")).strip()
+            if len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", cur_text)) < 6:
+                continue
+            if len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", nxt_text)) < 4:
+                continue
+            if not self._styles_roughly_compatible(cur.get("style") or {}, nxt.get("style") or {}):
+                continue
+            group_id = f"rel_paragraph_chain_{paragraph_chain_idx}"
+            relations.append(self._rel("continues_paragraph", cur["id"], nxt["id"], weight=0.92, metadata={"group_id": group_id, "direction": "forward"}))
+            relations.append(self._rel("continues_paragraph", nxt["id"], cur["id"], weight=0.92, metadata={"group_id": group_id, "direction": "backward"}))
+            paragraph_chain_idx += 1
+
+        heading_roles = {"title", "section_heading"}
+        heading_top = [el for el in top_level if str(el.get("role") or "").strip().lower() in heading_roles]
+        heading_top.sort(key=lambda el: (el.get("column_index", 0), el["bbox"][1], el["bbox"][0], el["id"]))
+        section_sibling_idx = 0
+        for idx in range(len(heading_top) - 1):
+            cur = heading_top[idx]
+            nxt = heading_top[idx + 1]
+            if cur.get("column_index") != nxt.get("column_index"):
+                continue
+            cur_bbox = cur.get("bbox") or [0, 0, 0, 0]
+            nxt_bbox = nxt.get("bbox") or [0, 0, 0, 0]
+            if max(0.0, float(nxt_bbox[1]) - float(cur_bbox[3])) > 180.0:
+                continue
+            self._append_group_relations(
+                relations,
+                "section_sibling",
+                [cur, nxt],
+                group_id=f"rel_section_sibling_{section_sibling_idx}",
+                weight=0.86,
+            )
+            section_sibling_idx += 1
+
+        if str((page_data or {}).get("page_role") or "").strip().lower() == "toc":
+            toc_top = [el for el in top_level if str(el.get("role") or "").strip().lower() in {"body", "title", "section_heading"}]
+            toc_groups = {}
+            for element in toc_top:
+                bbox = element.get("bbox") or [0, 0, 0, 0]
+                row_key = int(round(((float(bbox[1]) + float(bbox[3])) * 0.5) / 18.0))
+                toc_groups.setdefault(row_key, []).append(element)
+            toc_idx = 0
+            for members in toc_groups.values():
+                if len(members) < 2:
+                    continue
+                members.sort(key=lambda el: (el["bbox"][0], el["id"]))
+                self._append_group_relations(
+                    relations,
+                    "inside_toc_entry",
+                    members,
+                    group_id=f"rel_toc_entry_{toc_idx}",
+                    weight=0.9,
+                )
+                toc_idx += 1
+
         return relations
+
+    def _append_group_relations(self, relations, rel_type, members, group_id, weight=0.9):
+        ordered = [member for member in members if isinstance(member, dict) and member.get("id")]
+        if len(ordered) < 2:
+            return
+        metadata = {"group_id": str(group_id)}
+        for idx in range(len(ordered) - 1):
+            a = ordered[idx]
+            b = ordered[idx + 1]
+            pair_meta = dict(metadata)
+            pair_meta["member_index"] = idx
+            relations.append(self._rel(rel_type, a["id"], b["id"], weight=weight, metadata=pair_meta))
+            relations.append(self._rel(rel_type, b["id"], a["id"], weight=weight, metadata=pair_meta))
+
+    def _styles_roughly_compatible(self, style_a, style_b):
+        if not isinstance(style_a, dict) or not isinstance(style_b, dict):
+            return False
+        size_a = float(style_a.get("font_size_px", style_a.get("size", 0.0)) or 0.0)
+        size_b = float(style_b.get("font_size_px", style_b.get("size", 0.0)) or 0.0)
+        if size_a > 0.0 and size_b > 0.0 and abs(size_a - size_b) > 2.0:
+            return False
+        weight_a = int(style_a.get("font_weight", 400) or 400)
+        weight_b = int(style_b.get("font_weight", 400) or 400)
+        if abs(weight_a - weight_b) > 350:
+            return False
+        return True
+
+    def _looks_like_abbreviation_page(self, page_data):
+        if not isinstance(page_data, dict):
+            return False
+        heading_texts = []
+        for block in page_data.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            role = str(block.get("role") or "").strip().lower()
+            if role not in {"title", "section_heading", "header"}:
+                continue
+            text = self._clean_text(block.get("translated_text") or block.get("text") or "")
+            if text:
+                heading_texts.append(text.lower())
+        if any(re.search(r"\b(abbreviations?|acronyms?|nomenclature|glossary)\b", text) for text in heading_texts):
+            return True
+        page_role = str(page_data.get("page_role") or "").strip().lower()
+        if page_role in {"glossary", "abbreviations"}:
+            return True
+        return False
+
+    def _looks_like_abbreviation_key(self, text):
+        s = self._clean_text(text)
+        if not s:
+            return False
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-/]*", s)
+        if not tokens or len(tokens) > 4:
+            return False
+        lexical = re.findall(r"[A-Za-z][A-Za-z0-9.\-/]*", s)
+        if not lexical:
+            return False
+        uppercase_like = 0
+        for token in lexical:
+            compact = re.sub(r"[^A-Za-z0-9]", "", token)
+            if not compact:
+                continue
+            letters = re.findall(r"[A-Za-z]", compact)
+            if not letters:
+                continue
+            upper_ratio = sum(1 for ch in letters if ch.isupper()) / max(1, len(letters))
+            if upper_ratio >= 0.7 and len(compact) <= 12:
+                uppercase_like += 1
+        if uppercase_like >= max(1, len(lexical)):
+            return True
+        if len(tokens) == 1 and len(tokens[0]) <= 12 and re.fullmatch(r"[A-Za-z0-9.\-/]{2,12}", tokens[0]):
+            token = tokens[0]
+            letters = re.findall(r"[A-Za-z]", token)
+            if letters:
+                upper_ratio = sum(1 for ch in letters if ch.isupper()) / max(1, len(letters))
+                if upper_ratio >= 0.8 or re.search(r"[\d./-]", token):
+                    return True
+        return False
 
     def _build_constraints(self, page_data, elements, groups, region_map):
         constraints = []
@@ -1171,8 +1410,8 @@ class LayoutDescriptorBuilder:
             attachment_target_id = self._infer_attachment_target_id(element, rels)
             group_ids = self._infer_group_ids(element, page_region, ai_region, rels)
             group_render_mode = self._infer_group_render_mode(element, page_region, ai_region, group_ids)
-            typographic_class = self._infer_typographic_class(element, page_region, ai_region)
-            visual_text_type = self._infer_visual_text_type(element, page_region, ai_region)
+            typographic_class = self._infer_typographic_class(element, page_region, ai_region, structural_role_override=structural_role)
+            visual_text_type = self._infer_visual_text_type(element, page_region, ai_region, structural_role_override=structural_role)
             text_embedding_mode = self._infer_text_embedding_mode(element, page_region, ai_region, attachment_target_id, group_render_mode)
             background_kind = self._infer_background_kind(page_region, ai_region, text_embedding_mode)
             background_replacement_strategy = self._infer_background_replacement_strategy(
@@ -1245,6 +1484,7 @@ class LayoutDescriptorBuilder:
             "table": native.get("table"),
             "annotations": native.get("annotations"),
             "chart": native.get("chart"),
+            "layout_ai": native.get("layout_ai"),
         }
 
     def _build_page_organization(self, page_data, regions, elements, groups, relations, ai_structure, native_structure):
@@ -1312,6 +1552,7 @@ class LayoutDescriptorBuilder:
             "table_row_groups": list((native_structure.get("table") or {}).get("row_groups") or []),
             "table_header_row_group_ids": list((native_structure.get("table") or {}).get("header_row_group_ids") or []),
             "table_stub_column_group_id": (native_structure.get("table") or {}).get("stub_column_group_id"),
+            "layout_ai_groups": list((native_structure.get("layout_ai") or {}).get("parsing_groups") or []),
             "chart_groups": {
                 "axis_groups": list((native_structure.get("chart") or {}).get("axis_groups") or []),
                 "tick_group": (native_structure.get("chart") or {}).get("y_tick_group"),
@@ -1331,7 +1572,7 @@ class LayoutDescriptorBuilder:
             ],
         }
 
-    def _build_reconstruction_plan(self, page_data, regions, elements, groups, constraints, page_organization):
+    def _build_reconstruction_plan(self, page_data, regions, elements, groups, relations, constraints, page_organization):
         keep_out_zones = []
         for region in regions:
             r_type = str(region.get("type") or "").strip().lower()
@@ -1348,6 +1589,7 @@ class LayoutDescriptorBuilder:
                 }
             )
         render_sequence = self._render_sequence_for_page(page_data)
+        relation_groups = self._build_relation_group_summary(relations, elements)
         return {
             "render_sequence": render_sequence,
             "primary_flow_regions": list(page_organization.get("primary_flow_region_ids") or []),
@@ -1366,7 +1608,64 @@ class LayoutDescriptorBuilder:
                     1 for c in constraints if c.get("type") == "table_cell_locked"
                 ),
             },
+            "relation_groups": relation_groups,
         }
+
+    def _build_relation_group_summary(self, relations, elements):
+        supported = {"same_band", "same_row", "continues_paragraph", "inside_toc_entry", "section_sibling"}
+        element_map = {
+            str(element.get("id")): element
+            for element in (elements or [])
+            if isinstance(element, dict) and element.get("id")
+        }
+        buckets = {}
+        for rel in relations:
+            if not isinstance(rel, dict):
+                continue
+            rel_type = str(rel.get("type") or "").strip().lower()
+            if rel_type not in supported:
+                continue
+            group_id = str(((rel.get("metadata") or {}).get("group_id")) or "").strip()
+            if not group_id:
+                continue
+            bucket = buckets.setdefault(rel_type, {})
+            members = bucket.setdefault(group_id, set())
+            if rel.get("source_id"):
+                members.add(str(rel.get("source_id")))
+            if rel.get("target_id"):
+                members.add(str(rel.get("target_id")))
+        summary = {}
+        for rel_type, group_map in sorted(buckets.items(), key=lambda item: item[0]):
+            groups_out = []
+            for group_id, member_ids in sorted(group_map.items(), key=lambda item: item[0]):
+                members = [element_map.get(member_id) for member_id in sorted(member_ids)]
+                members = [member for member in members if isinstance(member, dict)]
+                bboxes = [member.get("bbox") for member in members if isinstance(member.get("bbox"), (list, tuple)) and len(member.get("bbox")) == 4]
+                group_bbox = None
+                if bboxes:
+                    group_bbox = [
+                        min(float(bbox[0]) for bbox in bboxes),
+                        min(float(bbox[1]) for bbox in bboxes),
+                        max(float(bbox[2]) for bbox in bboxes),
+                        max(float(bbox[3]) for bbox in bboxes),
+                    ]
+                groups_out.append(
+                    {
+                        "id": group_id,
+                        "member_ids": sorted(member_ids),
+                        "bbox": group_bbox,
+                        "column_indices": sorted(
+                            {
+                                int(member.get("column_index"))
+                                for member in members
+                                if isinstance(member.get("column_index"), int)
+                            }
+                        ),
+                        "member_count": len(members),
+                    }
+                )
+            summary[rel_type] = groups_out
+        return summary
 
     def _build_visual_text_model(self, page_data, elements, page_organization):
         objects = []
@@ -1762,6 +2061,11 @@ class LayoutDescriptorBuilder:
         if role in {"equation_inline", "equation_block"} or unit_type in {"formula", "formula_label"}:
             return "formula_block"
         if role in {"body", "paragraph", "list_item"}:
+            if self._looks_like_abbreviation_page(page_data) and any(rel.get("type") == "same_row" for rel in rels):
+                source_text = str(((element.get("text") or {}).get("source_text") or "")).strip()
+                if self._looks_like_abbreviation_key(source_text):
+                    return "abbreviation_key"
+                return "abbreviation_value"
             if any(rel.get("type") == "heads_content" for rel in rels):
                 return "opening_paragraph"
             if element.get("paragraph_id"):
@@ -1823,6 +2127,11 @@ class LayoutDescriptorBuilder:
             "table_row_group_id": None,
             "table_column_group_id": None,
             "cell_id": None,
+            "same_band_group_id": None,
+            "same_row_group_id": None,
+            "paragraph_chain_group_id": None,
+            "toc_entry_group_id": None,
+            "section_sibling_group_id": None,
         }
         hinted_group_ids = hints.get("group_ids") or {}
         for key in group_ids:
@@ -1847,6 +2156,21 @@ class LayoutDescriptorBuilder:
             target = next((rel.get("target_id") for rel in rels if rel.get("type") == "anchored_to"), None)
             if target and not group_ids["annotation_group_id"]:
                 group_ids["annotation_group_id"] = f"annotation_group_{target}"
+        for rel in rels:
+            rel_type = str(rel.get("type") or "").strip().lower()
+            group_id = str(((rel.get("metadata") or {}).get("group_id")) or "").strip() or None
+            if not group_id:
+                continue
+            if rel_type == "same_band" and not group_ids["same_band_group_id"]:
+                group_ids["same_band_group_id"] = group_id
+            elif rel_type == "same_row" and not group_ids["same_row_group_id"]:
+                group_ids["same_row_group_id"] = group_id
+            elif rel_type == "continues_paragraph" and not group_ids["paragraph_chain_group_id"]:
+                group_ids["paragraph_chain_group_id"] = group_id
+            elif rel_type == "inside_toc_entry" and not group_ids["toc_entry_group_id"]:
+                group_ids["toc_entry_group_id"] = group_id
+            elif rel_type == "section_sibling" and not group_ids["section_sibling_group_id"]:
+                group_ids["section_sibling_group_id"] = group_id
         if ai_type == "chart":
             group_ids["legend_group_id"] = group_ids["legend_group_id"] or "chart_group_0"
         return group_ids
@@ -1877,8 +2201,8 @@ class LayoutDescriptorBuilder:
             return "table_group"
         return "flow_group"
 
-    def _infer_typographic_class(self, element, page_region, ai_region):
-        structural_role = str((element or {}).get("structural_role") or (element or {}).get("role") or "").strip().lower()
+    def _infer_typographic_class(self, element, page_region, ai_region, structural_role_override=None):
+        structural_role = str(structural_role_override or (element or {}).get("structural_role") or (element or {}).get("role") or "").strip().lower()
         role = str((element or {}).get("role") or "").strip().lower()
         region_type = str((page_region or {}).get("type") or "").strip().lower()
         ai_type = str((ai_region or {}).get("type") or "").strip().lower()
@@ -1886,6 +2210,10 @@ class LayoutDescriptorBuilder:
             return "running_header"
         if structural_role in {"section_title"} or role in {"section_heading"}:
             return "section_heading"
+        if structural_role in {"abbreviation_key"}:
+            return "abbreviation_key"
+        if structural_role in {"abbreviation_value"}:
+            return "abbreviation_value"
         if structural_role in {"opening_paragraph", "body_paragraph", "continuation_paragraph"} or role in {"body", "paragraph", "list_item"}:
             return "editorial_body"
         if structural_role in {"figure_caption"} or role == "figure_caption":
@@ -1908,8 +2236,8 @@ class LayoutDescriptorBuilder:
             return "table_value_cell"
         return "content"
 
-    def _infer_visual_text_type(self, element, page_region, ai_region):
-        structural_role = str((element or {}).get("structural_role") or (element or {}).get("role") or "").strip().lower()
+    def _infer_visual_text_type(self, element, page_region, ai_region, structural_role_override=None):
+        structural_role = str(structural_role_override or (element or {}).get("structural_role") or (element or {}).get("role") or "").strip().lower()
         role = str((element or {}).get("role") or "").strip().lower()
         region_type = str((page_region or {}).get("type") or "").strip().lower()
         ai_type = str((ai_region or {}).get("type") or "").strip().lower()

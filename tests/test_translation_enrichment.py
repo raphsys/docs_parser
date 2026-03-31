@@ -144,6 +144,153 @@ class TranslationEnrichmentTests(unittest.TestCase):
             "Projet 2: réglage fin",
         )
 
+    def test_toc_translation_repairs_remaining_page_7_terms(self):
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("Converting color images to grayscale to reduce computation complexity", role="subentry"),
+            "Conversion des images couleur en niveaux de gris pour réduire la complexité de calcul",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("What is a feature in computer vision?", role="subentry"),
+            "Qu'est-ce qu'une caractéristique en vision par ordinateur ?",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("Mini-batch gradient descent", role="subentry_marker"),
+            "Descente de gradient par mini-lots",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("What is backpropagation?", role="section_heading"),
+            "Qu'est-ce que la rétropropagation ?",
+        )
+
+    def test_toc_translation_repairs_remaining_page_11_terms(self):
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("High-level SSD architecture", role="section_heading"),
+            "Architecture générale du SSD",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("7.4 You only look once (YOLO)", role="section_heading"),
+            "7.4 YOLO (You Only Look Once)",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("10.1 Applications of visual embeddings", role="section_heading"),
+            "10.1 Applications des embeddings visuels",
+        )
+
+    def test_toc_translation_generalizes_pattern_based_model_labels(self):
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("Novel features of MobileNet", role="section_heading"),
+            "Nouvelles caractéristiques de MobileNet",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("Architecture of YOLOv4", role="section_heading"),
+            "Architecture de YOLOv4",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("How YOLOv4 works", role="section_heading"),
+            "Fonctionnement de YOLOv4",
+        )
+
+    def test_toc_translation_generalizes_safe_technical_concepts(self):
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("What is a perceptron?", role="subentry"),
+            "Qu'est-ce qu'un perceptron ?",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("What is the error function?", role="subentry"),
+            "Qu'est-ce que la fonction d'erreur ?",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("What is optimization?", role="subentry"),
+            "Qu'est-ce que l'optimisation ?",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("Multilayer perceptron architecture", role="subentry"),
+            "Architecture du perceptron multicouche",
+        )
+        self.assertEqual(
+            self.translator._translate_toc_label_fr("How the DeepDream algorithm works", role="section_heading"),
+            "Fonctionnement de l'algorithme DeepDream",
+        )
+
+    def test_backfills_translated_text_on_mixed_style_spans(self):
+        phrase = {
+            "texte": "PRACTICAL SQL. Copyright © 2018 by Anthony DeBarros.",
+            "translated_text": "SQL PRATIQUE. Copyright © 2018 par Anthony DeBarros.",
+            "spans": [
+                {
+                    "texte": "PRACTICAL SQL.",
+                    "style": {"font": "JansonTextLTStd-Bold", "flags": {"bold": True}, "color": "#000000"},
+                },
+                {
+                    "texte": "Copyright © 2018 by Anthony DeBarros.",
+                    "style": {"font": "JansonTextLTStd-Roman", "flags": {"bold": False}, "color": "#000000"},
+                },
+            ],
+        }
+
+        self.translator._backfill_phrase_span_translations(phrase)
+
+        self.assertEqual(phrase["spans"][0]["translated_text"], "SQL PRATIQUE.")
+        self.assertEqual(
+            phrase["spans"][1]["translated_text"],
+            "Copyright © 2018 par Anthony DeBarros.",
+        )
+
+    def test_extract_block_slot_items_prefers_translated_inline_segments(self):
+        reconstructor = DocumentReconstructor()
+        page_data = {
+            "dimensions": {"width": 400, "height": 300},
+            "language": "fr",
+            "page_role": "body",
+            "layout_type": "table_dominant",
+            "document_type": "form",
+            "page_family": "form_page",
+            "blocks": [
+                {
+                    "id": "b1",
+                    "bbox": [40, 40, 300, 64],
+                    "role": "title",
+                    "source": "native",
+                    "translated_text": "SQL PRATIQUE. Copyright © 2018 par Anthony DeBarros.",
+                    "lines": [
+                        {
+                            "bbox": [40, 40, 300, 64],
+                            "line_text": "PRACTICAL SQL. Copyright © 2018 by Anthony DeBarros.",
+                            "translated_text": "SQL PRATIQUE. Copyright © 2018 par Anthony DeBarros.",
+                            "phrases": [
+                                {
+                                    "bbox": [40, 40, 300, 64],
+                                    "texte": "PRACTICAL SQL. Copyright © 2018 by Anthony DeBarros.",
+                                    "translated_text": "SQL PRATIQUE. Copyright © 2018 par Anthony DeBarros.",
+                                    "spans": [
+                                        {
+                                            "bbox": [40, 40, 120, 64],
+                                            "texte": "PRACTICAL SQL.",
+                                            "translated_text": "SQL PRATIQUE.",
+                                            "style": {"font": "JansonTextLTStd-Bold", "size": 11.25, "color": "#000000", "flags": {"bold": True}},
+                                        },
+                                        {
+                                            "bbox": [122, 40, 300, 64],
+                                            "texte": "Copyright © 2018 by Anthony DeBarros.",
+                                            "translated_text": "Copyright © 2018 par Anthony DeBarros.",
+                                            "style": {"font": "JansonTextLTStd-Roman", "size": 11.25, "color": "#000000", "flags": {"bold": False}},
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        items = reconstructor._extract_block_slot_items(page_data)
+        title_item = next(item for item in items if item.get("role") == "title")
+        self.assertEqual(
+            [seg.get("text") for seg in (title_item.get("inline_style_segments") or [])],
+            ["SQL PRATIQUE.", "Copyright © 2018 par Anthony DeBarros."],
+        )
+
     def test_toc_part_title_translation_does_not_duplicate_part_number(self):
         translated = self.translator._translate_toc_label_fr(
             "PART 2 IMAGE CLASSIFICATION AND DETECTION",
@@ -161,6 +308,20 @@ class TranslationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(rows[0].get("page"), "")
         self.assertEqual(rows[0].get("chapter_marker"), "5")
+
+    def test_toc_normalization_merges_continuation_row_and_drops_empty_marker(self):
+        rows = [
+            {"role": "subentry_marker", "label": "Plotting the", "page": ""},
+            {"role": "subentry", "label": "learning curves", "page": "158", "page_bbox": [1, 2, 3, 4]},
+            {"role": "subentry_marker", "label": "", "page": ""},
+        ]
+
+        self.layout_v2_builder._normalize_toc_rows(rows)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get("label"), "Plotting the learning curves")
+        self.assertEqual(rows[0].get("page"), "158")
+        self.assertEqual(rows[0].get("role"), "subentry")
 
     def test_fontsize_from_bbox_uses_source_height(self):
         fs = self.reconstructor._fontsize_from_bbox([0, 100, 10, 175])
@@ -213,6 +374,141 @@ class TranslationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(contract.get("strategy"), "layout_constrained")
         self.assertTrue(contract.get("translatable"))
+
+    def test_abbreviation_key_contract_is_exact_preserve(self):
+        contract = self.translator._resolve_translation_contract(
+            {
+                "translation_strategy": "layout_constrained",
+                "texte": "LRN",
+                "structure_hints": {"structural_role_hint": "abbreviation_key"},
+            },
+            context={"block_role": "body", "role": "body"},
+        )
+
+        self.assertEqual(contract.get("strategy"), "exact_preserve")
+        self.assertFalse(contract.get("translatable"))
+
+    def test_abbreviation_value_contract_is_layout_constrained(self):
+        contract = self.translator._resolve_translation_contract(
+            {
+                "translation_strategy": "exact_preserve",
+                "texte": "Local Response Normalization",
+                "structure_hints": {"structural_role_hint": "abbreviation_value"},
+            },
+            context={"block_role": "body", "role": "body"},
+        )
+
+        self.assertEqual(contract.get("strategy"), "layout_constrained")
+        self.assertTrue(contract.get("translatable"))
+
+    def test_abbreviation_page_detection_and_key_text_heuristics(self):
+        structure = {
+            "blocks": [
+                {"role": "header", "texte": "Abbreviations"},
+                {"role": "body", "texte": "LRN"},
+                {"role": "body", "texte": "Local response normalization"},
+                {"role": "body", "texte": "MSE"},
+                {"role": "body", "texte": "Mean squared error"},
+                {"role": "body", "texte": "CNN"},
+                {"role": "body", "texte": "Convolutional neural network"},
+                {"role": "body", "texte": "RBF"},
+                {"role": "body", "texte": "Radial basis function"},
+            ]
+        }
+
+        self.assertTrue(self.translator._looks_like_abbreviation_page(structure))
+        self.assertTrue(self.translator._looks_like_abbreviation_key_text("LRN"))
+        self.assertTrue(self.translator._looks_like_abbreviation_key_text("M-DBNs"))
+        self.assertFalse(self.translator._looks_like_abbreviation_key_text("Local response normalization"))
+
+    def test_paragraph_line_redistribution_avoids_pathological_one_word_lines(self):
+        source_lines = [
+            "Spatial analysis helps journalists compare places and reveal patterns",
+            "across neighborhoods, cities, and regions in a rigorous way",
+            "that can be explained clearly to readers with maps and tables",
+            "when the story needs both narrative and quantitative evidence",
+        ]
+
+        redistributed = self.translator._redistribute_translated_to_lines(
+            "L'analyse spatiale aide les journalistes a comparer des lieux et a reveler des motifs entre des quartiers des villes et des regions avec une methode rigoureuse qui reste claire pour les lecteurs grace aux cartes et aux tableaux lorsque le recit exige a la fois une narration et des preuves quantitatives.",
+            source_lines,
+            ["", "", "", ""],
+        )
+
+        word_counts = [
+            len(self.translator._normalize_spaces(line).split())
+            for line in redistributed[:-1]
+        ]
+        self.assertTrue(all(count >= 2 for count in word_counts))
+
+    def test_paragraph_line_redistribution_preserves_leading_marker(self):
+        redistributed = self.translator._redistribute_translated_to_lines(
+            "premier point plus detaille pour la traduction du paragraphe",
+            ["1. First bullet line", "continuation line"],
+            ["1.", ""],
+        )
+
+        self.assertTrue(redistributed[0].startswith("1. "))
+
+    def test_editorial_exact_preserve_is_relaxed_on_double_column_prose(self):
+        contract = self.translator._resolve_translation_contract(
+            {
+                "translation_strategy": "exact_preserve",
+                "unit_type": "citation",
+                "texte": "in U.S. library use based on annual surveys.",
+            },
+            default_strategy="semantic_reflow",
+            default_translatable=True,
+            context={
+                "layout_type": "double_column",
+                "document_type": "book_page",
+                "page_family": "body_text_two_column_equations",
+                "block_role": "body",
+                "role": "body",
+            },
+        )
+
+        self.assertEqual(contract.get("strategy"), "layout_constrained")
+        self.assertTrue(contract.get("translatable"))
+
+    def test_true_bibliographic_exact_preserve_stays_locked(self):
+        contract = self.translator._resolve_translation_contract(
+            {
+                "translation_strategy": "exact_preserve",
+                "unit_type": "citation",
+                "texte": "(Smith, 2020)",
+            },
+            default_strategy="semantic_reflow",
+            default_translatable=True,
+            context={
+                "layout_type": "double_column",
+                "document_type": "book_page",
+                "page_family": "body_text_two_column_equations",
+                "block_role": "body",
+                "role": "body",
+            },
+        )
+
+        self.assertEqual(contract.get("strategy"), "exact_preserve")
+
+    def test_contents_like_block_is_not_treated_as_paragraph(self):
+        block = {
+            "role": "body",
+            "lines": [
+                {"line_text": "USING POSTGRESQL FROM THE COMMAND LINE", "indent_px": 0.0},
+                {"line_text": "Setting Up the Command Line for psql", "indent_px": 0.0},
+                {"line_text": "Windows psql Setup", "indent_px": 121.0},
+                {"line_text": "macOS psql Setup", "indent_px": 121.0},
+                {"line_text": "Linux psql Setup", "indent_px": 121.0},
+                {"line_text": "Working with psql", "indent_px": 0.0},
+                {"line_text": "Launching psql and Connecting to a Database", "indent_px": 121.0},
+                {"line_text": "Getting Help", "indent_px": 121.0},
+            ],
+        }
+
+        self.assertTrue(self.translator._looks_like_contents_block(block))
+        self.assertFalse(self.translator._should_translate_block_as_paragraph(block))
+        self.assertFalse(self.translator._looks_like_editorial_narrative_block(block))
 
     def test_code_visible_table_block_stays_exact_preserve(self):
         contract = self.translator._resolve_translation_contract(
@@ -769,6 +1065,36 @@ class TranslationEnrichmentTests(unittest.TestCase):
         )
         self.assertEqual(policy["unit_type"], "narrative_body")
         self.assertEqual(policy["render_policy"], "paragraph_flow")
+
+    def test_two_column_equation_page_long_body_uses_paragraph_flow(self):
+        policy = self.page_policy.classify_unit_policy(
+            text="This longer editorial paragraph explains the context around the equation while remaining ordinary body prose for the reader across the two column page layout.",
+            role="body",
+            source_kind="native_phrase",
+            page_role="body",
+            page_family="body_text_two_column_equations",
+            page_family_group="body_text",
+            document_type="book_page",
+            layout_type="double_column",
+            style_profile="academic_dense",
+        )
+        self.assertEqual(policy["unit_type"], "narrative_body")
+        self.assertEqual(policy["render_policy"], "paragraph_flow")
+
+    def test_two_column_equation_page_formula_label_stays_anchored(self):
+        policy = self.page_policy.classify_unit_policy(
+            text="Gradient update rule",
+            role="equation_inline",
+            source_kind="native_phrase",
+            page_role="body",
+            page_family="body_text_two_column_equations",
+            page_family_group="body_text",
+            document_type="book_page",
+            layout_type="double_column",
+            style_profile="academic_dense",
+        )
+        self.assertEqual(policy["unit_type"], "formula_label")
+        self.assertEqual(policy["render_policy"], "anchored_text")
 
     def test_annotated_page_explanatory_label_gets_diagram_label_type(self):
         unit_type = self.page_policy.classify_unit_type(
@@ -1401,6 +1727,83 @@ class TranslationEnrichmentTests(unittest.TestCase):
         texts = [" ".join(b[4].split()) for b in page.get_text("blocks") if b[4].strip()]
         self.assertFalse(any("274 7" in t for t in texts))
         self.assertTrue(any("Détection d'objets" in t for t in texts))
+        doc.close()
+
+    def test_dense_toc_renderer_keeps_trailing_rows_visible(self):
+        reconstructor = DocumentReconstructor.__new__(DocumentReconstructor)
+        reconstructor.pixel_to_point = 72.0 / 150.0
+        reconstructor._rendered_signatures = set()
+
+        doc = fitz.open()
+        page = doc.new_page(width=531.36, height=666.24)
+        rows = []
+        y = 120.0
+        for idx in range(44):
+            rows.append(
+                {
+                    "role": "section_heading" if idx % 3 == 0 else "subentry",
+                    "label": f"{idx + 1}. Dense toc row {idx + 1}",
+                    "page": str(200 + idx),
+                    "y": y,
+                    "style": {"size": 10.0, "source": "native"},
+                    "label_bbox": [308.0, y, 700.0, y + 22.0],
+                    "page_bbox": [894.0, y, 930.0, y + 22.0],
+                    "source_band_id": idx,
+                    "source_band_lane": 0,
+                }
+            )
+            y += 23.0
+        rows.extend(
+            [
+                {
+                    "role": "section_heading",
+                    "label": "Network predictions",
+                    "page": "287",
+                    "y": y,
+                    "style": {"size": 10.0, "source": "native"},
+                    "label_bbox": [308.0, y, 760.0, y + 22.0],
+                    "page_bbox": [894.0, y, 930.0, y + 22.0],
+                    "source_band_id": 44,
+                    "source_band_lane": 0,
+                },
+                {
+                    "role": "section_heading",
+                    "label": "Non-maximum suppression (NMS)",
+                    "page": "288",
+                    "y": y + 23.0,
+                    "style": {"size": 10.0, "source": "native"},
+                    "label_bbox": [308.0, y + 23.0, 760.0, y + 45.0],
+                    "page_bbox": [894.0, y + 23.0, 930.0, y + 45.0],
+                    "source_band_id": 45,
+                    "source_band_lane": 0,
+                },
+                {
+                    "role": "subentry_marker",
+                    "label": "Object-detector evaluation metrics",
+                    "page": "289",
+                    "y": y + 46.0,
+                    "style": {"size": 10.0, "source": "native"},
+                    "label_bbox": [308.0, y + 46.0, 820.0, y + 68.0],
+                    "page_bbox": [894.0, y + 46.0, 930.0, y + 68.0],
+                    "source_band_id": 46,
+                    "source_band_lane": 0,
+                },
+            ]
+        )
+
+        reconstructor._render_toc_rows_v2(
+            page,
+            rows,
+            tab_stops={"column_left_x": 287.0, "column_right_x": 911.0, "page_num_right_x": 930.0},
+            zone_top=20.0,
+            zone_bottom=650.0,
+            left=0.0,
+            right=531.36,
+        )
+
+        text = " ".join(page.get_text("text").split())
+        self.assertIn("Network predictions", text)
+        self.assertIn("287", text)
         doc.close()
 
 

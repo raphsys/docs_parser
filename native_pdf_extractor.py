@@ -2,11 +2,46 @@ import hashlib
 import os
 import re
 import tempfile
+from collections import Counter
 
 
 def _normalize_font_key(font_name: str) -> str:
     raw = (font_name or "").split("+", 1)[-1].strip()
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
+
+
+def _font_key_variants(font_name: str):
+    key = _normalize_font_key(font_name)
+    if not key:
+        return []
+    variants = {key}
+    suffix_map = {
+        "itali": "italic",
+        "ital": "italic",
+        "obl": "oblique",
+        "cond": "condensed",
+    }
+    changed = True
+    while changed:
+        changed = False
+        current = list(variants)
+        for value in current:
+            for short_suffix, full_suffix in suffix_map.items():
+                if value.endswith(short_suffix) and not value.endswith(full_suffix):
+                    candidate = value[: -len(short_suffix)] + full_suffix
+                    if candidate not in variants:
+                        variants.add(candidate)
+                        changed = True
+    raw = (font_name or "").split("+", 1)[-1].strip()
+    stripped = re.sub(r"\.[A-Za-z0-9]+$", "", raw)
+    stripped = re.sub(r"\+[A-Za-z0-9]+$", "", stripped)
+    stripped_key = _normalize_font_key(stripped)
+    if stripped_key:
+        variants.add(stripped_key)
+        compact = re.sub(r"([a-z0-9])(?:[a-f0-9]{6,}|[a-z]{2,}\d{2,})$", r"\1", stripped_key, flags=re.IGNORECASE)
+        if compact and len(compact) >= max(8, len(stripped_key) - 12):
+            variants.add(compact)
+    return [variant for variant in variants if variant]
 
 
 def _color_int_to_hex(value) -> str:
@@ -143,16 +178,36 @@ class NativePDFExtractor:
             font_path = self._extract_embedded_font_file(pdf_page, xref, font_name)
             if not font_path:
                 continue
-            key_variants = {
-                _normalize_font_key(font_name),
-                _normalize_font_key(font_name.split("+", 1)[-1]),
-            }
+            key_variants = set()
+            key_variants.update(_font_key_variants(font_name))
+            key_variants.update(_font_key_variants(font_name.split("+", 1)[-1]))
             for key in key_variants:
                 if key and key not in font_map:
                     font_map[key] = font_path
 
         self._embedded_font_map_cache[cache_key] = font_map
         return font_map
+
+    def _resolve_embedded_font_path(self, embedded_font_map, font_name):
+        if not isinstance(embedded_font_map, dict):
+            return None
+        candidate_keys = [key for key in _font_key_variants(font_name) if key]
+        for key in candidate_keys:
+            font_path = embedded_font_map.get(key)
+            if font_path:
+                return font_path
+        for candidate in candidate_keys:
+            prefix_matches = [
+                (mapped_key, font_path)
+                for mapped_key, font_path in embedded_font_map.items()
+                if isinstance(mapped_key, str)
+                and mapped_key
+                and (mapped_key.startswith(candidate) or candidate.startswith(mapped_key))
+            ]
+            if prefix_matches:
+                prefix_matches.sort(key=lambda item: abs(len(item[0]) - len(candidate)))
+                return prefix_matches[0][1]
+        return None
 
     def _build_style(self, font_name, span_text, size, color, embedded_font_path=None):
         low_font = (font_name or "").lower()
@@ -200,6 +255,31 @@ class NativePDFExtractor:
             "avg_char_width_pt": round(sum(widths) / max(1, len(widths)), 4),
             "avg_char_height_pt": round(sum(heights) / max(1, len(heights)), 4),
         }
+
+    def _representative_style(self, span_payloads):
+        if not isinstance(span_payloads, list):
+            return None
+        weighted = Counter()
+        style_by_key = {}
+        for span in span_payloads:
+            if not isinstance(span, dict):
+                continue
+            style = span.get("style") or {}
+            if not isinstance(style, dict) or not style:
+                continue
+            key = (
+                style.get("font"),
+                style.get("size"),
+                style.get("color"),
+                style.get("embedded_font_path"),
+                tuple(sorted((style.get("flags") or {}).items())),
+            )
+            text = str(span.get("texte") or "")
+            weighted[key] += max(1, len(text.strip()))
+            style_by_key[key] = dict(style)
+        if not weighted:
+            return None
+        return dict(style_by_key[weighted.most_common(1)[0][0]])
 
     def _translatability_contract(self, text):
         txt = (text or "").strip()
@@ -287,7 +367,7 @@ class NativePDFExtractor:
                             txt,
                             s.get("size", 12.0),
                             s.get("color", 0),
-                            embedded_font_path=embedded_font_map.get(_normalize_font_key(font_name)),
+                            embedded_font_path=self._resolve_embedded_font_path(embedded_font_map, font_name),
                         ),
                     }
                     span_payload.update(self._translatability_contract(txt))
@@ -302,6 +382,8 @@ class NativePDFExtractor:
                     "bbox": _merge_bbox_list([sp["bbox"] for sp in current_spans]),
                     "bbox_pt": _merge_bbox_list([sp["bbox_pt"] for sp in current_spans]),
                     "spans": current_spans,
+                    "style": self._representative_style(current_spans),
+                    "resolved_style": self._representative_style(current_spans),
                     "source": "native",
                     "source_kind": "native_phrase",
                 }
@@ -312,6 +394,8 @@ class NativePDFExtractor:
                     "bbox": line_bbox_px,
                     "bbox_pt": [float(line_bbox_pt[0]), float(line_bbox_pt[1]), float(line_bbox_pt[2]), float(line_bbox_pt[3])],
                     "phrases": phrases,
+                    "style": self._representative_style(current_spans),
+                    "resolved_style": self._representative_style(current_spans),
                     "source": "native",
                     "source_kind": "native_line",
                     "line_index_native": line_idx,
@@ -324,12 +408,20 @@ class NativePDFExtractor:
                 lines.append(line_payload)
 
             if lines:
+                all_spans = [
+                    span
+                    for line in lines
+                    for phrase in (line.get("phrases") or [])
+                    for span in (phrase.get("spans") or [])
+                ]
                 block_text = " ".join((ln.get("line_text") or "").strip() for ln in lines if (ln.get("line_text") or "").strip()).strip()
                 block_payload = {
                     "id": f"n_{len(native_blocks)}",
                     "bbox": _merge_bbox_list([ln["bbox"] for ln in lines]),
                     "bbox_pt": _merge_bbox_list([ln["bbox_pt"] for ln in lines]),
                     "lines": lines,
+                    "style": self._representative_style(all_spans),
+                    "resolved_style": self._representative_style(all_spans),
                     "source": "native",
                     "source_kind": "native_block",
                     "raw_text": block_text,

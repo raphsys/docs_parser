@@ -248,6 +248,31 @@ class PageCaseClassifierTests(unittest.TestCase):
         )
         self.assertNotEqual(result["page_family"], "toc")
 
+    def test_layout_ai_regions_raise_table_signal(self):
+        page_data = {
+            "dimensions": {"width": 500, "height": 700},
+            "blocks": [
+                {"role": "body", "source": "native", "text": "Layer name", "lines": [{"line_text": "Layer name"}]},
+                {"role": "body", "source": "native", "text": "conv1", "lines": [{"line_text": "conv1"}]},
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"x0": 0, "x1": 500}]},
+            "layout_ai_structure": {
+                "regions": [
+                    {"id": "ai_t0", "type": "table", "bbox": [40, 80, 460, 360]},
+                    {"id": "ai_t1", "type": "formula", "bbox": [300, 380, 430, 430]},
+                ]
+            },
+        }
+        lines = [{"bbox": [0, 0, 100, 10], "block": b, "line": {}} for b in page_data["blocks"]]
+        features = self.classifier.extract_features(page_data, lines, page_role="body")
+        self.assertEqual(features["ai_table_regions"], 1)
+        self.assertEqual(features["ai_formula_regions"], 1)
+        layout_scores = self.classifier.score_layout_types(features, page_family="unknown", page_role="body")
+        self.assertGreater(layout_scores["table_dominant"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

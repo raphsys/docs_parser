@@ -138,9 +138,58 @@ class LayoutDescriptorTests(unittest.TestCase):
         page = self._sample_page()
         enriched = self.layout_builder.build(page)
         self.assertIn("layout_descriptor", enriched)
+        self.assertIn("page_case_v2", enriched)
+        self.assertIn("layout_descriptor_v3", enriched)
+        self.assertEqual(enriched["page_case_v2"]["version"], "page_case.v2")
         self.assertEqual(enriched["layout_descriptor"]["descriptor_version"], "layout_descriptor.v2")
+        self.assertEqual(enriched["layout_descriptor_v3"]["descriptor_version"], "layout_descriptor.v3")
         self.assertIn("layout_descriptor", enriched["layout"])
+        self.assertIn("page_case_v2", enriched["layout"])
+        self.assertIn("layout_descriptor_v3", enriched["layout"])
         self.assertEqual(enriched["layout"]["descriptor_version"], "layout_descriptor.v2")
+        self.assertEqual(enriched["layout"]["descriptor_v3_version"], "layout_descriptor.v3")
+
+    def test_layout_v2_builder_splits_abbreviation_blocks_before_descriptor(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 800, "height": 1200},
+            "blocks": [
+                {
+                    "id": "h1",
+                    "role": "header",
+                    "source": "native",
+                    "bbox": [100, 80, 320, 110],
+                    "text": "Abbreviations",
+                    "lines": [{"bbox": [100, 80, 320, 110], "line_text": "Abbreviations", "phrases": []}],
+                },
+                {
+                    "id": "b1",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [100, 200, 620, 420],
+                    "text": "AE Autoencoder AI Artificial intelligence ANN Artificial neural network BN Batch normalization",
+                    "lines": [
+                        {"bbox": [100, 200, 126, 220], "line_text": "AE", "phrases": []},
+                        {"bbox": [220, 200, 360, 220], "line_text": "Autoencoder", "phrases": []},
+                        {"bbox": [100, 230, 122, 250], "line_text": "AI", "phrases": []},
+                        {"bbox": [220, 230, 420, 250], "line_text": "Artificial intelligence", "phrases": []},
+                        {"bbox": [100, 260, 138, 280], "line_text": "ANN", "phrases": []},
+                        {"bbox": [220, 260, 452, 280], "line_text": "Artificial neural network", "phrases": []},
+                        {"bbox": [100, 290, 129, 310], "line_text": "BN", "phrases": []},
+                        {"bbox": [220, 290, 410, 310], "line_text": "Batch normalization", "phrases": []},
+                    ],
+                },
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"id": 0, "x0": 80, "x1": 760}]},
+        }
+        enriched = self.layout_builder.build(page)
+        body_blocks = [blk for blk in enriched["blocks"] if blk.get("role") == "body"]
+        self.assertEqual(len(body_blocks), 8)
+        self.assertEqual(body_blocks[0]["text"], "AE")
+        self.assertEqual(body_blocks[1]["text"], "Autoencoder")
 
     def test_table_dominant_page_builds_table_regions_and_locked_constraints(self):
         page = {
@@ -329,6 +378,7 @@ class LayoutDescriptorTests(unittest.TestCase):
         self.assertEqual(t1["layout_behavior"], "anchored")
         self.assertEqual(t1["section_id"], "section_t1")
         self.assertEqual(elements["b1"]["section_id"], "section_t1")
+        self.assertIn("relation_groups", descriptor["reconstruction_plan"])
 
     def test_descriptor_uses_native_structure_hints_for_groups_and_roles(self):
         page = {
@@ -435,6 +485,150 @@ class LayoutDescriptorTests(unittest.TestCase):
         self.assertEqual(descriptor["page_organization"]["table_stub_column_group_id"], "native_table_col_0")
         self.assertEqual((descriptor["page_organization"]["chart_groups"]["x_tick_group"] or {}).get("id"), "native_chart_ticks_x")
         self.assertTrue(descriptor["page_organization"]["chart_groups"]["series_groups"])
+
+    def test_descriptor_builds_same_band_same_row_and_paragraph_chain_relations(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 600, "height": 900},
+            "document_type": "book_page",
+            "layout_type": "double_column",
+            "style_profile": "administrative_clean",
+            "page_role": "body",
+            "layout": {"columns": [{"id": 0, "x0": 40, "x1": 280}, {"id": 1, "x0": 320, "x1": 560}]},
+            "regions": [],
+            "classification_confidence": {},
+            "page_case": {"features": {}},
+            "blocks": [
+                {"id": "h1", "role": "section_heading", "source": "native", "bbox": [40, 80, 240, 110], "text": "Abbreviations", "lines": []},
+                {"id": "r1a", "role": "body", "source": "native", "bbox": [40, 140, 110, 165], "text": "AE", "lines": []},
+                {"id": "r1b", "role": "body", "source": "native", "bbox": [130, 140, 280, 165], "text": "Autoencoder", "lines": []},
+                {"id": "p1", "role": "body", "source": "native", "bbox": [320, 140, 560, 178], "text": "Machine learning systems can learn useful representations from data.", "lines": []},
+                {"id": "p2", "role": "body", "source": "native", "bbox": [320, 182, 560, 220], "text": "The learned features can support downstream tasks and robust predictions.", "lines": []},
+                {"id": "h2", "role": "section_heading", "source": "native", "bbox": [40, 260, 240, 290], "text": "Another Section", "lines": []},
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "ai_layout_regions": [
+                {"id": "ai_title_left", "type": "paragraph_title", "bbox": [38, 74, 282, 116], "source": "layout_ai"},
+                {"id": "ai_text_left", "type": "text", "bbox": [38, 132, 282, 190], "source": "layout_ai"},
+                {"id": "ai_text_right", "type": "text", "bbox": [318, 132, 562, 224], "source": "layout_ai"},
+            ],
+        }
+        descriptor = self.builder.build(page)
+        relation_types = [rel["type"] for rel in descriptor["relations"]]
+        self.assertIn("same_band", relation_types)
+        self.assertIn("same_row", relation_types)
+        self.assertIn("continues_paragraph", relation_types)
+        self.assertIn("section_sibling", relation_types)
+        elements = {el["id"]: el for el in descriptor["elements"] if not el.get("parent_id")}
+        self.assertEqual(elements["r1a"]["structural_role"], "abbreviation_key")
+        self.assertEqual(elements["r1b"]["structural_role"], "abbreviation_value")
+        self.assertEqual(elements["r1a"]["typographic_class"], "abbreviation_key")
+        self.assertEqual(elements["r1b"]["typographic_class"], "abbreviation_value")
+        self.assertTrue((elements["r1a"]["group_ids"] or {}).get("same_row_group_id"))
+        self.assertTrue((elements["r1a"]["group_ids"] or {}).get("same_band_group_id"))
+        self.assertTrue((elements["p1"]["group_ids"] or {}).get("paragraph_chain_group_id"))
+        self.assertTrue((elements["h1"]["group_ids"] or {}).get("section_sibling_group_id"))
+        rel_groups = descriptor["reconstruction_plan"]["relation_groups"]
+        self.assertTrue(rel_groups.get("same_row"))
+        self.assertTrue(rel_groups.get("continues_paragraph"))
+        self.assertIn("r1a", rel_groups["same_row"][0]["member_ids"])
+        self.assertIn("p2", rel_groups["continues_paragraph"][0]["member_ids"])
+        self.assertEqual(rel_groups["same_row"][0]["bbox"], [40.0, 140.0, 280.0, 165.0])
+        self.assertEqual(rel_groups["continues_paragraph"][0]["bbox"], [320.0, 140.0, 560.0, 220.0])
+
+    def test_toc_rows_feed_descriptor_v3_toc_entries(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 1000, "height": 1300},
+            "document_type": "book_page",
+            "layout_type": "toc_page",
+            "style_profile": "minimalist",
+            "page_role": "toc",
+            "layout": {"columns": [{"id": 0, "x0": 252, "x1": 916}]},
+            "regions": [],
+            "classification_confidence": {},
+            "page_case": {"features": {"toc_pattern_score": 1.0}},
+            "blocks": [
+                {
+                    "id": "h1",
+                    "role": "header",
+                    "source": "native",
+                    "bbox": [503, 56, 585, 70],
+                    "text": "CONTENTS",
+                    "lines": [
+                        {
+                            "bbox": [503, 56, 585, 70],
+                            "line_text": "CONTENTS",
+                            "phrases": [
+                                {
+                                    "bbox": [503, 56, 585, 70],
+                                    "texte": "CONTENTS",
+                                    "style": {"font": "Times", "size": 8.5, "flags": {}},
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "b1",
+                    "role": "section_heading",
+                    "source": "native",
+                    "bbox": [289, 112, 919, 135],
+                    "text": "4.5 Improving the network and tuning hyperparameters 162",
+                    "lines": [
+                        {
+                            "bbox": [289, 112, 919, 135],
+                            "line_text": "4.5 Improving the network and tuning hyperparameters 162",
+                            "phrases": [
+                                {
+                                    "bbox": [289, 112, 919, 135],
+                                    "texte": "4.5 Improving the network and tuning hyperparameters 162",
+                                    "style": {"font": "Times", "size": 11, "flags": {"bold": True}},
+                                }
+                            ],
+                            "indent_level": 0,
+                            "indent_px": 38.0,
+                        }
+                    ],
+                },
+                {
+                    "id": "b2",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [370, 145, 815, 167],
+                    "text": "Collecting more data vs. tuning hyperparameters 162",
+                    "lines": [
+                        {
+                            "bbox": [370, 145, 815, 167],
+                            "line_text": "Collecting more data vs. tuning hyperparameters 162",
+                            "phrases": [
+                                {
+                                    "bbox": [370, 145, 815, 167],
+                                    "texte": "Collecting more data vs. tuning hyperparameters 162",
+                                    "style": {"font": "Times", "size": 10, "flags": {"italic": True}},
+                                }
+                            ],
+                            "indent_level": 1,
+                            "indent_px": 118.0,
+                        }
+                    ],
+                },
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+        }
+
+        toc_rows, tab_stops = self.layout_builder._build_toc_rows(
+            page,
+            columns=page["layout"]["columns"],
+            margins={"left": 252, "right": 916},
+        )
+        page["toc"] = {"toc_rows": toc_rows, "tab_stops": tab_stops}
+        inferred = (self.layout_builder.layout_descriptor_builder_v3.build(page).get("inferred_structure") or {})
+        self.assertGreater(len(inferred.get("toc_entries") or []), 0)
 
 
 if __name__ == "__main__":

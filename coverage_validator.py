@@ -1,6 +1,51 @@
 import re
+from collections import Counter
 
 import fitz
+
+
+def _page_refs(page, fallback_index=0):
+    if not isinstance(page, dict):
+        return {
+            "page_index": max(0, int(fallback_index or 0)),
+            "page_number": max(1, int(fallback_index or 0) + 1),
+        }
+    raw_page_number = page.get("page")
+    raw_page_index = page.get("page_index")
+    descriptor = (page.get("layout_descriptor") or ((page.get("layout") or {}).get("layout_descriptor")) or {})
+    descriptor_page_index = descriptor.get("page_id") if isinstance(descriptor, dict) else None
+    descriptor_page_number = descriptor.get("page_number") if isinstance(descriptor, dict) else None
+
+    try:
+        page_index = int(raw_page_index)
+    except Exception:
+        page_index = None
+    if page_index is None:
+        page_index = max(0, int(fallback_index or 0))
+    if page_index is None:
+        try:
+            page_index = int(descriptor_page_index)
+        except Exception:
+            page_index = None
+
+    try:
+        page_number = int(raw_page_number)
+    except Exception:
+        page_number = None
+    if page_number is None:
+        page_number = max(1, int(fallback_index or 0) + 1)
+    if page_number is None:
+        try:
+            page_number = int(descriptor_page_number)
+        except Exception:
+            page_number = None
+    if page_number is None:
+        page_number = max(1, int(page_index) + 1)
+
+    return {
+        "page_index": max(0, int(page_index)),
+        "page_number": max(1, int(page_number)),
+    }
 
 
 def _normalize_spaces(text):
@@ -183,9 +228,10 @@ def _guess_translated_text(unit):
     )
 
 
-def _iter_phrase_units(page):
+def _iter_phrase_units(page, fallback_page_index=0):
     if not isinstance(page, dict):
         return
+    refs = _page_refs(page, fallback_index=fallback_page_index)
     descriptor = page.get("layout_descriptor") or ((page.get("layout") or {}).get("layout_descriptor")) or {}
     descriptor_elements = {
         str(el.get("id")): el
@@ -231,11 +277,13 @@ def _iter_phrase_units(page):
                 spans = phrase.get("spans", []) or []
                 skip_flags = [bool(sp.get("skip_render", False)) for sp in spans if isinstance(sp, dict)]
                 unit = {
-                    "page_id": page.get("page", 0),
+                    "page_id": refs["page_number"],
+                    "page_number": refs["page_number"],
+                    "page_index": refs["page_index"],
                     "block_index": b_idx,
                     "line_index": l_idx,
                     "phrase_index": p_idx,
-                    "unit_id": phrase.get("unit_id") or f"p{page.get('page', 0)}:b{b_idx}:l{l_idx}:p{p_idx}",
+                    "unit_id": phrase.get("unit_id") or f"p{refs['page_number']}:b{b_idx}:l{l_idx}:p{p_idx}",
                     "role": phrase.get("role") or block.get("role") or "body",
                     "source_kind": phrase.get("source_kind") or block.get("source_kind") or "",
                     "translation_strategy": phrase.get("translation_strategy") or block.get("translation_strategy") or "semantic_reflow",
@@ -265,15 +313,16 @@ def _iter_phrase_units(page):
                 yield unit
 
 
-def _iter_toc_units(page):
+def _iter_toc_units(page, fallback_page_index=0):
     if not isinstance(page, dict):
         return
     if page.get("schema_version") != "layout.v2":
         return
     if str(page.get("page_role", "")).strip().lower() != "toc":
         return
+    refs = _page_refs(page, fallback_index=fallback_page_index)
     rows = ((page.get("toc") or {}).get("toc_rows") or [])
-    page_id = page.get("page", 0)
+    page_id = refs["page_number"]
     for idx, row in enumerate(rows):
         label = _normalize_spaces(row.get("label") or "")
         translated_label = _normalize_spaces(row.get("translated_label") or row.get("label") or "")
@@ -281,6 +330,8 @@ def _iter_toc_units(page):
         if label:
             yield {
                 "page_id": page_id,
+                "page_number": refs["page_number"],
+                "page_index": refs["page_index"],
                 "block_index": idx,
                 "line_index": 0,
                 "phrase_index": 0,
@@ -296,6 +347,8 @@ def _iter_toc_units(page):
         if page_num:
             yield {
                 "page_id": page_id,
+                "page_number": refs["page_number"],
+                "page_index": refs["page_index"],
                 "block_index": idx,
                 "line_index": 0,
                 "phrase_index": 1,
@@ -310,13 +363,13 @@ def _iter_toc_units(page):
             }
 
 
-def _iter_units(page):
-    toc_units = list(_iter_toc_units(page) or [])
+def _iter_units(page, fallback_page_index=0):
+    toc_units = list(_iter_toc_units(page, fallback_page_index=fallback_page_index) or [])
     if toc_units:
         for unit in toc_units:
             yield unit
         return
-    for unit in _iter_phrase_units(page):
+    for unit in _iter_phrase_units(page, fallback_page_index=fallback_page_index):
         yield unit
 
 
@@ -393,12 +446,15 @@ def _classify_unit_status(unit, target_lang="fr"):
 def analyze_document_coverage(source_pages, translated_pages, target_lang="fr"):
     src_units = []
     tr_units = []
-    for page in source_pages or []:
-        src_units.extend(list(_iter_units(page)))
-    for page in translated_pages or []:
-        tr_units.extend(list(_iter_units(page)))
+    for page_idx, page in enumerate(source_pages or []):
+        src_units.extend(list(_iter_units(page, fallback_page_index=page_idx)))
+    for page_idx, page in enumerate(translated_pages or []):
+        tr_units.extend(list(_iter_units(page, fallback_page_index=page_idx)))
 
-    translated_by_id = {u["unit_id"]: u for u in tr_units}
+    translated_by_id = {
+        (int(u.get("page_index", 0)), str(u["unit_id"])): u
+        for u in tr_units
+    }
     findings = []
     summary = {
         "source_units": 0,
@@ -414,7 +470,7 @@ def analyze_document_coverage(source_pages, translated_pages, target_lang="fr"):
     }
 
     for src in src_units:
-        translated = translated_by_id.get(src["unit_id"], {})
+        translated = translated_by_id.get((int(src.get("page_index", 0)), str(src["unit_id"])), {})
         unit = dict(src)
         unit["translated_text"] = translated.get("translated_text", src.get("translated_text", ""))
         status, reason = _classify_unit_status(unit, target_lang=target_lang)
@@ -442,6 +498,8 @@ def analyze_document_coverage(source_pages, translated_pages, target_lang="fr"):
                 {
                     "unit_id": unit["unit_id"],
                     "page_id": unit["page_id"],
+                    "page_number": unit.get("page_number", unit["page_id"]),
+                    "page_index": unit.get("page_index", 0),
                     "role": unit["role"],
                     "source_kind": unit["source_kind"],
                     "translation_strategy": unit["translation_strategy"],
@@ -459,8 +517,13 @@ def analyze_document_coverage(source_pages, translated_pages, target_lang="fr"):
     summary["coverage_score"] = round(score, 4)
     summary["publication_blocked"] = summary["missing_units"] > 0
     findings.sort(key=lambda x: (0 if x["status"] == "missing" else 1, x["page_id"], x["unit_id"]))
+    findings_by_page = Counter(item["page_id"] for item in findings)
+    findings_by_reason = Counter(item["reason"] for item in findings)
     return {
         "summary": summary,
+        "findings_total": len(findings),
+        "findings_by_page": dict(sorted(findings_by_page.items())),
+        "findings_by_reason": dict(sorted(findings_by_reason.items())),
         "findings": findings[:200],
     }
 
@@ -507,15 +570,16 @@ def _expected_rendered_text(unit):
 
 
 def _page_index_for_unit(unit, page_count):
-    raw = unit.get("page_id", 0)
     try:
-        idx = int(raw)
+        idx = int(unit.get("page_index"))
     except Exception:
-        idx = 0
+        raw = unit.get("page_id", 0)
+        try:
+            idx = int(raw) - 1
+        except Exception:
+            idx = 0
     if idx < 0:
         idx = 0
-    if idx >= page_count and idx > 0:
-        idx -= 1
     if idx < 0:
         idx = 0
     if idx >= page_count:
@@ -609,8 +673,8 @@ def analyze_rendered_text_coverage(source_pages, translated_pages, pdf_path, tar
     rendered_pages = _extract_rendered_page_texts(pdf_path)
     full_text = _normalize_spaces(" ".join(rendered_pages))
     translated_units = []
-    for page in translated_pages or []:
-        translated_units.extend(list(_iter_units(page)))
+    for page_idx, page in enumerate(translated_pages or []):
+        translated_units.extend(list(_iter_units(page, fallback_page_index=page_idx)))
 
     findings = []
     summary = {
@@ -646,6 +710,8 @@ def analyze_rendered_text_coverage(source_pages, translated_pages, pdf_path, tar
                 {
                     "unit_id": unit.get("unit_id"),
                     "page_id": unit.get("page_id"),
+                    "page_number": unit.get("page_number", unit.get("page_id")),
+                    "page_index": unit.get("page_index"),
                     "role": unit.get("role"),
                     "source_kind": unit.get("source_kind"),
                     "translation_strategy": unit.get("translation_strategy"),
@@ -665,7 +731,12 @@ def analyze_rendered_text_coverage(source_pages, translated_pages, pdf_path, tar
         summary["rendered_missing_units"] > 0 or summary["rendered_warning_units"] > 0
     )
     findings.sort(key=lambda x: (0 if x["status"] == "missing" else 1, x["page_id"], x["unit_id"]))
+    findings_by_page = Counter(item["page_id"] for item in findings)
+    findings_by_reason = Counter(item["reason"] for item in findings)
     return {
         "summary": summary,
+        "findings_total": len(findings),
+        "findings_by_page": dict(sorted(findings_by_page.items())),
+        "findings_by_reason": dict(sorted(findings_by_reason.items())),
         "findings": findings[:200],
     }

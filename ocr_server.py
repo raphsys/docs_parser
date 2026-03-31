@@ -1946,7 +1946,7 @@ async def translate_structure_endpoint(data: dict, target_lang: str = "French", 
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/reconstruct")
-async def reconstruct_document(data: dict, target_lang: str = None, debug_compare: bool = False, export_html: bool = False, style: str = None, tone: str = None):
+async def reconstruct_document(data: dict, target_lang: str = None, debug_compare: bool = False, export_html: bool = False, style: str = None, tone: str = None, include_debug_pages: bool = False):
     try:
         if isinstance(data, dict) and "structure" in data:
             data = data["structure"]
@@ -2014,6 +2014,9 @@ async def reconstruct_document(data: dict, target_lang: str = None, debug_compar
                 target_lang=(target_lang or "fr"),
                 original_image_paths=original_paths,
             )
+        if include_debug_pages:
+            response["source_pages"] = json_serializable(source_pages_for_qa)
+            response["translated_pages"] = json_serializable(pages)
         if debug_compare:
             if any(original_paths):
                 response["visual_compare"] = compare_reconstruction(original_paths, output_path, dpi=TARGET_DPI)

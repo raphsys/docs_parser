@@ -115,6 +115,8 @@ class PageCaseClassifier:
         images = page_data.get("images") or []
         drawings = page_data.get("drawings") or []
         non_text_zones = page_data.get("non_text_zones") or []
+        layout_ai = page_data.get("layout_ai_structure") or {}
+        ai_regions = list(layout_ai.get("regions") or page_data.get("ai_layout_regions") or [])
         layout = page_data.get("layout") or {}
         columns = layout.get("columns") or []
         dims = page_data.get("dimensions") or {}
@@ -171,6 +173,8 @@ class PageCaseClassifier:
         invoice_terms = {"invoice", "total", "subtotal", "tax", "amount", "vat", "balance"}
         toc_like_lines = 0
         page_marker_lines = 0
+        ai_region_types = Counter()
+        ai_region_area = 0.0
 
         for block in blocks:
             block_role = str(block.get("role") or "body").strip().lower()
@@ -292,6 +296,11 @@ class PageCaseClassifier:
                 table_area += area
                 table_block_count += 1
 
+        for region in ai_regions:
+            r_type = str(region.get("type") or region.get("label") or "unknown").strip().lower()
+            ai_region_types.update([r_type])
+            ai_region_area += self._bbox_area(region.get("bbox") or [])
+
         image_count = len(images)
         drawing_count = len(drawings)
         major_non_text = image_count + len(non_text_zones)
@@ -369,6 +378,15 @@ class PageCaseClassifier:
             "block_area_mean": self._mean(block_areas),
             "font_size_levels": len({round(v, 1) for v in font_sizes}),
             "font_size_mean": self._mean(font_sizes),
+            "ai_region_count": len(ai_regions),
+            "ai_text_regions": int(ai_region_types.get("text", 0)),
+            "ai_title_regions": int(ai_region_types.get("title", 0) + ai_region_types.get("paragraph_title", 0) + ai_region_types.get("figure_title", 0)),
+            "ai_table_regions": int(ai_region_types.get("table", 0)),
+            "ai_chart_regions": int(ai_region_types.get("chart", 0)),
+            "ai_formula_regions": int(ai_region_types.get("formula", 0)),
+            "ai_header_regions": int(ai_region_types.get("header", 0)),
+            "ai_caption_regions": int(ai_region_types.get("caption", 0)),
+            "ai_region_coverage_ratio": self._safe_ratio(ai_region_area, page_area),
         }
 
     def _build_regions(self, page_data):
@@ -451,6 +469,10 @@ class PageCaseClassifier:
         scientific = float(features.get("scientific_pattern_score", 0.0))
         table_blocks = int(features.get("num_table_blocks", 0))
         visual_non_text = int(features.get("visual_non_text", 0))
+        ai_table_regions = int(features.get("ai_table_regions", 0))
+        ai_chart_regions = int(features.get("ai_chart_regions", 0))
+        ai_formula_regions = int(features.get("ai_formula_regions", 0))
+        ai_title_regions = int(features.get("ai_title_regions", 0))
 
         if page_role == "toc":
             scores["toc_page"] = 0.98
@@ -462,12 +484,21 @@ class PageCaseClassifier:
             scores["multi_column"] += 0.9
         if page_family in {"table_page", "table_diagram_example"} or table_blocks >= 2 or table_ratio >= 0.28:
             scores["table_dominant"] += 0.9
+        if ai_table_regions >= 1:
+            scores["table_dominant"] += min(0.28, 0.12 * ai_table_regions)
         if figure_ratio >= 0.35 and text_ratio <= 0.35:
             scores["image_dominant"] += 0.82
         if page_family in {"body_with_diagram", "illustrated_label_page", "chart_label_page", "mixed_formula_annotation_page"}:
             scores["annotated_page"] += 0.88
+        if ai_chart_regions >= 1:
+            scores["annotated_page"] += min(0.22, 0.11 * ai_chart_regions)
         if visual_non_text >= 4 and int(features.get("short_label_lines", 0)) >= 4:
             scores["annotated_page"] += 0.12
+        if ai_formula_regions >= 1:
+            scores["annotated_page"] += 0.08
+            scores["mixed_blocks"] += 0.06
+        if ai_title_regions >= 1 and col_count >= 2 and text_ratio >= 0.35 and table_blocks == 0:
+            scores["double_column"] += 0.04
         if page_family in {"mixed_page", "mixed_dense_illustrated"}:
             scores["mixed_blocks"] += 0.82
         if text_ratio >= 0.45 and figure_ratio < 0.2:
@@ -544,11 +575,19 @@ class PageCaseClassifier:
         code_like_blocks = int(features.get("code_like_blocks", 0))
         reference_like_blocks = int(features.get("reference_like_blocks", 0))
         citation_like_blocks = int(features.get("citation_like_blocks", 0))
+        ai_table_regions = int(features.get("ai_table_regions", 0))
+        ai_chart_regions = int(features.get("ai_chart_regions", 0))
+        ai_formula_regions = int(features.get("ai_formula_regions", 0))
+        ai_title_regions = int(features.get("ai_title_regions", 0))
 
         if int(features.get("tableish_lines", 0)) >= 6:
             scores["table_page"] += 0.75
+        if ai_table_regions >= 1:
+            scores["table_page"] += min(0.25, 0.12 * ai_table_regions)
         if int(features.get("tableish_lines", 0)) >= 2 and short_native_labels >= 3 and equation_blocks >= 1:
             scores["table_diagram_example"] += 0.82
+        if ai_table_regions >= 1 and ai_formula_regions >= 1:
+            scores["table_diagram_example"] += 0.12
         if visual_non_text >= 1 and (short_native_labels >= 4 or short_label_lines >= 5):
             scores["illustrated_label_page"] += 0.8
         elif visual_non_text >= 1 and short_label_lines >= 4 and body_blocks >= 3:
@@ -565,6 +604,8 @@ class PageCaseClassifier:
             scores["chart_label_page"] += 0.78
             if figure_captions >= 1 and visual_non_text >= 5 and short_native_labels >= 3:
                 scores["chart_label_page"] += 0.08
+        if ai_chart_regions >= 1 and ai_title_regions >= 1:
+            scores["chart_label_page"] += 0.16
         if figure_captions >= 1:
             scores["body_with_figure"] += 0.45
         if major_non_text >= 1:
@@ -585,6 +626,8 @@ class PageCaseClassifier:
             scores["illustrated_label_page"] = max(0.0, scores["illustrated_label_page"] - 0.08)
         if body_blocks >= 1 and major_non_text >= 1 and equation_blocks >= 2 and short_native_labels >= 2:
             scores["mixed_formula_annotation_page"] += 0.84
+        if ai_formula_regions >= 1 and major_non_text >= 1:
+            scores["mixed_formula_annotation_page"] += 0.1
         if visual_non_text == 0 and reference_like_blocks >= 1 and body_blocks >= 1:
             scores["narrative_reference_page"] += 0.78
         if visual_non_text == 0 and citation_like_blocks >= 1 and body_blocks >= 1:

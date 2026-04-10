@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import ocr_server
+from scripts.metadata_explorer_builder import build_metadata_explorer
 
 
 def _ensure_clean_dir(path: Path):
@@ -204,6 +205,51 @@ def _write_page_payloads(pages, out_path: Path):
     )
 
 
+def _copy_source_page_images(pages, out_dir: Path):
+    for idx, page in enumerate(pages or []):
+        src = str((page or {}).get("source_image_path") or "").strip()
+        if not src:
+            continue
+        src_path = Path(src)
+        if not src_path.exists():
+            continue
+        page_num = int((page or {}).get("page") or (idx + 1))
+        shutil.copy2(src_path, out_dir / f"page_{page_num:03d}_original.png")
+
+
+def _render_reconstructed_page_images(pdf_path: Path, out_dir: Path):
+    if not pdf_path.exists():
+        return
+    doc = fitz.open(pdf_path)
+    try:
+        for idx in range(len(doc)):
+            pix = doc[idx].get_pixmap(dpi=150, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img.save(out_dir / f"page_{idx + 1:03d}_translated.png")
+    finally:
+        doc.close()
+
+
+def _write_side_by_side_images(out_dir: Path):
+    originals = sorted(out_dir.glob("page_*_original.png"))
+    for original in originals:
+        translated = out_dir / original.name.replace("_original.png", "_translated.png")
+        if not translated.exists():
+            continue
+        src_img = Image.open(original).convert("RGB")
+        rec_img = Image.open(translated).convert("RGB")
+        w = max(src_img.width, rec_img.width)
+        h = max(src_img.height, rec_img.height)
+        src_canvas = Image.new("RGB", (w, h), "white")
+        rec_canvas = Image.new("RGB", (w, h), "white")
+        src_canvas.paste(src_img, (0, 0))
+        rec_canvas.paste(rec_img, (0, 0))
+        side = Image.new("RGB", (w * 2, h), "white")
+        side.paste(src_canvas, (0, 0))
+        side.paste(rec_canvas, (w, 0))
+        side.save(out_dir / original.name.replace("_original.png", "_side_by_side.png"))
+
+
 def _write_extraction_overlay_pdf(pdf_path: Path, pages, out_pdf: Path):
     src = fitz.open(pdf_path)
     out = fitz.open()
@@ -351,15 +397,20 @@ async def main():
     source_pages = payload.get("source_pages")
     if isinstance(source_pages, list):
         _write_page_payloads(source_pages, payloads_dir / "source_pages.json")
+        _copy_source_page_images(source_pages, export_root)
     else:
         extracted_pages = copy.deepcopy(pages)
         _write_page_payloads(extracted_pages, payloads_dir / "source_pages.json")
+        _copy_source_page_images(extracted_pages, export_root)
     print("[export] writing translated payloads", flush=True)
     translated_pages = payload.get("translated_pages")
     if isinstance(translated_pages, list):
         _write_page_payloads(translated_pages, payloads_dir / "translated_pages.json")
     else:
         _write_page_payloads(pages, payloads_dir / "translated_pages.json")
+    _render_reconstructed_page_images(reconstructed_dir / f"{args.target_lang}_translated_reconstructed.pdf", export_root)
+    _write_side_by_side_images(export_root)
+    build_metadata_explorer(export_root)
     print("[export] reconstruction done", flush=True)
 
     manifest = {

@@ -36,6 +36,7 @@ from layout_ai_enricher import get_layout_ai_enricher
 UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'uploads', 'converted_pages', 'ocr_results'
 TARGET_DPI = 150 
 FONT_AI_AUDIT_DEFAULT = False
+EXTRACTION_AI_ENABLED = os.getenv("DOCS_PARSER_ENABLE_EXTRACTION_AI", "0") == "1"
 LAYOUT_OPTIMIZER_ON_TRANSLATION = os.getenv("LAYOUT_OPTIMIZER_ON_TRANSLATION", "0") == "1"
 OFFICE_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".odt", ".odp"}
 
@@ -106,6 +107,22 @@ def _safe_runtime_stem(filename: str) -> str:
         return "document"
     name = re.sub(r"[^\w.\-]+", "_", name)
     return name[:180] or "document"
+
+
+def _disabled_layout_ai_info():
+    return {
+        "enabled": False,
+        "ready": False,
+        "applied": False,
+        "bypassed": True,
+        "reason": "extraction_ai_bypassed",
+        "regions_added": 0,
+        "feature_flags": {},
+        "prediction_summary": {},
+        "load_error": None,
+        "predict_error": None,
+        "inference_rescaled": False,
+    }
 
 
 def _find_office_binary():
@@ -190,6 +207,10 @@ def _is_equation_like_text(text):
     if not s:
         return False
     words = re.findall(r"[a-zà-ÿ][a-zà-ÿ0-9'\-]*", s, flags=re.IGNORECASE)
+    # Pure lexical parenthetical notes like "(weights)" are editorial text,
+    # not formula overlays that should stay baked into the background.
+    if re.fullmatch(r"\([a-zà-ÿ][a-zà-ÿ0-9'\-\s]{0,32}\)", s, flags=re.IGNORECASE):
+        return False
     # Natural-language fragments with several lexical words are not equations,
     # even if they contain hyphens or punctuation.
     if len(words) >= 4 and not re.search(r"[=<>±×÷∑∫∞≈≠≤≥√∆∂µλΩα-ωΑ-Ω]", s):
@@ -236,8 +257,10 @@ def _is_immutable_inline_text(text):
     # Preserve visual list markers / numbering exactly from source.
     if re.fullmatch(r"[•▪◦·\-\*]", s):
         return True
-    if re.fullmatch(r"\d{1,2}[.)]?", s):
-        return True
+    # Plain page numbers / ordinal labels must be re-rendered as normal units,
+    # not frozen into the clean background.
+    if re.fullmatch(r"\d{1,3}[.)]?", s):
+        return False
     if _is_equation_like_text(s):
         return True
     if _contains_greek_or_symbol(s):
@@ -255,6 +278,53 @@ def _is_immutable_inline_text(text):
     return False
 
 
+def _span_is_monospace(span):
+    if not isinstance(span, dict):
+        return False
+    style = span.get("style") or {}
+    flags = style.get("flags") or {}
+    font_name = str(style.get("font") or "").strip().lower()
+    return bool(flags.get("monospace")) or "courier" in font_name
+
+
+def _looks_like_programming_code_text(text):
+    s = _normalize_spaces(text)
+    if not s:
+        return False
+    if re.search(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", s):
+        return True
+    if "=" in s and re.search(r"[A-Za-z_][A-Za-z0-9_]*", s):
+        return True
+    if re.search(r"\b(?:name|padding|stride|strides|filters?_[A-Za-z0-9_]+)\s*=\s*", s):
+        return True
+    if s.count(",") >= 2 and ("_" in s or "(" in s or ")" in s):
+        return True
+    return False
+
+
+def _phrase_is_immutable_programming_code(block, line, phrase):
+    if not isinstance(phrase, dict):
+        return False
+    text = _normalize_spaces(
+        phrase.get("text")
+        or phrase.get("texte")
+        or ""
+    )
+    if not text:
+        return False
+    unit_types = {
+        str((node or {}).get("unit_type") or "").strip().lower()
+        for node in (block, line, phrase)
+        if isinstance(node, dict)
+    }
+    if "code_visible" in unit_types:
+        return True
+    spans = phrase.get("spans") or []
+    if any(_span_is_monospace(span) for span in spans) and _looks_like_programming_code_text(text):
+        return True
+    return False
+
+
 def _extract_immutable_overlays(blocks, pil_img, filename, page_idx):
     overlays = []
     if pil_img is None:
@@ -262,9 +332,50 @@ def _extract_immutable_overlays(blocks, pil_img, filename, page_idx):
     img_w, img_h = pil_img.size
     seen = set()
     n = 0
+
+    def _save_overlay(bb, txt, reason):
+        nonlocal n
+        if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+            return None
+        x0, y0, x1, y1 = [int(float(v)) for v in bb]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(img_w, x1), min(img_h, y1)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        sig = (x0, y0, x1, y1, txt, reason)
+        if sig in seen:
+            return None
+        seen.add(sig)
+        n += 1
+        out_name = f"immutable_{filename}_{page_idx}_{n}.png"
+        out_path = os.path.join(RESULTS_DIR, out_name)
+        try:
+            crop = pil_img.crop((x0, y0, x1, y1))
+            crop.save(out_path)
+        except Exception:
+            return None
+        return {
+            "bbox": [x0, y0, x1, y1],
+            "path": out_path,
+            "url": f"/results/{out_name}",
+            "text": txt,
+            "reason": reason,
+        }
+
     for block in blocks:
         for line in block.get("lines", []):
             for phrase in line.get("phrases", []):
+                phrase_text = (phrase.get("text") or phrase.get("texte") or "").strip()
+                phrase_bbox = phrase.get("bbox") or line.get("bbox") or block.get("bbox")
+                if _phrase_is_immutable_programming_code(block, line, phrase):
+                    overlay = _save_overlay(phrase_bbox, phrase_text, "immutable_code")
+                    if overlay:
+                        overlays.append(overlay)
+                        for sp in phrase.get("spans", []) or []:
+                            if isinstance(sp, dict):
+                                sp["skip_render"] = True
+                        phrase["render_mode"] = "background_only"
+                    continue
                 spans = phrase.get("spans", [])
                 immutable_spans = []
                 for sp in spans:
@@ -274,32 +385,10 @@ def _extract_immutable_overlays(blocks, pil_img, filename, page_idx):
                         continue
                     if not _is_immutable_inline_text(txt):
                         continue
-                    x0, y0, x1, y1 = [int(float(v)) for v in bb]
-                    x0, y0 = max(0, x0), max(0, y0)
-                    x1, y1 = min(img_w, x1), min(img_h, y1)
-                    if x1 <= x0 or y1 <= y0:
+                    overlay = _save_overlay(bb, txt, "immutable_inline")
+                    if not overlay:
                         continue
-                    sig = (x0, y0, x1, y1, txt)
-                    if sig in seen:
-                        continue
-                    seen.add(sig)
-                    n += 1
-                    out_name = f"immutable_{filename}_{page_idx}_{n}.png"
-                    out_path = os.path.join(RESULTS_DIR, out_name)
-                    try:
-                        crop = pil_img.crop((x0, y0, x1, y1))
-                        crop.save(out_path)
-                    except Exception:
-                        continue
-                    overlays.append(
-                        {
-                            "bbox": [x0, y0, x1, y1],
-                            "path": out_path,
-                            "url": f"/results/{out_name}",
-                            "text": txt,
-                            "reason": "immutable_inline",
-                        }
-                    )
+                    overlays.append(overlay)
                     sp["skip_render"] = True
                     immutable_spans.append(sp)
                 if spans and len(immutable_spans) == len(spans):
@@ -696,13 +785,221 @@ def _annotate_translation_contracts(blocks, page_context=None):
         inherited["render_policy"] = parent_policy.get("render_policy")
         return inherited
 
+    def _span_flags(span):
+        style = span.get("style") if isinstance(span.get("style"), dict) else {}
+        flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
+        return {name: bool(flags.get(name)) for name in ["bold", "italic", "underline", "highlight", "uppercase", "monospace", "serif"]}
+
+    def _inline_reference_like(text):
+        s = _normalize_spaces(text)
+        if not s:
+            return False
+        return bool(re.search(r"(https?://|www\.|[\w\.-]+@[\w\.-]+\.\w+|doi:\s*|arxiv:|^\[\d+\]$|^\(\d+\)$)", s, flags=re.IGNORECASE))
+
+    def _inline_technical_like(text):
+        s = _normalize_spaces(text)
+        if not s:
+            return False
+        if re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\b", s):
+            return True
+        if re.search(r"\b[A-Za-z]+Net\b|\b[A-Za-z]+GAN\b|\bYOLOv?\d*\b|\bResNet\d*\b|\bAlexNet\b|\bVGG\d*\b", s):
+            return True
+        if re.search(r"\b[a-z]+[A-Z][A-Za-z0-9]*\b", s):
+            return True
+        return False
+
+    def _infer_expression_inline_class(span):
+        text = _normalize_spaces(span.get("text") or span.get("texte") or "")
+        unit_type = _normalize_spaces(span.get("unit_type") or "").lower()
+        flags = _span_flags(span)
+        if unit_type == "code_visible" or _looks_like_programming_code_text(text):
+            return "code"
+        if unit_type in {"reference_link", "citation"} or _inline_reference_like(text):
+            return "reference"
+        if unit_type in {"formula", "formula_label"}:
+            return "formula"
+        # Micro-symboles mathématiques : lettre grecque isolée, opérateur math, variable courte
+        # avec exposant/indice — traités comme formule pour ne pas se perdre dans le flux
+        if text and len(text) <= 6:
+            if re.fullmatch(r"[α-ωΑ-Ωα-ωµ][\u2080-\u2089\u00B2\u00B3\u00B9]?", text):
+                return "formula"
+            if re.fullmatch(r"[∑∫∞≈≠≤≥√∆∂±×÷⊕⊗∈∉∩∪⊂⊃∀∃∇]", text):
+                return "formula"
+            if re.search(r"[α-ωΑ-Ωα-ωµ∑∫∞≈≠≤≥√∆∂±×÷]", text) and len(re.findall(r"[A-Za-z0-9]", text)) <= 3:
+                return "formula"
+        if flags.get("monospace") or _inline_technical_like(text):
+            return "technical_inline"
+        if unit_type in {"diagram_label", "chart_label", "short_label"}:
+            return "label"
+        return "plain_text"
+
+    def _expression_emphasis_level(span):
+        flags = _span_flags(span)
+        if flags.get("highlight") or flags.get("bold"):
+            return "strong"
+        if flags.get("italic") or flags.get("underline") or flags.get("uppercase"):
+            return "moderate"
+        return "neutral"
+
+    def _style_signature(span):
+        style = span.get("style") if isinstance(span.get("style"), dict) else {}
+        flags = _span_flags(span)
+        size = style.get("size")
+        try:
+            size = round(float(size), 1) if size not in {None, ""} else None
+        except Exception:
+            size = None
+        active_flags = tuple(sorted(name for name, enabled in flags.items() if enabled))
+        return (
+            str(style.get("font") or ""),
+            size,
+            str(style.get("color") or ""),
+            active_flags,
+        )
+
+    def _neighbor_relation(current, neighbor):
+        if not isinstance(neighbor, dict):
+            return {"exists": False}
+        cur_sem = current.get("expression_semantics") if isinstance(current.get("expression_semantics"), dict) else {}
+        nxt_sem = neighbor.get("expression_semantics") if isinstance(neighbor.get("expression_semantics"), dict) else {}
+        same_inline = cur_sem.get("inline_class") == nxt_sem.get("inline_class")
+        same_style = _style_signature(current) == _style_signature(neighbor)
+        relation = "continuation"
+        if same_inline and not same_style:
+            relation = "emphasis_shift"
+        elif not same_inline:
+            relation = "semantic_shift"
+        return {
+            "exists": True,
+            "neighbor_id": neighbor.get("unit_id"),
+            "neighbor_text": _normalize_spaces(neighbor.get("text") or neighbor.get("texte") or ""),
+            "relation": relation,
+            "continuation": bool(same_inline),
+            "same_inline_class": bool(same_inline),
+            "same_style": bool(same_style),
+        }
+
+    def _editorial_flow_class(unit):
+        role_local = _normalize_spaces(unit.get("role") or "").lower()
+        render_policy_local = _normalize_spaces(unit.get("render_policy") or "").lower()
+        unit_type_local = _normalize_spaces(unit.get("unit_type") or "").lower()
+        if render_policy_local == "background_only":
+            return "protected_visual"
+        if role_local in {"section_heading", "title", "header", "footer"}:
+            return "heading_like"
+        if role_local in {"diagram_label", "diagram_text_label", "chart_label"}:
+            return "anchored_annotation"
+        if role_local == "figure_caption":
+            return "caption"
+        if unit_type_local in {"reference_link", "citation"}:
+            return "reference_run"
+        return "editorial_body"
+
+    def _editorial_semantics(unit):
+        flow_class = _editorial_flow_class(unit)
+        render_policy_local = _normalize_spaces(unit.get("render_policy") or "").lower()
+        return {
+            "flow_class": flow_class,
+            "reflowable": bool(render_policy_local not in {"background_only", "exact_preserve"}),
+            "anchored_annotation": bool(flow_class == "anchored_annotation"),
+            "heading_like": bool(flow_class == "heading_like"),
+            "protected_visual": bool(flow_class == "protected_visual"),
+            "caption_like": bool(flow_class == "caption"),
+        }
+
+    def _structural_context(unit_level, unit, parent=None, block=None, line=None):
+        ctx = {
+            "level": unit_level,
+            "unit_id": unit.get("unit_id"),
+            "parent_unit_id": parent.get("unit_id") if isinstance(parent, dict) else None,
+            "block_unit_id": block.get("unit_id") if isinstance(block, dict) else None,
+            "line_unit_id": line.get("unit_id") if isinstance(line, dict) else None,
+        }
+        if unit_level == "block":
+            ctx["child_line_count"] = len(unit.get("lines", []) or [])
+            ctx["child_semantic_phrase_count"] = len(unit.get("semantic_phrases", []) or [])
+        elif unit_level == "line":
+            ctx["child_phrase_count"] = len(unit.get("phrases", []) or [])
+            ctx["line_index"] = unit.get("line_index")
+        elif unit_level == "semantic_phrase":
+            ctx["child_span_count"] = len(unit.get("spans", []) or [])
+            ctx["start_line_index"] = unit.get("start_line_index")
+            ctx["end_line_index"] = unit.get("end_line_index")
+            ctx["line_indices"] = list(unit.get("line_indices", []) or [])
+        elif unit_level == "phrase":
+            ctx["child_span_count"] = len(unit.get("spans", []) or [])
+            ctx["line_index"] = unit.get("line_index")
+        elif unit_level == "span":
+            ctx["line_index"] = line.get("line_index") if isinstance(line, dict) else None
+        return ctx
+
+    def _block_gap(current, previous):
+        try:
+            cb = current.get("bbox") or [0, 0, 0, 0]
+            pb = previous.get("bbox") or [0, 0, 0, 0]
+            return max(0.0, float(cb[1]) - float(pb[3]))
+        except Exception:
+            return 0.0
+
+    def _x_anchor_delta(current, previous):
+        try:
+            cx = float((current.get("bbox") or [0, 0, 0, 0])[0])
+            px = float((previous.get("bbox") or [0, 0, 0, 0])[0])
+            return abs(cx - px)
+        except Exception:
+            return 0.0
+
+    def _editorial_relation(current, previous, hard_break=False):
+        if not isinstance(previous, dict):
+            return {"exists": False}
+        current_sem = current.get("editorial_semantics") if isinstance(current.get("editorial_semantics"), dict) else _editorial_semantics(current)
+        previous_sem = previous.get("editorial_semantics") if isinstance(previous.get("editorial_semantics"), dict) else _editorial_semantics(previous)
+        relation = "separate"
+        continuation = False
+        if previous_sem.get("heading_like") and current_sem.get("flow_class") == "editorial_body":
+            relation = "heading_to_body"
+            continuation = True
+        elif current_sem.get("flow_class") == "editorial_body" and previous_sem.get("flow_class") == "editorial_body":
+            if hard_break:
+                relation = "paragraph_break"
+            else:
+                relation = "paragraph_continuation"
+                continuation = True
+        elif current_sem.get("caption_like") and previous_sem.get("anchored_annotation"):
+            relation = "annotation_to_caption"
+        elif current_sem.get("anchored_annotation") and previous_sem.get("anchored_annotation"):
+            relation = "annotation_cluster"
+            continuation = True
+        elif current_sem.get("caption_like") and previous_sem.get("caption_like"):
+            relation = "caption_continuation"
+            continuation = True
+        return {
+            "exists": True,
+            "neighbor_id": previous.get("unit_id"),
+            "neighbor_role": previous.get("role"),
+            "relation": relation,
+            "continuation": bool(continuation),
+            "gap_px": round(_block_gap(current, previous), 2),
+            "x_anchor_delta_px": round(_x_anchor_delta(current, previous), 2),
+            "hard_break": bool(hard_break),
+        }
+
     for b_idx, block in enumerate(blocks or []):
         role = block.get("role", "body")
-        source = block.get("source", "ocr")
+        source = str(block.get("source") or "").strip().lower()
+        source_kind_hint = str(block.get("source_kind") or "").strip().lower()
+        if not source:
+            if source_kind_hint.startswith("native_"):
+                source = "native"
+            elif source_kind_hint.startswith("ocr_"):
+                source = "ocr"
+            else:
+                source = "ocr"
         source_kind = block.get("source_kind") or ("native_block" if source == "native" else "ocr_block")
         text = block.get("text") or _block_text(block)
         policy = classify_text(text, role, source_kind)
         block["unit_id"] = block.get("id") or f"blk_{b_idx}"
+        block["source"] = source
         block["source_kind"] = source_kind
         block["text"] = text
         block["text_normalized"] = _normalize_spaces(text)
@@ -711,12 +1008,32 @@ def _annotate_translation_contracts(blocks, page_context=None):
         block["translation_strategy"] = policy["translation_strategy"]
         block["coverage_required"] = policy["coverage_required"]
         block["render_policy"] = policy["render_policy"]
+        block["editorial_semantics"] = _editorial_semantics(block)
+        block["structural_context"] = _structural_context("block", block, parent=None, block=block)
+        for sp_idx, semantic_phrase in enumerate(block.get("semantic_phrases", []) or []):
+            sp_txt = _normalize_spaces(semantic_phrase.get("texte") or _phrase_render_text(semantic_phrase))
+            sp_kind = semantic_phrase.get("source_kind") or ("native_semantic_phrase" if source == "native" else "ocr_semantic_phrase")
+            sp_policy = classify_text(sp_txt, role, sp_kind)
+            sp_policy = inherit_reference_policy(block.get("unit_type"), policy, sp_policy)
+            semantic_phrase["unit_id"] = semantic_phrase.get("sentence_id") or f"{block['unit_id']}:semantic_phrase:{sp_idx}"
+            semantic_phrase["source"] = str(semantic_phrase.get("source") or source).strip().lower() or source
+            semantic_phrase["source_kind"] = sp_kind
+            semantic_phrase["text"] = _phrase_render_text(semantic_phrase) or sp_txt
+            semantic_phrase["text_normalized"] = _normalize_spaces(semantic_phrase["text"])
+            semantic_phrase["translatable"] = bool(sp_policy["translatable"])
+            semantic_phrase["unit_type"] = sp_policy.get("unit_type") or ""
+            semantic_phrase["translation_strategy"] = sp_policy["translation_strategy"]
+            semantic_phrase["coverage_required"] = sp_policy["coverage_required"]
+            semantic_phrase["render_policy"] = sp_policy["render_policy"]
+            semantic_phrase["editorial_semantics"] = _editorial_semantics(semantic_phrase)
+            semantic_phrase["structural_context"] = _structural_context("semantic_phrase", semantic_phrase, parent=block, block=block)
         for l_idx, line in enumerate(block.get("lines", []) or []):
             l_txt = line.get("line_text") or _line_phrase_text(line)
             l_kind = line.get("source_kind") or ("native_line" if source == "native" else "ocr_line")
             l_policy = classify_text(l_txt, role, l_kind)
             l_policy = inherit_reference_policy(block.get("unit_type"), policy, l_policy)
             line["unit_id"] = f"{block['unit_id']}:line:{l_idx}"
+            line["source"] = str(line.get("source") or source).strip().lower() or source
             line["source_kind"] = l_kind
             line["text"] = l_txt
             line["text_normalized"] = _normalize_spaces(l_txt)
@@ -725,6 +1042,8 @@ def _annotate_translation_contracts(blocks, page_context=None):
             line["translation_strategy"] = l_policy["translation_strategy"]
             line["coverage_required"] = l_policy["coverage_required"]
             line["render_policy"] = l_policy["render_policy"]
+            line["editorial_semantics"] = _editorial_semantics(line)
+            line["structural_context"] = _structural_context("line", line, parent=block, block=block, line=line)
             for p_idx, phrase in enumerate(line.get("phrases", []) or []):
                 p_render_txt = _phrase_render_text(phrase)
                 p_txt = _normalize_spaces(phrase.get("texte") or p_render_txt)
@@ -732,6 +1051,7 @@ def _annotate_translation_contracts(blocks, page_context=None):
                 p_policy = classify_text(p_txt, role, p_kind)
                 p_policy = inherit_reference_policy(line.get("unit_type") or block.get("unit_type"), l_policy, p_policy)
                 phrase["unit_id"] = f"{line['unit_id']}:phrase:{p_idx}"
+                phrase["source"] = str(phrase.get("source") or line.get("source") or source).strip().lower() or source
                 phrase["source_kind"] = p_kind
                 phrase["text"] = p_render_txt
                 phrase["text_normalized"] = _normalize_spaces(p_render_txt)
@@ -740,19 +1060,77 @@ def _annotate_translation_contracts(blocks, page_context=None):
                 phrase["translation_strategy"] = p_policy["translation_strategy"]
                 phrase["coverage_required"] = p_policy["coverage_required"]
                 phrase["render_policy"] = p_policy["render_policy"]
+                phrase["editorial_semantics"] = _editorial_semantics(phrase)
+                phrase["structural_context"] = _structural_context("phrase", phrase, parent=line, block=block, line=line)
                 for s_idx, span in enumerate(phrase.get("spans", []) or []):
                     s_txt = _normalize_spaces(span.get("texte", ""))
                     s_kind = span.get("source_kind") or ("native_span" if source == "native" else "ocr_span")
                     s_policy = classify_text(s_txt, role, s_kind)
                     s_policy = inherit_reference_policy(phrase.get("unit_type") or line.get("unit_type") or block.get("unit_type"), p_policy, s_policy)
                     span["unit_id"] = f"{phrase['unit_id']}:span:{s_idx}"
+                    span["source"] = str(span.get("source") or phrase.get("source") or line.get("source") or source).strip().lower() or source
                     span["source_kind"] = s_kind
+                    span["text"] = s_txt
                     span["text_normalized"] = s_txt
                     span["translatable"] = bool(s_policy["translatable"])
                     span["unit_type"] = s_policy.get("unit_type") or ""
                     span["translation_strategy"] = s_policy["translation_strategy"]
                     span["coverage_required"] = s_policy["coverage_required"]
                     span["render_policy"] = s_policy["render_policy"]
+                    inline_class = _infer_expression_inline_class(span)
+                    emphasis_flags = _span_flags(span)
+                    protected_inline = (
+                        (not bool(span.get("translatable")))
+                        or inline_class in {"code", "reference", "formula"}
+                        or str(span.get("translation_strategy") or "").strip().lower() in {"exact_preserve", "keep_original", "background_only"}
+                    )
+                    span["expression_semantics"] = {
+                        "inline_class": inline_class,
+                        "protected_inline": bool(protected_inline),
+                        "immutable_inline": bool(protected_inline and inline_class in {"code", "reference", "formula"}),
+                        "technical_inline": bool(inline_class == "technical_inline"),
+                        "emphasis_level": _expression_emphasis_level(span),
+                        "emphasis_flags": emphasis_flags,
+                    }
+                    span["structural_context"] = _structural_context("span", span, parent=phrase, block=block, line=line)
+                phrase_spans = phrase.get("spans", []) or []
+                for s_idx, span in enumerate(phrase_spans):
+                    previous_span = phrase_spans[s_idx - 1] if s_idx > 0 else None
+                    next_span = phrase_spans[s_idx + 1] if s_idx + 1 < len(phrase_spans) else None
+                    span["expression_relations"] = {
+                        "with_previous": _neighbor_relation(span, previous_span),
+                        "with_next": _neighbor_relation(span, next_span),
+                    }
+
+        semantic_phrase_list = block.get("semantic_phrases", []) or []
+        for sp_idx, semantic_phrase in enumerate(semantic_phrase_list):
+            previous_phrase = semantic_phrase_list[sp_idx - 1] if sp_idx > 0 else None
+            next_phrase = semantic_phrase_list[sp_idx + 1] if sp_idx + 1 < len(semantic_phrase_list) else None
+            hard_break_before = bool(sp_idx == 0 or (semantic_phrase.get("start_line_index", 0) != (previous_phrase or {}).get("end_line_index", -1) + 1))
+            next_hard_break = bool((next_phrase or {}).get("start_line_index", 0) != semantic_phrase.get("end_line_index", 0) + 1) if isinstance(next_phrase, dict) else False
+            semantic_phrase["editorial_relations"] = {
+                "with_previous": _editorial_relation(semantic_phrase, previous_phrase, hard_break=hard_break_before),
+                "with_next": _editorial_relation(next_phrase, semantic_phrase, hard_break=next_hard_break) if isinstance(next_phrase, dict) else {"exists": False},
+            }
+
+        line_list = block.get("lines", []) or []
+        for l_idx, line in enumerate(line_list):
+            previous_line = line_list[l_idx - 1] if l_idx > 0 else None
+            next_line = line_list[l_idx + 1] if l_idx + 1 < len(line_list) else None
+            hard_break_before = bool(line.get("hard_break_before", False))
+            next_hard_break = bool(next_line.get("hard_break_before", False)) if isinstance(next_line, dict) else False
+            line["editorial_relations"] = {
+                "with_previous": _editorial_relation(line, previous_line, hard_break=hard_break_before),
+                "with_next": _editorial_relation(next_line, line, hard_break=next_hard_break) if isinstance(next_line, dict) else {"exists": False},
+            }
+
+    for b_idx, block in enumerate(blocks or []):
+        previous_block = blocks[b_idx - 1] if b_idx > 0 else None
+        next_block = blocks[b_idx + 1] if b_idx + 1 < len(blocks) else None
+        block["editorial_relations"] = {
+            "with_previous": _editorial_relation(block, previous_block, hard_break=False),
+            "with_next": _editorial_relation(next_block, block, hard_break=False) if isinstance(next_block, dict) else {"exists": False},
+        }
 
 
 def _detect_leading_marker(text):
@@ -830,6 +1208,780 @@ def _enrich_layout_markers(blocks):
         block["paragraph_break_before"] = paragraph_break_before
 
 
+def _semantic_fragment_spans_for_line(line, fragment_bbox):
+    spans = []
+    if not isinstance(fragment_bbox, (list, tuple)) or len(fragment_bbox) != 4:
+        return spans
+    frag_rect = fitz.Rect(fragment_bbox)
+    for phrase in line.get("phrases", []) or []:
+        pbb = phrase.get("bbox")
+        if not isinstance(pbb, (list, tuple)) or len(pbb) != 4:
+            continue
+        p_rect = fitz.Rect(pbb)
+        overlap = (frag_rect & p_rect).get_area()
+        if overlap <= 0 and not frag_rect.intersects(p_rect):
+            continue
+        phrase_spans = phrase.get("spans", []) or []
+        if phrase_spans:
+            for sp in phrase_spans:
+                spans.append(copy.deepcopy(sp))
+        else:
+            spans.append(
+                {
+                    "texte": _normalize_spaces(phrase.get("texte", "")),
+                    "bbox": phrase.get("bbox"),
+                    "style": copy.deepcopy(phrase.get("style", {})) if isinstance(phrase.get("style"), dict) else {},
+                }
+            )
+    return spans
+
+
+def _approximate_line_words_from_text(line):
+    text = _normalize_spaces(line.get("line_text") or line.get("text") or "")
+    bb = line.get("bbox")
+    if not text or not isinstance(bb, (list, tuple)) or len(bb) != 4:
+        return []
+    x0, y0, x1, y1 = [float(v) for v in bb]
+    tokens = text.split()
+    if not tokens:
+        return []
+    total_chars = max(1, sum(len(tok) for tok in tokens) + max(0, len(tokens) - 1))
+    cursor = x0
+    words = []
+    for idx, token in enumerate(tokens):
+        token_chars = len(token)
+        token_w = max(4.0, (x1 - x0) * (token_chars / total_chars))
+        words.append(
+            {
+                "label": token,
+                "bbox": [cursor, y0, min(x1, cursor + token_w), y1],
+                "score": float(line.get("ocr_confidence_mean", 0.0) or 0.0),
+            }
+        )
+        cursor = min(x1, cursor + token_w + max(2.0, (x1 - x0) * (1.0 / total_chars)))
+    return words
+
+
+def _split_line_text_into_sentence_chunks(text):
+    s = _normalize_spaces(text or "")
+    if not s:
+        return []
+    chunks = []
+    start = 0
+    _SENT_END_RE = re.compile(r'[.!?\u2026]+[\u201d\u2019"\')\]}\u00bb]*')
+    for match in _SENT_END_RE.finditer(s):
+        end = match.end()
+        chunk_text = s[start:end].strip()
+        if not chunk_text:
+            continue
+        last_token = chunk_text.split()[-1] if chunk_text.split() else ""
+        next_part = s[end:]
+        if _is_abbreviation_token(last_token):
+            continue
+        if next_part and not re.match(r'^\s+[A-Z\u201c\u2018"\'(\[]', next_part) and next_part.strip():
+            continue
+        chunks.append({"text": chunk_text, "start": start, "end": end, "ends_sentence": True})
+        start = end
+        while start < len(s) and s[start].isspace():
+            start += 1
+    if start < len(s):
+        tail = s[start:].strip()
+        if tail:
+            tail_start = s.find(tail, start)
+            chunks.append({"text": tail, "start": max(start, tail_start), "end": max(start, tail_start) + len(tail), "ends_sentence": False})
+
+    # Découpage doux pour les lignes académiques denses sans ponctuation terminale :
+    # si une seule chunk reste et dépasse 40 mots, on tente de couper à une frontière naturelle
+    # (point-virgule, deux-points suivi de majuscule, virgule devant conjonction).
+    # Cela évite les spans gloutons sur les paragraphes académiques continus.
+    if len(chunks) == 1 and not chunks[0].get("ends_sentence"):
+        chunk_text = chunks[0]["text"]
+        words = chunk_text.split()
+        if len(words) > 20:
+            # Cherche un point de coupe naturel autour du milieu du texte
+            mid = len(chunk_text) // 2
+            best_pos = None
+            # Priorité : "; " ou ": [A-Z]" près du milieu
+            for m in re.finditer(r";[ ]|:[ ][A-Z]|,[ ](and|or|but|while|whereas|however|although|yet)\b", chunk_text, flags=re.IGNORECASE):
+                pos = m.start() + 1  # coupe après le signe de ponctuation
+                if best_pos is None or abs(pos - mid) < abs(best_pos - mid):
+                    best_pos = pos
+            if best_pos and best_pos > 10 and best_pos < len(chunk_text) - 10:
+                part1 = chunk_text[:best_pos].strip()
+                part2 = chunk_text[best_pos:].strip()
+                if part1 and part2:
+                    orig_start = chunks[0]["start"]
+                    chunks = [
+                        {"text": part1, "start": orig_start, "end": orig_start + best_pos, "ends_sentence": False},
+                        {"text": part2, "start": orig_start + best_pos, "end": orig_start + len(chunk_text), "ends_sentence": False},
+                    ]
+    return chunks
+
+
+def _approximate_text_fragment_bbox(line_bbox, full_text, start, end):
+    bb = _clean_bbox(line_bbox)
+    if not bb:
+        return [0, 0, 0, 0]
+    x0, y0, x1, y1 = bb
+    content = _normalize_spaces(full_text or "")
+    total = max(1, len(content))
+    start = max(0, min(int(start or 0), total - 1))
+    end = max(start + 1, min(int(end or total), total))
+    fx0 = x0 + (x1 - x0) * (start / total)
+    fx1 = x0 + (x1 - x0) * (end / total)
+    return [int(round(fx0)), int(round(y0)), int(round(max(fx0 + 4.0, fx1))), int(round(y1))]
+
+
+def _make_semantic_phrase(block, sentence_index, sentence_fragments, end_reason=""):
+    fragments_in = [frag for frag in (sentence_fragments or []) if _normalize_spaces(frag.get("text") or "")]
+    if not fragments_in:
+        return None
+    text = ""
+    for frag in fragments_in:
+        text = _append_fragment(text, frag.get("text") or "")
+    text = _normalize_spaces(text)
+    if not text:
+        return None
+    bbox = [
+        int(min(float(frag["bbox"][0]) for frag in fragments_in)),
+        int(min(float(frag["bbox"][1]) for frag in fragments_in)),
+        int(max(float(frag["bbox"][2]) for frag in fragments_in)),
+        int(max(float(frag["bbox"][3]) for frag in fragments_in)),
+    ]
+    fragments = []
+    spans = []
+    line_indices = []
+    confidence_values = []
+    for frag_index, frag in enumerate(fragments_in):
+        frag_text = _normalize_spaces(frag.get("text") or "")
+        frag_bbox = list(frag.get("bbox") or [0, 0, 0, 0])
+        line_obj = frag.get("line") or {}
+        line_index = int(frag.get("line_index", 0) or 0)
+        line_indices.append(line_index)
+        if line_obj.get("ocr_confidence_mean") is not None:
+            confidence_values.append(float(line_obj.get("ocr_confidence_mean", 0.0) or 0.0))
+        fragment_spans = _semantic_fragment_spans_for_line(line_obj, frag_bbox)
+        if fragment_spans:
+            spans.extend(fragment_spans)
+        fragments.append(
+            {
+                "fragment_index": frag_index,
+                "line_index": line_index,
+                "text": frag_text,
+                "bbox": frag_bbox,
+                "word_count": int(_text_statistics(frag_text).get("word_count", 0) or 0),
+                "source_line_text": line_obj.get("line_text", ""),
+            }
+        )
+    if not spans:
+        spans = [{"texte": text, "bbox": bbox, "style": {}}]
+    line_indices = sorted(set(line_indices))
+    return {
+        "texte": text,
+        "text": text,
+        "bbox": bbox,
+        "spans": spans,
+        "fragments": fragments,
+        "source": str(block.get("source") or "ocr"),
+        "source_kind": "ocr_semantic_phrase",
+        "sentence_index": int(sentence_index),
+        "start_line_index": int(line_indices[0]) if line_indices else 0,
+        "end_line_index": int(line_indices[-1]) if line_indices else 0,
+        "line_indices": line_indices,
+        "multi_line": bool(len(line_indices) > 1),
+        "fragment_count": len(fragments),
+        "ocr_word_count": int(_text_statistics(text).get("word_count", 0) or 0),
+        "ocr_confidence_mean": float(np.mean(confidence_values)) if confidence_values else 0.0,
+        "ocr_confidence_min": float(np.min(confidence_values)) if confidence_values else 0.0,
+        "sentence_end_reason": end_reason or "eof",
+    }
+
+
+_MAX_SEMANTIC_PHRASE_WORDS = 50  # plafond anti-span-glouton pour les blocs denses
+
+
+def _build_semantic_phrases_for_block(block):
+    existing_semantic_phrases = copy.deepcopy(block.get("semantic_phrases") or [])
+    lines = sorted(
+        [ln for ln in (block.get("lines") or []) if isinstance(ln, dict)],
+        key=lambda ln: (int(ln.get("line_index", 0) or 0), float((ln.get("bbox") or [0, 0, 0, 0])[1])),
+    )
+    semantic_phrases = []
+    current_fragments = []
+    sentence_index = 0
+    current_text = ""
+
+    def flush(end_reason=""):
+        nonlocal current_fragments, sentence_index, current_text
+        phrase = _make_semantic_phrase(block, sentence_index, current_fragments, end_reason=end_reason)
+        current_fragments = []
+        current_text = ""
+        if phrase:
+            semantic_phrases.append(phrase)
+            sentence_index += 1
+
+    def _current_word_count():
+        return len(re.findall(r"\S+", current_text))
+
+    for line_pos, line in enumerate(lines):
+        line_text = _normalize_spaces(line.get("line_text") or line.get("text") or "")
+        previous_line = lines[line_pos - 1] if line_pos > 0 else None
+        if current_fragments and bool(line.get("hard_break_before", False)) and _semantic_phrase_should_break_on_hard_boundary(current_text, line, previous_line):
+            flush(end_reason="hard_break_before")
+        # Plafond anti-glouton : si la phrase en cours dépasse MAX mots, on flush
+        # au prochain saut de ligne même sans ponctuation terminale.
+        # Cela casse les paragraphes académiques longs en unités exploitables.
+        elif current_fragments and _current_word_count() >= _MAX_SEMANTIC_PHRASE_WORDS:
+            flush(end_reason="word_count_cap")
+        if not line_text:
+            continue
+        line_chunks = _split_line_text_into_sentence_chunks(line_text)
+        if not line_chunks:
+            line_chunks = [{"text": line_text, "start": 0, "end": len(line_text), "ends_sentence": False}]
+        for chunk in line_chunks:
+            current_text = _append_fragment(current_text, chunk.get("text") or "")
+            current_fragments.append(
+                {
+                    "line_index": int(line.get("line_index", line_pos) or line_pos),
+                    "line": line,
+                    "text": chunk.get("text") or "",
+                    "bbox": _approximate_text_fragment_bbox(line.get("bbox"), line_text, chunk.get("start", 0), chunk.get("end", len(line_text))),
+                }
+            )
+            if bool(chunk.get("ends_sentence")):
+                flush(end_reason="terminal_punctuation")
+
+    if current_fragments:
+        flush(end_reason="eof")
+
+    if not semantic_phrases and existing_semantic_phrases:
+        semantic_phrases = existing_semantic_phrases
+
+    for semantic_phrase in semantic_phrases:
+        sentence_id = f"{block.get('id') or block.get('unit_id') or 'block'}:semantic_phrase:{semantic_phrase.get('sentence_index', 0)}"
+        semantic_phrase["sentence_id"] = sentence_id
+        for frag in semantic_phrase.get("fragments", []) or []:
+            frag["sentence_id"] = sentence_id
+    block["semantic_phrases"] = semantic_phrases
+    block["semantic_phrase_count"] = len(semantic_phrases)
+
+
+def _build_semantic_phrases_for_blocks(blocks):
+    for block in blocks or []:
+        _build_semantic_phrases_for_block(block)
+
+
+def _semantic_span_style_signature(span):
+    style = span.get("style") if isinstance(span.get("style"), dict) else {}
+    flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
+    try:
+        size = round(float(style.get("size")), 1) if style.get("size") not in {None, ""} else None
+    except Exception:
+        size = None
+    return (
+        str(style.get("font") or ""),
+        size,
+        str(style.get("color") or ""),
+        tuple(sorted(name for name, enabled in flags.items() if enabled)),
+    )
+
+
+def _semantic_span_ends_sentence(text):
+    s = _normalize_spaces(text or "")
+    if not s:
+        return False
+    return bool(re.search(r'[.!?\u2026]+[\u201d\u2019"\')\]}\u00bb]*$', s)) and not _is_abbreviation_token(s.split()[-1] if s.split() else s)
+
+
+def _build_semantic_spans_for_block(block):
+    existing_semantic_spans = copy.deepcopy(block.get("semantic_spans") or [])
+    flat_spans = []
+    for line in sorted(block.get("lines", []) or [], key=lambda ln: int(ln.get("line_index", 0) or 0)):
+        line_index = int(line.get("line_index", 0) or 0)
+        line_phrases = line.get("phrases", []) or []
+        for phrase_index, phrase in enumerate(line_phrases):
+            phrase_spans = phrase.get("spans", []) or []
+            if not phrase_spans:
+                text = _normalize_spaces(phrase.get("texte") or phrase.get("text") or "")
+                if text and isinstance(phrase.get("bbox"), (list, tuple)) and len(phrase.get("bbox")) == 4:
+                    phrase_spans = [{
+                        "texte": text,
+                        "text": text,
+                        "bbox": phrase.get("bbox"),
+                        "style": {},
+                        "source_kind": "synthetic_phrase_span",
+                        "phrase_unit_id": phrase.get("unit_id"),
+                    }]
+            for span_index, span in enumerate(phrase_spans):
+                text = _normalize_spaces(span.get("texte") or span.get("text") or "")
+                bbox = span.get("bbox")
+                if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                flat_spans.append(
+                    {
+                        "line_index": line_index,
+                        "line": line,
+                        "phrase_index": phrase_index,
+                        "phrase": phrase,
+                        "span_index": span_index,
+                        "span": span,
+                        "text": text,
+                        "bbox": list(bbox),
+                        "is_first_in_line": phrase_index == 0 and span_index == 0,
+                        "is_last_in_line": False,
+                    }
+                )
+        line_entries = [entry for entry in flat_spans if entry["line_index"] == line_index]
+        if line_entries:
+            line_entries[-1]["is_last_in_line"] = True
+
+    semantic_spans = []
+    current_group = []
+
+    def flush():
+        nonlocal current_group
+        if not current_group:
+            return
+        text = ""
+        bbox = None
+        line_indices = []
+        fragments = []
+        for frag_index, entry in enumerate(current_group):
+            text = _append_fragment(text, entry["text"])
+            eb = entry["bbox"]
+            bbox = eb if bbox is None else [
+                min(float(bbox[0]), float(eb[0])),
+                min(float(bbox[1]), float(eb[1])),
+                max(float(bbox[2]), float(eb[2])),
+                max(float(bbox[3]), float(eb[3])),
+            ]
+            line_indices.append(entry["line_index"])
+            fragments.append(
+                {
+                    "fragment_index": frag_index,
+                    "line_index": entry["line_index"],
+                    "text": entry["text"],
+                    "bbox": eb,
+                    "source_span_unit_id": entry["span"].get("unit_id"),
+                    "source_phrase_unit_id": entry["phrase"].get("unit_id"),
+                }
+            )
+        first_span = current_group[0]["span"]
+        semantic_spans.append(
+            {
+                "unit_id": f"{block.get('unit_id') or block.get('id') or 'block'}:semantic_span:{len(semantic_spans)}",
+                "texte": _normalize_spaces(text),
+                "text": _normalize_spaces(text),
+                "bbox": [int(round(v)) for v in (bbox or [0, 0, 0, 0])],
+                "line_indices": sorted(set(int(v) for v in line_indices)),
+                "start_line_index": min(line_indices),
+                "end_line_index": max(line_indices),
+                "multi_line": len(set(line_indices)) > 1,
+                "fragment_count": len(fragments),
+                "fragments": fragments,
+                "source": first_span.get("source") or block.get("source") or "ocr",
+                "source_kind": "semantic_span",
+                "style": copy.deepcopy(first_span.get("style", {})) if isinstance(first_span.get("style"), dict) else {},
+                "translatable": bool(first_span.get("translatable", True)),
+                "translation_strategy": first_span.get("translation_strategy"),
+                "coverage_required": first_span.get("coverage_required"),
+                "render_policy": first_span.get("render_policy"),
+                "unit_type": first_span.get("unit_type") or "",
+                "expression_semantics": copy.deepcopy(first_span.get("expression_semantics", {})),
+            }
+        )
+        current_group = []
+
+    def should_merge(previous_entry, current_entry):
+        if previous_entry is None:
+            return False
+        previous_span = previous_entry["span"]
+        current_span = current_entry["span"]
+        if current_entry["line_index"] == previous_entry["line_index"]:
+            return False
+        if current_entry["line_index"] != previous_entry["line_index"] + 1:
+            return False
+        if not previous_entry["is_last_in_line"] or not current_entry["is_first_in_line"]:
+            return False
+        if _semantic_span_style_signature(previous_span) != _semantic_span_style_signature(current_span):
+            return False
+        prev_class = ((previous_span.get("expression_semantics") or {}).get("inline_class") or "")
+        cur_class = ((current_span.get("expression_semantics") or {}).get("inline_class") or "")
+        if prev_class != cur_class:
+            return False
+        if prev_class in {"reference", "formula"}:
+            return False
+        next_line_relation = (((previous_entry["line"].get("editorial_relations") or {}).get("with_next")) or {})
+        if next_line_relation.get("exists") and not next_line_relation.get("continuation"):
+            return False
+        if bool(current_entry["line"].get("hard_break_before", False)) and not next_line_relation.get("continuation"):
+            return False
+        if _semantic_span_ends_sentence(previous_entry["text"]):
+            return False
+        return True
+
+    previous_entry = None
+    for entry in flat_spans:
+        if current_group and not should_merge(previous_entry, entry):
+            flush()
+        current_group.append(entry)
+        previous_entry = entry
+    flush()
+
+    if not semantic_spans and existing_semantic_spans:
+        semantic_spans = existing_semantic_spans
+
+    for index, semantic_span in enumerate(semantic_spans):
+        previous_span = semantic_spans[index - 1] if index > 0 else None
+        next_span = semantic_spans[index + 1] if index + 1 < len(semantic_spans) else None
+        semantic_span["structural_context"] = {
+            "level": "semantic_span",
+            "unit_id": semantic_span.get("unit_id"),
+            "parent_unit_id": block.get("unit_id"),
+            "block_unit_id": block.get("unit_id"),
+            "line_unit_id": None,
+            "child_fragment_count": len(semantic_span.get("fragments", []) or []),
+            "line_indices": list(semantic_span.get("line_indices", []) or []),
+        }
+        semantic_span["expression_relations"] = {
+            "with_previous": {
+                "exists": bool(previous_span),
+                "neighbor_id": previous_span.get("unit_id") if previous_span else None,
+                "neighbor_text": _normalize_spaces(previous_span.get("text") or "") if previous_span else "",
+                "relation": "continuation" if previous_span and previous_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class") else "semantic_shift",
+                "continuation": bool(previous_span and previous_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class")),
+                "same_inline_class": bool(previous_span and previous_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class")),
+                "same_style": bool(previous_span and _semantic_span_style_signature(previous_span) == _semantic_span_style_signature(semantic_span)),
+            } if previous_span else {"exists": False},
+            "with_next": {
+                "exists": bool(next_span),
+                "neighbor_id": next_span.get("unit_id") if next_span else None,
+                "neighbor_text": _normalize_spaces(next_span.get("text") or "") if next_span else "",
+                "relation": "continuation" if next_span and next_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class") else "semantic_shift",
+                "continuation": bool(next_span and next_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class")),
+                "same_inline_class": bool(next_span and next_span.get("expression_semantics", {}).get("inline_class") == semantic_span.get("expression_semantics", {}).get("inline_class")),
+                "same_style": bool(next_span and _semantic_span_style_signature(next_span) == _semantic_span_style_signature(semantic_span)),
+            } if next_span else {"exists": False},
+        }
+    block["semantic_spans"] = semantic_spans
+    block["semantic_span_count"] = len(semantic_spans)
+
+
+def _build_semantic_spans_for_blocks(blocks):
+    for block in blocks or []:
+        _build_semantic_spans_for_block(block)
+
+
+def _semantic_run_text(unit):
+    return _normalize_spaces(unit.get("text") or unit.get("texte") or "")
+
+
+def _semantic_run_inline_class(unit):
+    sem = unit.get("expression_semantics") if isinstance(unit.get("expression_semantics"), dict) else {}
+    return _normalize_spaces(sem.get("inline_class") or "")
+
+
+def _semantic_run_style_signature(unit):
+    style = unit.get("style") if isinstance(unit.get("style"), dict) else {}
+    flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
+    try:
+        size = round(float(style.get("size")), 1) if style.get("size") not in {None, ""} else None
+    except Exception:
+        size = None
+    return (
+        str(style.get("font") or ""),
+        size,
+        str(style.get("color") or ""),
+        tuple(sorted(name for name, enabled in flags.items() if enabled)),
+    )
+
+
+def _semantic_run_line_indices(unit):
+    if isinstance(unit.get("line_indices"), list) and unit.get("line_indices"):
+        return [int(v) for v in unit.get("line_indices", []) if isinstance(v, (int, float))]
+    structural = unit.get("structural_context") if isinstance(unit.get("structural_context"), dict) else {}
+    if isinstance(structural.get("line_indices"), list) and structural.get("line_indices"):
+        return [int(v) for v in structural.get("line_indices", []) if isinstance(v, (int, float))]
+    line_index = structural.get("line_index", unit.get("line_index"))
+    if isinstance(line_index, (int, float)):
+        return [int(line_index)]
+    return []
+
+
+def _build_semantic_runs_from_units(units, parent_unit_id):
+    candidates = [unit for unit in (units or []) if _semantic_run_text(unit)]
+    if not candidates:
+        return []
+    runs = []
+    current_group = []
+
+    def merge_allowed(previous_unit, current_unit):
+        if not previous_unit:
+            return False
+        prev_class = _semantic_run_inline_class(previous_unit)
+        cur_class = _semantic_run_inline_class(current_unit)
+        prev_text = _semantic_run_text(previous_unit)
+        cur_text = _semantic_run_text(current_unit)
+        if not prev_text or not cur_text:
+            return False
+        protected = {"code", "reference", "formula"}
+        if prev_class in protected or cur_class in protected:
+            return prev_class == cur_class
+        if _semantic_span_ends_sentence(prev_text):
+            return False
+        if prev_class == cur_class:
+            return True
+        broad = {"plain_text", "technical_inline", "label"}
+        return prev_class in broad and cur_class in broad
+
+    def flush():
+        nonlocal current_group
+        if not current_group:
+            return
+        text = ""
+        bbox = None
+        line_indices = []
+        style_signatures = []
+        run_inline_classes = []
+        protected_inline = False
+        fragments = []
+        for fragment_index, unit in enumerate(current_group):
+            text = _append_fragment(text, _semantic_run_text(unit))
+            ub = unit.get("bbox") or [0, 0, 0, 0]
+            bbox = ub if bbox is None else [
+                min(float(bbox[0]), float(ub[0])),
+                min(float(bbox[1]), float(ub[1])),
+                max(float(bbox[2]), float(ub[2])),
+                max(float(bbox[3]), float(ub[3])),
+            ]
+            line_indices.extend(_semantic_run_line_indices(unit))
+            style_signatures.append(_semantic_run_style_signature(unit))
+            inline_class = _semantic_run_inline_class(unit)
+            if inline_class:
+                run_inline_classes.append(inline_class)
+            sem = unit.get("expression_semantics") if isinstance(unit.get("expression_semantics"), dict) else {}
+            protected_inline = protected_inline or bool(sem.get("protected_inline"))
+            fragments.append(
+                {
+                    "fragment_index": fragment_index,
+                    "source_unit_id": unit.get("unit_id"),
+                    "text": _semantic_run_text(unit),
+                    "bbox": unit.get("bbox"),
+                    "line_indices": _semantic_run_line_indices(unit),
+                }
+            )
+        dominant_class = run_inline_classes[0] if run_inline_classes else "plain_text"
+        if len(set(run_inline_classes)) > 1 and all(cls in {"plain_text", "technical_inline", "label"} for cls in run_inline_classes):
+            dominant_class = "technical_inline" if "technical_inline" in run_inline_classes else "plain_text"
+        run = {
+            "unit_id": f"{parent_unit_id}:semantic_run:{len(runs)}",
+            "text": _normalize_spaces(text),
+            "texte": _normalize_spaces(text),
+            "bbox": [int(round(v)) for v in (bbox or [0, 0, 0, 0])],
+            "line_indices": sorted(set(int(v) for v in line_indices)),
+            "multi_line": len(set(line_indices)) > 1,
+            "fragment_count": len(fragments),
+            "fragments": fragments,
+            "mixed_style": len(set(style_signatures)) > 1,
+            "expression_semantics": {
+                "inline_class": dominant_class,
+                "protected_inline": bool(protected_inline),
+                "mixed_style": len(set(style_signatures)) > 1,
+            },
+            "source_kind": "semantic_run",
+        }
+        for unit in current_group:
+            unit["parent_semantic_run_id"] = run["unit_id"]
+        runs.append(run)
+        current_group = []
+
+    previous_unit = None
+    for unit in candidates:
+        if current_group and not merge_allowed(previous_unit, unit):
+            flush()
+        current_group.append(unit)
+        previous_unit = unit
+    flush()
+    return runs
+
+
+def _build_semantic_runs_for_block(block):
+    block_runs = []
+    for semantic_phrase in block.get("semantic_phrases", []) or []:
+        phrase_units = [copy.deepcopy(sp) for sp in (semantic_phrase.get("spans", []) or []) if _semantic_run_text(sp)]
+        if not phrase_units:
+            phrase_units = [{
+                "unit_id": f"{semantic_phrase.get('unit_id')}:synthetic-run-span:0",
+                "text": semantic_phrase.get("text") or semantic_phrase.get("texte") or "",
+                "texte": semantic_phrase.get("text") or semantic_phrase.get("texte") or "",
+                "bbox": semantic_phrase.get("bbox"),
+                "line_indices": list(semantic_phrase.get("line_indices", []) or []),
+                "expression_semantics": {"inline_class": "plain_text", "protected_inline": False},
+                "style": {},
+            }]
+        semantic_runs = _build_semantic_runs_from_units(phrase_units, semantic_phrase.get("unit_id") or block.get("unit_id") or block.get("id") or "phrase")
+        semantic_phrase["semantic_runs"] = semantic_runs
+        semantic_phrase["semantic_run_count"] = len(semantic_runs)
+        block_runs.extend(copy.deepcopy(semantic_runs))
+    block["semantic_runs"] = block_runs
+    block["semantic_run_count"] = len(block_runs)
+
+
+def _build_semantic_runs_for_blocks(blocks):
+    for block in blocks or []:
+        _build_semantic_runs_for_block(block)
+
+
+def _semantic_group_text(unit):
+    return _normalize_spaces(unit.get("text") or unit.get("texte") or "")
+
+
+def _semantic_group_inline_class(unit):
+    sem = unit.get("expression_semantics") if isinstance(unit.get("expression_semantics"), dict) else {}
+    return _normalize_spaces(sem.get("inline_class") or "")
+
+
+def _semantic_group_line_indices(unit):
+    if isinstance(unit.get("line_indices"), list) and unit.get("line_indices"):
+        return [int(v) for v in unit.get("line_indices", []) if isinstance(v, (int, float))]
+    return []
+
+
+def _classify_semantic_group(units):
+    texts = [_semantic_group_text(unit) for unit in (units or []) if _semantic_group_text(unit)]
+    classes = [_semantic_group_inline_class(unit) for unit in (units or []) if _semantic_group_inline_class(unit)]
+    joined = _normalize_spaces(" ".join(texts))
+    if texts and texts[0].endswith(":") and len(texts) >= 2:
+        return "label_value"
+    if "technical_inline" in classes:
+        return "technical_group"
+    if set(classes) <= {"code"} and classes:
+        return "code_group"
+    if set(classes) <= {"reference"} and classes:
+        return "reference_group"
+    if set(classes) <= {"formula"} and classes:
+        return "formula_group"
+    if re.search(r"\b(v|ver\.?|version)\s*\d+(\.\d+)*\b", joined, flags=re.IGNORECASE):
+        return "name_version"
+    return "editorial_group"
+
+
+def _build_semantic_groups_from_runs(runs, parent_unit_id):
+    candidates = [run for run in (runs or []) if _semantic_group_text(run)]
+    if not candidates:
+        return []
+    groups = []
+    current_group = []
+
+    def merge_allowed(previous_run, current_run):
+        if not previous_run:
+            return False
+        prev_text = _semantic_group_text(previous_run)
+        cur_text = _semantic_group_text(current_run)
+        if not prev_text or not cur_text:
+            return False
+        prev_class = _semantic_group_inline_class(previous_run)
+        cur_class = _semantic_group_inline_class(current_run)
+        prev_lines = _semantic_group_line_indices(previous_run)
+        cur_lines = _semantic_group_line_indices(current_run)
+        if prev_lines and cur_lines and min(cur_lines) - max(prev_lines) > 1:
+            return False
+        if _semantic_span_ends_sentence(prev_text):
+            return False
+        if prev_text.endswith(":"):
+            return True
+        protected = {"code", "reference", "formula"}
+        if prev_class in protected or cur_class in protected:
+            return prev_class == cur_class
+        broad = {"plain_text", "technical_inline", "label"}
+        if prev_class in broad and cur_class in broad:
+            return True
+        return prev_class == cur_class
+
+    def flush():
+        nonlocal current_group
+        if not current_group:
+            return
+        text = ""
+        bbox = None
+        line_indices = []
+        fragments = []
+        for fragment_index, run in enumerate(current_group):
+            text = _append_fragment(text, _semantic_group_text(run))
+            rb = run.get("bbox") or [0, 0, 0, 0]
+            bbox = rb if bbox is None else [
+                min(float(bbox[0]), float(rb[0])),
+                min(float(bbox[1]), float(rb[1])),
+                max(float(bbox[2]), float(rb[2])),
+                max(float(bbox[3]), float(rb[3])),
+            ]
+            line_indices.extend(_semantic_group_line_indices(run))
+            fragments.append(
+                {
+                    "fragment_index": fragment_index,
+                    "source_run_id": run.get("unit_id"),
+                    "text": _semantic_group_text(run),
+                    "bbox": run.get("bbox"),
+                    "line_indices": _semantic_group_line_indices(run),
+                }
+            )
+        group = {
+            "unit_id": f"{parent_unit_id}:semantic_group:{len(groups)}",
+            "text": _normalize_spaces(text),
+            "texte": _normalize_spaces(text),
+            "bbox": [int(round(v)) for v in (bbox or [0, 0, 0, 0])],
+            "line_indices": sorted(set(int(v) for v in line_indices)),
+            "multi_line": len(set(line_indices)) > 1,
+            "fragment_count": len(fragments),
+            "fragments": fragments,
+            "group_class": _classify_semantic_group(current_group),
+            "source_kind": "semantic_group",
+        }
+        for run in current_group:
+            run["parent_semantic_group_id"] = group["unit_id"]
+        groups.append(group)
+        current_group = []
+
+    previous_run = None
+    for run in candidates:
+        if current_group and not merge_allowed(previous_run, run):
+            flush()
+        current_group.append(run)
+        previous_run = run
+    flush()
+    return groups
+
+
+def _build_semantic_groups_for_block(block):
+    block_groups = []
+    for semantic_phrase in block.get("semantic_phrases", []) or []:
+        phrase_runs = [copy.deepcopy(run) for run in (semantic_phrase.get("semantic_runs", []) or []) if _semantic_group_text(run)]
+        semantic_groups = _build_semantic_groups_from_runs(
+            phrase_runs,
+            semantic_phrase.get("unit_id") or block.get("unit_id") or block.get("id") or "phrase",
+        )
+        semantic_phrase["semantic_groups"] = semantic_groups
+        semantic_phrase["semantic_group_count"] = len(semantic_groups)
+        for group in semantic_groups:
+            group["structural_context"] = {
+                "level": "semantic_group",
+                "unit_id": group.get("unit_id"),
+                "parent_unit_id": semantic_phrase.get("unit_id"),
+                "block_unit_id": block.get("unit_id"),
+                "line_unit_id": None,
+                "child_fragment_count": len(group.get("fragments", []) or []),
+                "line_indices": list(group.get("line_indices", []) or []),
+            }
+        block_groups.extend(copy.deepcopy(semantic_groups))
+    block["semantic_groups"] = block_groups
+    block["semantic_group_count"] = len(block_groups)
+
+
+def _build_semantic_groups_for_blocks(blocks):
+    for block in blocks or []:
+        _build_semantic_groups_for_block(block)
+
+
 def _bbox_overlap_ratio(b1, b2):
     r1 = fitz.Rect(b1)
     r2 = fitz.Rect(b2)
@@ -837,6 +1989,58 @@ def _bbox_overlap_ratio(b1, b2):
     if inter <= 0:
         return 0.0
     return inter / max(1e-9, min(r1.get_area(), r2.get_area()))
+
+
+def _erase_uncovered_pdf_words(clean_bgr, pdf_page, already_blanked_regions, sx, sy):
+    """Efface dans clean_bgr les mots PDF qui n'ont pas été couverts par l'extraction.
+
+    Cela permet de nettoyer les en-têtes courants, pieds de page, grands titres
+    décoratifs ou tout texte qui était dans le PDF mais pas dans final_blocks.
+    On applique un whiteout (255, 255, 255) avec une légère marge.
+    """
+    import numpy as _np
+    try:
+        words = pdf_page.get_text("words")  # [(x0, y0, x1, y1, text, block_no, line_no, word_no), ...]
+    except Exception:
+        return clean_bgr
+
+    if not words:
+        return clean_bgr
+
+    # Construire un masque des régions déjà effacées (en coordonnées pixels)
+    h, w = clean_bgr.shape[:2]
+    already_covered = _np.zeros((h, w), dtype=_np.uint8)
+    for r in already_blanked_regions or []:
+        if not isinstance(r, (list, tuple)) or len(r) != 4:
+            continue
+        x0, y0, x1, y1 = int(r[0]), int(r[1]), int(r[2]), int(r[3])
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+        if x1 > x0 and y1 > y0:
+            already_covered[y0:y1, x0:x1] = 1
+
+    result = clean_bgr.copy()
+    margin = 2  # pixels de marge autour de chaque mot
+    for word in words:
+        wx0, wy0, wx1, wy1 = word[0], word[1], word[2], word[3]
+        # Convertir coordonnées points → pixels
+        px0 = int(wx0 * sx) - margin
+        py0 = int(wy0 * sy) - margin
+        px1 = int(wx1 * sx) + margin
+        py1 = int(wy1 * sy) + margin
+        px0, py0 = max(0, px0), max(0, py0)
+        px1, py1 = min(w, px1), min(h, py1)
+        if px1 <= px0 or py1 <= py0:
+            continue
+        # Vérifier si cette région est déjà couverte par l'extraction
+        region_already = already_covered[py0:py1, px0:px1]
+        coverage = float(region_already.sum()) / max(1, region_already.size)
+        if coverage >= 0.25:
+            continue  # Déjà nettoyé par le passage principal
+        # Appliquer le whiteout
+        result[py0:py1, px0:px1] = 255
+
+    return result
 
 
 def _collect_text_regions_for_inpainting(blocks, non_text_zones, immutable_overlays=None):
@@ -936,23 +2140,442 @@ def _dedupe_final_blocks(native_blocks, ocr_blocks):
     return native_blocks + kept_ocr
 
 
+def _bbox_width(bbox):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return 0.0
+    try:
+        return max(0.0, float(bbox[2]) - float(bbox[0]))
+    except Exception:
+        return 0.0
+
+
+def _bbox_height(bbox):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return 0.0
+    try:
+        return max(0.0, float(bbox[3]) - float(bbox[1]))
+    except Exception:
+        return 0.0
+
+
+def _bbox_x_overlap_ratio(a, b):
+    if not (isinstance(a, (list, tuple)) and len(a) == 4 and isinstance(b, (list, tuple)) and len(b) == 4):
+        return 0.0
+    try:
+        ix0 = max(float(a[0]), float(b[0]))
+        ix1 = min(float(a[2]), float(b[2]))
+        if ix1 <= ix0:
+            return 0.0
+        overlap = ix1 - ix0
+        base = max(1.0, min(float(a[2]) - float(a[0]), float(b[2]) - float(b[0])))
+        return overlap / base
+    except Exception:
+        return 0.0
+
+
+def _recompute_ocr_block_geometry(block):
+    if not isinstance(block, dict):
+        return block
+    lines = [ln for ln in (block.get("lines") or []) if isinstance(ln, dict)]
+    if not lines:
+        return block
+    bboxes = [ln.get("bbox") for ln in lines if isinstance(ln.get("bbox"), (list, tuple)) and len(ln.get("bbox")) == 4]
+    if bboxes:
+        block["bbox"] = [
+            int(min(float(bb[0]) for bb in bboxes)),
+            int(min(float(bb[1]) for bb in bboxes)),
+            int(max(float(bb[2]) for bb in bboxes)),
+            int(max(float(bb[3]) for bb in bboxes)),
+        ]
+    block["text"] = " ".join(
+        str((line or {}).get("text") or (line or {}).get("line_text") or "").strip()
+        for line in lines
+        if str((line or {}).get("text") or (line or {}).get("line_text") or "").strip()
+    ).strip()
+    heights = [_bbox_height(line.get("bbox")) for line in lines if _bbox_height(line.get("bbox")) > 0.0]
+    peaks = [
+        float(line.get("peak_y"))
+        for line in lines
+        if isinstance(line.get("peak_y"), (int, float))
+    ]
+    if heights:
+        block["avg_line_height"] = float(np.median(heights))
+    if len(lines) >= 2:
+        gaps = []
+        peak_diffs = []
+        for idx in range(1, len(lines)):
+            prev_bbox = lines[idx - 1].get("bbox")
+            cur_bbox = lines[idx].get("bbox")
+            if isinstance(prev_bbox, (list, tuple)) and len(prev_bbox) == 4 and isinstance(cur_bbox, (list, tuple)) and len(cur_bbox) == 4:
+                gaps.append(float(cur_bbox[1]) - float(prev_bbox[3]))
+            if idx - 1 < len(peaks) and idx < len(peaks):
+                peak_diffs.append(peaks[idx] - peaks[idx - 1])
+        block["line_spacing"] = float(np.median(gaps)) if gaps else 0.0
+        block["peak_to_peak_spacing"] = float(np.median(peak_diffs)) if peak_diffs else 0.0
+    else:
+        block["line_spacing"] = 0.0
+        block["peak_to_peak_spacing"] = 0.0
+    confs = [
+        float(line.get("ocr_confidence_mean", 0.0) or 0.0)
+        for line in lines
+        if float(line.get("ocr_confidence_mean", 0.0) or 0.0) > 0.0
+    ]
+    if confs:
+        block["ocr_confidence_mean"] = float(np.mean(confs))
+        block["ocr_confidence_min"] = float(np.min(confs))
+    block["ocr_line_count"] = len(lines)
+    block["ocr_word_count"] = int(sum(int((line or {}).get("ocr_word_count", 0) or 0) for line in lines))
+    return block
+
+
+def _prune_weak_ocr_lines(ocr_blocks):
+    cleaned_blocks = []
+    for block in ocr_blocks or []:
+        if not isinstance(block, dict):
+            continue
+        lines = [copy.deepcopy(ln) for ln in (block.get("lines") or []) if isinstance(ln, dict)]
+        if len(lines) < 2:
+            cleaned_blocks.append(block)
+            continue
+        best_conf = max(float((ln or {}).get("ocr_confidence_mean", 0.0) or 0.0) for ln in lines)
+        kept_lines = []
+        for idx, line in enumerate(lines):
+            text = _normalize_spaces(line.get("text") or line.get("line_text") or "")
+            conf = float(line.get("ocr_confidence_mean", 0.0) or 0.0)
+            token_count = len(re.findall(r"[A-Za-zÀ-ÿ0-9]+", text))
+            char_count = len(re.sub(r"\s+", "", text))
+            line_bbox = line.get("bbox")
+            prev_bbox = lines[idx - 1].get("bbox") if idx > 0 else None
+            dangling_short_tail = bool(
+                idx > 0
+                and token_count <= 1
+                and char_count <= 6
+                and conf < max(0.78, best_conf - 0.10)
+                and _bbox_width(line_bbox) <= max(54.0, _bbox_height(line_bbox) * 3.6)
+                and _bbox_x_overlap_ratio(prev_bbox, line_bbox) >= 0.30
+            )
+            if dangling_short_tail:
+                continue
+            kept_lines.append(line)
+        if not kept_lines:
+            continue
+        new_block = copy.deepcopy(block)
+        new_block["lines"] = kept_lines
+        cleaned_blocks.append(_recompute_ocr_block_geometry(new_block))
+    return cleaned_blocks
+
+
 def _infer_alignment(bbox, content_bbox, page_w):
-    x0, _, x1, _ = bbox
-    c0, _, c1, _ = content_bbox
+    return _infer_alignment_with_context(bbox, content_bbox, page_w=page_w)
+
+
+def _clean_bbox(bb):
+    if not isinstance(bb, (list, tuple)) or len(bb) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(v) for v in bb]
+    except Exception:
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def _text_case_profile(text):
+    s = _normalize_spaces(text or "")
+    alpha = [ch for ch in s if ch.isalpha()]
+    if not alpha:
+        return "empty"
+    if s.isupper() and len(alpha) >= 2:
+        return "uppercase"
+    if s.islower() and len(alpha) >= 2:
+        return "lowercase"
+    title_words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", s)
+    if title_words and sum(1 for w in title_words if w[:1].isupper()) >= max(1, int(len(title_words) * 0.75)):
+        return "title_like"
+    return "mixed"
+
+
+def _text_statistics(text):
+    s = _normalize_spaces(text or "")
+    chars = len(s)
+    words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", s)
+    digits = re.findall(r"\d", s)
+    punct = re.findall(r"[^\w\s]", s, flags=re.UNICODE)
+    alpha = [ch for ch in s if ch.isalpha()]
+    uppercase = [ch for ch in alpha if ch.isupper()]
+    return {
+        "char_count": chars,
+        "word_count": len(words),
+        "digit_count": len(digits),
+        "punctuation_count": len(punct),
+        "uppercase_ratio": round(len(uppercase) / max(1, len(alpha)), 4),
+        "digit_ratio": round(len(digits) / max(1, chars), 4),
+        "punctuation_ratio": round(len(punct) / max(1, chars), 4),
+        "case_profile": _text_case_profile(s),
+    }
+
+
+def _bbox_relative_attributes(bbox, container_bbox):
+    bb = _clean_bbox(bbox)
+    cb = _clean_bbox(container_bbox)
+    if not bb or not cb:
+        return {}
+    x0, y0, x1, y1 = bb
+    c0, t0, c1, t1 = cb
+    cw = max(1.0, c1 - c0)
+    ch = max(1.0, t1 - t0)
+    left_gap = max(0.0, x0 - c0)
+    right_gap = max(0.0, c1 - x1)
+    top_gap = max(0.0, y0 - t0)
+    bottom_gap = max(0.0, t1 - y1)
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+    center_x = ((x0 + x1) / 2.0 - c0) / cw
+    center_y = ((y0 + y1) / 2.0 - t0) / ch
+    fill_ratio_x = bw / cw
+    fill_ratio_y = bh / ch
+    near_x = max(8.0, cw * 0.04)
+    near_y = max(6.0, ch * 0.08)
+    center_tol_x = max(10.0, cw * 0.08)
+    center_tol_y = max(8.0, ch * 0.12)
+    if fill_ratio_x >= 0.9 and left_gap <= near_x and right_gap <= near_x:
+        horizontal_anchor = "stretch"
+    elif abs(left_gap - right_gap) <= center_tol_x:
+        horizontal_anchor = "center"
+    elif left_gap <= near_x:
+        horizontal_anchor = "left"
+    elif right_gap <= near_x:
+        horizontal_anchor = "right"
+    else:
+        horizontal_anchor = "free"
+    if fill_ratio_y >= 0.9 and top_gap <= near_y and bottom_gap <= near_y:
+        vertical_anchor = "stretch"
+    elif abs(top_gap - bottom_gap) <= center_tol_y:
+        vertical_anchor = "middle"
+    elif top_gap <= near_y:
+        vertical_anchor = "top"
+    elif bottom_gap <= near_y:
+        vertical_anchor = "bottom"
+    else:
+        vertical_anchor = "free"
+    return {
+        "container_bbox": [round(v, 2) for v in cb],
+        "left_gap_px": round(left_gap, 2),
+        "right_gap_px": round(right_gap, 2),
+        "top_gap_px": round(top_gap, 2),
+        "bottom_gap_px": round(bottom_gap, 2),
+        "width_px": round(bw, 2),
+        "height_px": round(bh, 2),
+        "width_ratio": round(fill_ratio_x, 4),
+        "height_ratio": round(fill_ratio_y, 4),
+        "center_x_ratio": round(center_x, 4),
+        "center_y_ratio": round(center_y, 4),
+        "horizontal_anchor": horizontal_anchor,
+        "vertical_anchor": vertical_anchor,
+    }
+
+
+def _infer_alignment_with_context(bbox, content_bbox, page_w=None, text="", role="body"):
+    bb = _clean_bbox(bbox)
+    cb = _clean_bbox(content_bbox)
+    if not bb or not cb:
+        return "left", 0.0
+    x0, _, x1, _ = bb
+    c0, _, c1, _ = cb
     content_w = max(1.0, c1 - c0)
     block_w = max(1.0, x1 - x0)
     left_gap = max(0.0, x0 - c0)
     right_gap = max(0.0, c1 - x1)
     near_tol = max(8.0, content_w * 0.03)
     center_tol = max(10.0, content_w * 0.06)
+    stats = _text_statistics(text)
+    word_count = int(stats.get("word_count") or 0)
+    char_count = int(stats.get("char_count") or 0)
+    long_prose = bool(role == "body" and (word_count >= 8 or char_count >= 48))
+    short_label = bool(word_count <= 6 and char_count <= 42)
 
-    if block_w >= content_w * 0.88 and left_gap <= near_tol and right_gap <= near_tol:
-        return "justify", left_gap
-    if abs(left_gap - right_gap) <= center_tol and block_w < content_w * 0.88:
+    if block_w >= content_w * 0.92 and left_gap <= near_tol and right_gap <= near_tol:
+        return ("justify" if long_prose else "center"), left_gap
+    if abs(left_gap - right_gap) <= center_tol and block_w < content_w * 0.86:
         return "center", left_gap
-    if right_gap <= near_tol and left_gap > near_tol:
+    if short_label and right_gap <= near_tol and left_gap > near_tol:
         return "right", left_gap
     return "left", left_gap
+
+
+def _collect_style_entries_from_phrase(phrase):
+    styles = []
+    for span in (phrase or {}).get("spans", []) or []:
+        style = span.get("style") if isinstance(span, dict) else None
+        if isinstance(style, dict) and style:
+            styles.append(style)
+    style = (phrase or {}).get("style")
+    if isinstance(style, dict) and style:
+        styles.append(style)
+    return styles
+
+
+def _aggregate_style_characteristics(style_entries, text=""):
+    entries = [st for st in (style_entries or []) if isinstance(st, dict)]
+    sizes = []
+    fonts = []
+    colors = []
+    flag_true_counts = {"bold": 0, "italic": 0, "underline": 0, "highlight": 0, "uppercase": 0, "monospace": 0, "serif": 0}
+    for st in entries:
+        if st.get("font"):
+            fonts.append(str(st.get("font")))
+        if st.get("color"):
+            colors.append(str(st.get("color")))
+        try:
+            if st.get("size") not in {None, ""}:
+                sizes.append(float(st.get("size")))
+        except Exception:
+            pass
+        flags = st.get("flags") if isinstance(st.get("flags"), dict) else {}
+        for key in flag_true_counts:
+            if bool(flags.get(key)):
+                flag_true_counts[key] += 1
+    primary_font = max(fonts, key=fonts.count) if fonts else ""
+    primary_color = max(colors, key=colors.count) if colors else ""
+    size_median = float(np.median(sizes)) if sizes else 0.0
+    size_min = min(sizes) if sizes else 0.0
+    size_max = max(sizes) if sizes else 0.0
+    total_entries = max(1, len(entries))
+    text_stats = _text_statistics(text)
+    if not any(flag_true_counts.values()) and text_stats.get("case_profile") == "uppercase":
+        flag_true_counts["uppercase"] = total_entries
+    return {
+        "font_family_primary": primary_font,
+        "font_size_pt_median": round(size_median, 2),
+        "font_size_pt_min": round(size_min, 2),
+        "font_size_pt_max": round(size_max, 2),
+        "color_primary": primary_color,
+        "flags_any": {k: bool(v) for k, v in flag_true_counts.items()},
+        "flags_ratio": {k: round(v / total_entries, 4) for k, v in flag_true_counts.items()},
+    }
+
+
+def _infer_block_alignment_from_lines(lines, container_bbox, fallback_alignment="left", role="body"):
+    valid = []
+    for line in lines or []:
+        bb = _clean_bbox((line or {}).get("bbox"))
+        if not bb:
+            continue
+        txt = _normalize_spaces((line or {}).get("line_text") or (line or {}).get("text") or "")
+        if not txt:
+            continue
+        valid.append((bb, txt))
+    if len(valid) < 2:
+        return fallback_alignment
+    cb = _clean_bbox(container_bbox)
+    if not cb:
+        return fallback_alignment
+    cw = max(1.0, cb[2] - cb[0])
+    lefts = [bb[0] for bb, _ in valid]
+    rights = [bb[2] for bb, _ in valid]
+    widths = [max(1.0, bb[2] - bb[0]) for bb, _ in valid]
+    left_spread = max(lefts) - min(lefts)
+    right_spread = max(rights) - min(rights)
+    tol = max(10.0, cw * 0.05)
+    width_ratio_median = float(np.median(widths)) / cw
+    if left_spread <= tol and right_spread > tol * 1.2:
+        return "left"
+    if right_spread <= tol and left_spread > tol * 1.2:
+        return "right"
+    if left_spread <= tol and right_spread <= tol and width_ratio_median >= 0.88 and role == "body":
+        return "justify"
+    centers = [((bb[0] + bb[2]) / 2.0 - cb[0]) / cw for bb, _ in valid]
+    center_spread = max(centers) - min(centers)
+    if center_spread <= 0.08 and width_ratio_median < 0.75:
+        return "center"
+    return fallback_alignment
+
+
+def _attach_textual_characteristics(final_blocks, content_bbox):
+    for block in final_blocks or []:
+        block_lines = block.get("lines", []) or []
+        semantic_phrases = block.get("semantic_phrases", []) or []
+        semantic_spans = block.get("semantic_spans", []) or []
+        semantic_runs = block.get("semantic_runs", []) or []
+        semantic_groups = block.get("semantic_groups", []) or []
+        line_texts = [_normalize_spaces(line.get("line_text") or line.get("text") or "") for line in block_lines]
+        block_text = _normalize_spaces(" ".join(t for t in line_texts if t))
+        block_style_entries = []
+        for line in block_lines:
+            for phrase in line.get("phrases", []) or []:
+                block_style_entries.extend(_collect_style_entries_from_phrase(phrase))
+        block["text_attributes"] = _text_statistics(block_text)
+        block["style_attributes"] = _aggregate_style_characteristics(block_style_entries, block_text)
+        block["layout_attributes"] = _bbox_relative_attributes(block.get("bbox"), content_bbox)
+        block["layout_attributes"]["horizontal_alignment"] = str(block.get("alignment") or "left")
+        block["layout_attributes"]["indent_px"] = float(block.get("indent_px", 0.0) or 0.0)
+        block["layout_attributes"]["line_count"] = len(block_lines)
+        block["layout_attributes"]["phrase_count"] = sum(len((line.get("phrases") or [])) for line in block_lines)
+        for line in block_lines:
+            line_text = _normalize_spaces(line.get("line_text") or line.get("text") or "")
+            line_style_entries = []
+            for phrase in line.get("phrases", []) or []:
+                line_style_entries.extend(_collect_style_entries_from_phrase(phrase))
+            line["text_attributes"] = _text_statistics(line_text)
+            line["style_attributes"] = _aggregate_style_characteristics(line_style_entries, line_text)
+            line["layout_attributes"] = _bbox_relative_attributes(line.get("bbox"), block.get("bbox") or content_bbox)
+            line["layout_attributes"]["horizontal_alignment"] = str(line.get("alignment") or block.get("alignment") or "left")
+            line["layout_attributes"]["indent_px"] = float(line.get("indent_px", 0.0) or 0.0)
+            line["layout_attributes"]["line_index"] = int(line.get("line_index") or 0)
+            for phrase in line.get("phrases", []) or []:
+                phrase_text = _normalize_spaces(_phrase_render_text(phrase) or phrase.get("texte") or "")
+                phrase_style_entries = _collect_style_entries_from_phrase(phrase)
+                phrase["text_attributes"] = _text_statistics(phrase_text)
+                phrase["style_attributes"] = _aggregate_style_characteristics(phrase_style_entries, phrase_text)
+                phrase["layout_attributes"] = _bbox_relative_attributes(phrase.get("bbox"), line.get("bbox") or block.get("bbox") or content_bbox)
+                phrase["layout_attributes"]["horizontal_alignment"] = str(phrase.get("alignment") or line.get("alignment") or "left")
+                phrase["layout_attributes"]["indent_px"] = float(phrase.get("indent_px", 0.0) or 0.0)
+                for span in phrase.get("spans", []) or []:
+                    span_text = _normalize_spaces(span.get("texte") or span.get("text") or "")
+                    span_style = span.get("style") if isinstance(span.get("style"), dict) else {}
+                    span["text_attributes"] = _text_statistics(span_text)
+                    span["style_attributes"] = _aggregate_style_characteristics([span_style] if span_style else [], span_text)
+                    span["layout_attributes"] = _bbox_relative_attributes(span.get("bbox"), phrase.get("bbox") or line.get("bbox") or block.get("bbox") or content_bbox)
+                    span["layout_attributes"]["horizontal_alignment"] = str(
+                        span.get("alignment") or phrase.get("alignment") or line.get("alignment") or "left"
+                    )
+                    span["layout_attributes"]["indent_px"] = float(
+                        span.get("indent_px", phrase.get("indent_px", line.get("indent_px", 0.0))) or 0.0
+                    )
+                    span["layout_attributes"]["line_index"] = int(line.get("line_index") or 0)
+        for phrase in semantic_phrases:
+            phrase_text = _normalize_spaces(_phrase_render_text(phrase) or phrase.get("texte") or "")
+            phrase_style_entries = _collect_style_entries_from_phrase(phrase)
+            phrase["text_attributes"] = _text_statistics(phrase_text)
+            phrase["style_attributes"] = _aggregate_style_characteristics(phrase_style_entries, phrase_text)
+            phrase["layout_attributes"] = _bbox_relative_attributes(phrase.get("bbox"), block.get("bbox") or content_bbox)
+            phrase["layout_attributes"]["horizontal_alignment"] = str(phrase.get("alignment") or block.get("alignment") or "left")
+            phrase["layout_attributes"]["indent_px"] = float(phrase.get("indent_px", 0.0) or 0.0)
+        for semantic_span in semantic_spans:
+            span_text = _normalize_spaces(semantic_span.get("texte") or semantic_span.get("text") or "")
+            span_style = semantic_span.get("style") if isinstance(semantic_span.get("style"), dict) else {}
+            semantic_span["text_attributes"] = _text_statistics(span_text)
+            semantic_span["style_attributes"] = _aggregate_style_characteristics([span_style] if span_style else [], span_text)
+            semantic_span["layout_attributes"] = _bbox_relative_attributes(semantic_span.get("bbox"), block.get("bbox") or content_bbox)
+            semantic_span["layout_attributes"]["horizontal_alignment"] = str(
+                semantic_span.get("alignment") or block.get("alignment") or "left"
+            )
+            semantic_span["layout_attributes"]["indent_px"] = 0.0
+        for semantic_run in semantic_runs:
+            run_text = _normalize_spaces(semantic_run.get("texte") or semantic_run.get("text") or "")
+            semantic_run["text_attributes"] = _text_statistics(run_text)
+            semantic_run["style_attributes"] = _aggregate_style_characteristics([], run_text)
+            semantic_run["layout_attributes"] = _bbox_relative_attributes(semantic_run.get("bbox"), block.get("bbox") or content_bbox)
+            semantic_run["layout_attributes"]["horizontal_alignment"] = str(block.get("alignment") or "left")
+            semantic_run["layout_attributes"]["indent_px"] = 0.0
+        for semantic_group in semantic_groups:
+            group_text = _normalize_spaces(semantic_group.get("texte") or semantic_group.get("text") or "")
+            semantic_group["text_attributes"] = _text_statistics(group_text)
+            semantic_group["style_attributes"] = _aggregate_style_characteristics([], group_text)
+            semantic_group["layout_attributes"] = _bbox_relative_attributes(semantic_group.get("bbox"), block.get("bbox") or content_bbox)
+            semantic_group["layout_attributes"]["horizontal_alignment"] = str(block.get("alignment") or "left")
+            semantic_group["layout_attributes"]["indent_px"] = 0.0
 
 
 def _annotate_layout(blocks, img_w, img_h):
@@ -1034,29 +2657,47 @@ def _annotate_layout(blocks, img_w, img_h):
         elif is_short_title and bw < (content_bbox[2] - content_bbox[0]) * 0.8:
             role = "title"
 
-        align, indent_px = _infer_alignment([x0, y0, x1, y1], content_bbox, img_w)
-        block["role"] = role
-        block["alignment"] = align
-        block["indent_px"] = float(max(0.0, indent_px))
+        line_alignment_candidates = []
 
         for line in block.get("lines", []):
             lb = line.get("bbox", bb)
             if isinstance(lb, (list, tuple)) and len(lb) == 4:
-                l_align, l_indent = _infer_alignment([float(v) for v in lb], content_bbox, img_w)
+                line_text = line.get("line_text") or line.get("text") or _line_phrase_text(line)
+                l_align, l_indent = _infer_alignment_with_context([float(v) for v in lb], content_bbox, page_w=img_w, text=line_text, role=role)
             else:
-                l_align, l_indent = align, indent_px
+                l_align, l_indent = "left", max(0.0, x0 - content_bbox[0])
             line["alignment"] = l_align
             line["indent_px"] = float(max(0.0, l_indent))
             line["role"] = role
+            line_alignment_candidates.append(line)
             for phrase in line.get("phrases", []):
                 pb = phrase.get("bbox", lb)
                 if isinstance(pb, (list, tuple)) and len(pb) == 4:
-                    p_align, p_indent = _infer_alignment([float(v) for v in pb], content_bbox, img_w)
+                    phrase_text = _phrase_render_text(phrase) or phrase.get("texte") or ""
+                    phrase_container = lb if isinstance(lb, (list, tuple)) and len(lb) == 4 else content_bbox
+                    p_align, p_indent = _infer_alignment_with_context([float(v) for v in pb], phrase_container, page_w=img_w, text=phrase_text, role=role)
                 else:
                     p_align, p_indent = l_align, l_indent
                 phrase["alignment"] = p_align
                 phrase["indent_px"] = float(max(0.0, p_indent))
                 phrase["role"] = role
+
+        align, indent_px = _infer_alignment_with_context([x0, y0, x1, y1], content_bbox, page_w=img_w, text=text, role=role)
+        block["role"] = role
+        block["alignment"] = _infer_block_alignment_from_lines(line_alignment_candidates, content_bbox, fallback_alignment=align, role=role)
+        block["indent_px"] = float(max(0.0, indent_px))
+        for phrase in block.get("semantic_phrases", []) or []:
+            pb = phrase.get("bbox", [x0, y0, x1, y1])
+            if isinstance(pb, (list, tuple)) and len(pb) == 4:
+                phrase_text = _phrase_render_text(phrase) or phrase.get("texte") or ""
+                p_align, p_indent = _infer_alignment_with_context([float(v) for v in pb], block.get("bbox") or content_bbox, page_w=img_w, text=phrase_text, role=role)
+            else:
+                p_align, p_indent = block["alignment"], block["indent_px"]
+            phrase["alignment"] = p_align
+            phrase["indent_px"] = float(max(0.0, p_indent))
+            phrase["role"] = role
+
+    _attach_textual_characteristics(blocks, content_bbox)
 
     return {
         "margins": margins,
@@ -1098,6 +2739,62 @@ def _phrase_render_text(phrase):
     return _normalize_spaces(phrase.get("texte", ""))
 
 
+def _normalize_word_label(word):
+    if not isinstance(word, dict):
+        return ""
+    return _normalize_spaces(word.get("label") or word.get("text") or "")
+
+
+def _starts_with_sentence_case(token):
+    s = re.sub(r'^["\'\u201c\u201d\u2018\u2019(\[{]+', "", _normalize_spaces(token or ""))
+    return bool(s[:1].isupper())
+
+
+def _is_abbreviation_token(token):
+    s = _normalize_spaces(token or "")
+    if not s:
+        return False
+    core = re.sub(r'["\'\u201c\u201d\u2018\u2019)\]}]+$', "", s)
+    lowered = core.lower()
+    if lowered in {
+        "mr.",
+        "mrs.",
+        "ms.",
+        "dr.",
+        "prof.",
+        "etc.",
+        "e.g.",
+        "i.e.",
+        "cf.",
+        "vs.",
+        "fig.",
+        "eq.",
+        "no.",
+        "vol.",
+        "al.",
+    }:
+        return True
+    if re.fullmatch(r"(?:[A-Za-z]\.){2,}", core):
+        return True
+    return False
+
+
+def _token_ends_sentence(token, next_token="", next_line_hard_break=False):
+    s = _normalize_spaces(token or "")
+    if not s:
+        return False
+    if not re.search(r'[.!?\u2026]+[\u201d\u2019"\')\]}\u00bb]*$', s):
+        return False
+    if _is_abbreviation_token(s):
+        return False
+    nxt = _normalize_spaces(next_token or "")
+    if nxt and _starts_with_sentence_case(nxt):
+        return True
+    if nxt and not _starts_with_sentence_case(nxt) and not next_line_hard_break:
+        return False
+    return True
+
+
 def _looks_like_sentence(text):
     s = _normalize_spaces(text)
     if not s:
@@ -1131,6 +2828,30 @@ def _append_fragment(base, frag):
     if re.match(r"^[\.,;:!?%\)\]\}]", f):
         return f"{b}{f}"
     return _normalize_spaces(f"{b} {f}")
+
+
+def _semantic_phrase_should_break_on_hard_boundary(current_text, current_line, previous_line=None):
+    text = _normalize_spaces(current_text)
+    if not text:
+        return False
+    if _token_ends_sentence(text):
+        return True
+    if isinstance(current_line, dict):
+        if current_line.get("leading_marker") or current_line.get("paragraph_break_before"):
+            return True
+    current_indent = 0.0
+    previous_indent = 0.0
+    if isinstance(current_line, dict):
+        current_indent = float(
+            current_line.get("indent_px", (current_line.get("layout_attributes") or {}).get("indent_px", 0.0)) or 0.0
+        )
+    if isinstance(previous_line, dict):
+        previous_indent = float(
+            previous_line.get("indent_px", (previous_line.get("layout_attributes") or {}).get("indent_px", 0.0)) or 0.0
+        )
+    if current_indent - previous_indent > 24.0:
+        return True
+    return False
 
 
 def _flush_pending_sentence(pending, residual_pool, sentence_min_words=6):
@@ -1276,51 +2997,63 @@ def _build_hierarchical_extraction(blocks):
     pending_sentence = ""
     line_stream = []
 
+    semantic_phrase_stream = []
+    for block in blocks or []:
+        for phrase in block.get("semantic_phrases", []) or []:
+            if phrase.get("render_mode") == "background_only":
+                continue
+            txt = _normalize_spaces(_phrase_render_text(phrase) or phrase.get("texte") or "")
+            if txt:
+                semantic_phrase_stream.append(txt)
+    if semantic_phrase_stream:
+        phrases = semantic_phrase_stream
+
     # Reconstitute sentence stream from visual lines (handles multi-line sentences better).
     allowed_roles = {"body", "figure_caption"}
     ignored_roles = {"diagram_label", "diagram_text_label", "equation_inline", "header", "footer"}
-    for block in blocks or []:
-        role = (block.get("role") or "").strip().lower()
-        if role in ignored_roles:
-            continue
-        if role and role not in allowed_roles:
-            continue
-        for line in block.get("lines", []):
-            if line.get("render_mode") == "background_only":
+    if not phrases:
+        for block in blocks or []:
+            role = (block.get("role") or "").strip().lower()
+            if role in ignored_roles:
                 continue
-            line_txt = _normalize_spaces(line.get("line_text", ""))
-            if not line_txt:
-                # Build line from phrases when line_text is unavailable.
-                parts = []
-                for phrase in line.get("phrases", []):
-                    if phrase.get("render_mode") == "background_only":
-                        continue
-                    ptxt = _phrase_render_text(phrase)
-                    if ptxt:
-                        parts.append(ptxt)
-                line_txt = _normalize_spaces(" ".join(parts))
-            if line_txt:
-                # Skip isolated markers/noise in sentence stream.
-                if re.fullmatch(r"(?:\.\.\.|[•▪◦·\-\*]|\d{1,2}[.)]?)", line_txt):
+            if role and role not in allowed_roles:
+                continue
+            for line in block.get("lines", []):
+                if line.get("render_mode") == "background_only":
                     continue
-                line_stream.append(line_txt)
+                line_txt = _normalize_spaces(line.get("line_text", ""))
+                if not line_txt:
+                    # Build line from phrases when line_text is unavailable.
+                    parts = []
+                    for phrase in line.get("phrases", []):
+                        if phrase.get("render_mode") == "background_only":
+                            continue
+                        ptxt = _phrase_render_text(phrase)
+                        if ptxt:
+                            parts.append(ptxt)
+                    line_txt = _normalize_spaces(" ".join(parts))
+                if line_txt:
+                    # Skip isolated markers/noise in sentence stream.
+                    if re.fullmatch(r"(?:\.\.\.|[•▪◦·\-\*]|\d{1,2}[.)]?)", line_txt):
+                        continue
+                    line_stream.append(line_txt)
 
-    for ltxt in line_stream:
-        # Join soft hyphenation across lines: "fea-" + "tures" => "features"
-        if pending_sentence.endswith("-") and re.match(r"^[A-Za-zÀ-ÿ]", ltxt):
-            pending_sentence = _normalize_spaces(f"{pending_sentence[:-1]}{ltxt}")
-        else:
-            pending_sentence = _append_fragment(pending_sentence, ltxt)
-        if re.search(r"[.!?…]\s*$", pending_sentence):
-            final_sentence = _normalize_spaces(pending_sentence)
-            if final_sentence:
-                phrases.append(final_sentence)
-            pending_sentence = ""
+        for ltxt in line_stream:
+            # Join soft hyphenation across lines: "fea-" + "tures" => "features"
+            if pending_sentence.endswith("-") and re.match(r"^[A-Za-zÀ-ÿ]", ltxt):
+                pending_sentence = _normalize_spaces(f"{pending_sentence[:-1]}{ltxt}")
+            else:
+                pending_sentence = _append_fragment(pending_sentence, ltxt)
+            if re.search(r"[.!?…]\s*$", pending_sentence):
+                final_sentence = _normalize_spaces(pending_sentence)
+                if final_sentence:
+                    phrases.append(final_sentence)
+                pending_sentence = ""
 
-    if pending_sentence:
-        flushed = _flush_pending_sentence(pending_sentence, residual_texts, sentence_min_words=4)
-        if flushed:
-            phrases.append(flushed)
+        if pending_sentence:
+            flushed = _flush_pending_sentence(pending_sentence, residual_texts, sentence_min_words=4)
+            if flushed:
+                phrases.append(flushed)
 
     for rtxt in residual_texts:
         for chunk in _split_residual_chunks(rtxt):
@@ -1384,8 +3117,40 @@ def _build_fidelity_layout_export(blocks):
             "bbox": block.get("bbox"),
             "line_texts": list(block.get("line_texts", []) or []),
             "render_text_with_breaks": block.get("render_text_with_breaks", ""),
+            "semantic_phrases": [],
+            "semantic_spans": [],
             "lines": [],
         }
+        for phrase in block.get("semantic_phrases", []) or []:
+            b["semantic_phrases"].append(
+                {
+                    "sentence_id": phrase.get("sentence_id") or phrase.get("unit_id"),
+                    "text": _phrase_render_text(phrase),
+                    "raw_text": phrase.get("texte", ""),
+                    "bbox": phrase.get("bbox"),
+                    "start_line_index": phrase.get("start_line_index"),
+                    "end_line_index": phrase.get("end_line_index"),
+                    "line_indices": list(phrase.get("line_indices", []) or []),
+                    "multi_line": bool(phrase.get("multi_line", False)),
+                    "fragment_count": int(phrase.get("fragment_count", 0) or 0),
+                    "fragments": list(phrase.get("fragments", []) or []),
+                }
+            )
+        for semantic_span in block.get("semantic_spans", []) or []:
+            b["semantic_spans"].append(
+                {
+                    "unit_id": semantic_span.get("unit_id"),
+                    "text": semantic_span.get("text") or semantic_span.get("texte") or "",
+                    "bbox": semantic_span.get("bbox"),
+                    "line_indices": list(semantic_span.get("line_indices", []) or []),
+                    "multi_line": bool(semantic_span.get("multi_line", False)),
+                    "fragment_count": int(semantic_span.get("fragment_count", 0) or 0),
+                    "fragments": list(semantic_span.get("fragments", []) or []),
+                    "expression_semantics": semantic_span.get("expression_semantics", {}),
+                    "expression_relations": semantic_span.get("expression_relations", {}),
+                    "structural_context": semantic_span.get("structural_context", {}),
+                }
+            )
         for line in block.get("lines", []) or []:
             marker = line.get("leading_marker") or ""
             marker_norm = "•" if marker in {"", "▪", "◦", "·", "*"} else marker
@@ -1418,9 +3183,17 @@ def _build_fidelity_layout_export(blocks):
                     st = span.get("style", {}) if isinstance(span.get("style"), dict) else {}
                     p["spans"].append(
                         {
+                            "unit_id": span.get("unit_id"),
                             "text": span.get("texte", ""),
                             "bbox": span.get("bbox"),
+                            "source_kind": span.get("source_kind"),
+                            "translatable": bool(span.get("translatable", False)),
+                            "translation_strategy": span.get("translation_strategy"),
+                            "translated_text": span.get("translated_text", ""),
                             "skip_render": bool(span.get("skip_render", False)),
+                            "text_attributes": span.get("text_attributes", {}),
+                            "style_attributes": span.get("style_attributes", {}),
+                            "layout_attributes": span.get("layout_attributes", {}),
                             "style": {
                                 "font": st.get("font"),
                                 "size": st.get("size"),
@@ -1471,6 +3244,20 @@ def _write_layout_xml(blocks, filename, page_idx, img_w, img_h):
                 "bbox": _fmt_bbox(block.get("bbox")),
             },
         )
+        semantic_el = ET.SubElement(b_el, "semantic_phrases")
+        for phrase in block.get("semantic_phrases", []) or []:
+            sp_el = ET.SubElement(
+                semantic_el,
+                "semantic_phrase",
+                {
+                    "id": str(phrase.get("sentence_id") or phrase.get("unit_id") or ""),
+                    "bbox": _fmt_bbox(phrase.get("bbox")),
+                    "start_line_index": str(phrase.get("start_line_index", "")),
+                    "end_line_index": str(phrase.get("end_line_index", "")),
+                    "multi_line": "1" if bool(phrase.get("multi_line", False)) else "0",
+                },
+            )
+            sp_el.text = _phrase_render_text(phrase)
         for line in block.get("lines", []) or []:
             marker = line.get("leading_marker") or ""
             l_el = ET.SubElement(
@@ -1519,7 +3306,7 @@ def _write_layout_xml(blocks, filename, page_idx, img_w, img_h):
     return out_path
 
 
-def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default"):
+def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default", include_debug_layers=False):
     safe_filename = _safe_runtime_stem(filename)
     source_fn = f"src_{uuid.uuid4().hex}_{idx + 1}.png"
     source_path = os.path.join(RESULTS_DIR, source_fn)
@@ -1559,6 +3346,8 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
                 raw_ocr.append({"label": txt, "bbox": bbox, "score": float(s)})
     
     ocr_structure = parser.parse(raw_ocr, img) if raw_ocr else []
+    if ocr_structure:
+        ocr_structure = _prune_weak_ocr_lines(ocr_structure)
     font_ai_summary = {
         "enabled": False,
         "ready": False,
@@ -1567,13 +3356,20 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "attempted": 0,
         "matched": 0,
         "promoted": 0,
-        "reasons": {"font_ai_removed": 1},
+        "reasons": {"extraction_ai_bypassed": 1} if not EXTRACTION_AI_ENABLED else {"font_ai_removed": 1},
     }
-    if ocr_structure:
+    if EXTRACTION_AI_ENABLED and ocr_structure:
         font_ai_summary = apply_ai_font_matching(ocr_structure, img, enable_audit=font_ai_audit)
     final_blocks = _dedupe_final_blocks(native_blocks, ocr_structure)
+    merged_blocks_pre_postprocess = copy.deepcopy(final_blocks)
     final_blocks = _postprocess_blocks(final_blocks, img.width, img.height)
+    _enrich_layout_markers(final_blocks)
+    _build_semantic_phrases_for_blocks(final_blocks)
     _annotate_translation_contracts(final_blocks)
+    _build_semantic_spans_for_blocks(final_blocks)
+    _build_semantic_runs_for_blocks(final_blocks)
+    _build_semantic_groups_for_blocks(final_blocks)
+    merged_blocks_postprocess = copy.deepcopy(final_blocks)
     immutable_overlays = _extract_immutable_overlays(final_blocks, img, filename, idx)
 
     layout_meta = _annotate_layout(final_blocks, img.width, img.height)
@@ -1587,8 +3383,13 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         )
     except Exception as e:
         print(f"Erreur style profiler : {e}")
-    # Ensure layout markers remain present after style profiling transforms.
+    # Ensure layout markers and semantic phrases remain present after style profiling transforms.
     _enrich_layout_markers(final_blocks)
+    _build_semantic_phrases_for_blocks(final_blocks)
+    _annotate_translation_contracts(final_blocks)
+    _build_semantic_spans_for_blocks(final_blocks)
+    _build_semantic_runs_for_blocks(final_blocks)
+    _build_semantic_groups_for_blocks(final_blocks)
 
     # 3. GÉNERATION DU FOND MAÎTRE NETTOYÉ (Workflow Inpainting IA)
     bg_master_path = ""
@@ -1597,6 +3398,10 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     try:
         text_regions = _collect_text_regions_for_inpainting(final_blocks, non_text_zones, immutable_overlays=immutable_overlays)
         clean_bgr, mask, text_removal_debug = text_removal_strategy.remove(img, text_regions, mode=text_removal_mode)
+        # Pass complémentaire : effacer les mots PDF non couverts par l'extraction
+        # (en-têtes, pieds de page, grands titres décoratifs, etc.)
+        if pdf_page is not None:
+            clean_bgr = _erase_uncovered_pdf_words(clean_bgr, pdf_page, text_regions, sx, sy)
         bg_name = f"bg_master_{safe_filename}_{idx}.png"
         bg_master_path = os.path.join(RESULTS_DIR, bg_name)
         cv2.imwrite(bg_master_path, clean_bgr)
@@ -1621,7 +3426,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
 
     # 5. CONSTRUCTION DU CONTENU DÉTAILLÉ (Pour l affichage Flutter)
     display_text = f"DOC: {img.width}x{img.height} | DPI: {TARGET_DPI}\n"
-    display_text += f"FONTS: {len(native_blocks)} blocs natifs | OCR: {len(ocr_structure)} blocs IA\n"
+    display_text += f"FONTS: {len(native_blocks)} blocs natifs | OCR: {len(ocr_structure)} blocs OCR\n"
     
     for block in final_blocks:
         source_tag = "NATIVE" if block.get("source") == "native" else "OCR"
@@ -1708,20 +3513,37 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "style_profile": visual_style_profile,
         "font_ai_summary": font_ai_summary,
         "layout_version": "v4_layout_roles_alignment_style_profile",
-        "dimensions": {"width": img.width, "height": img.height},
+        "dimensions": {"width": img.width, "height": img.height, "dpi": TARGET_DPI, "unit": "px"},
     }
+    if include_debug_layers:
+        page_structure["debug_extraction_layers"] = {
+            "raw_ocr_words": copy.deepcopy(raw_ocr),
+            "ocr_blocks_parsed": copy.deepcopy(ocr_structure),
+            "merged_blocks_pre_postprocess": merged_blocks_pre_postprocess,
+            "merged_blocks_postprocess": merged_blocks_postprocess,
+        }
     try:
         # Canonical structure enrichment for stable translation/reconstruction.
         page_structure = layout_v2_builder.build(page_structure)
-        page_structure, layout_ai_info = layout_ai_enricher.enrich(page_structure, img)
-        if layout_ai_info.get("applied"):
-            page_structure = layout_v2_builder.build(page_structure)
+        if EXTRACTION_AI_ENABLED:
+            page_structure, layout_ai_info = layout_ai_enricher.enrich(page_structure, img)
+            if layout_ai_info.get("applied"):
+                page_structure = layout_v2_builder.build(page_structure)
+        else:
+            layout_ai_info = _disabled_layout_ai_info()
         page_structure, postprocess_info = apply_page_extraction_postprocessors(page_structure)
         if postprocess_info.get("changed") or postprocess_info.get("applied") or page_structure.get("native_structure"):
             page_structure = layout_v2_builder.build(page_structure)
         page_structure["layout_ai"] = layout_ai_info
         page_structure["extraction_postprocess"] = postprocess_info
+        _enrich_layout_markers(page_structure.get("blocks", []))
+        _build_semantic_phrases_for_blocks(page_structure.get("blocks", []))
         _annotate_translation_contracts(page_structure.get("blocks", []), page_context=page_structure)
+        _build_semantic_spans_for_blocks(page_structure.get("blocks", []))
+        _build_semantic_runs_for_blocks(page_structure.get("blocks", []))
+        _build_semantic_groups_for_blocks(page_structure.get("blocks", []))
+        hierarchical_extraction = _build_hierarchical_extraction(page_structure.get("blocks", []) or [])
+        fidelity_layout = _build_fidelity_layout_export(page_structure.get("blocks", []) or [])
     except Exception as e:
         print(f"Erreur LayoutV2Builder: {e}")
 
@@ -1864,6 +3686,22 @@ async def perform_ocr(file: UploadFile = File(...), force_ai: bool = False, font
             img = Image.open(save_path).convert("RGB")
             pages_results.append(process_page(img, 0, base_name, force_ai=force_ai, font_ai_audit=font_ai_audit, text_removal_mode=text_removal_mode))
         
+        for page_result in pages_results:
+            if not isinstance(page_result, dict):
+                continue
+            structure = page_result.get("structure")
+            if not isinstance(structure, dict):
+                continue
+            blocks = structure.get("blocks", []) or []
+            _enrich_layout_markers(blocks)
+            _build_semantic_phrases_for_blocks(blocks)
+            _annotate_translation_contracts(blocks, page_context=structure)
+            _build_semantic_spans_for_blocks(blocks)
+            _build_semantic_runs_for_blocks(blocks)
+            _build_semantic_groups_for_blocks(blocks)
+            page_result["hierarchical_extraction"] = _build_hierarchical_extraction(blocks)
+            page_result["fidelity_layout"] = _build_fidelity_layout_export(blocks)
+
         # Nettoyage récursif des types numpy avant envoi
         cleaned_results = json_serializable(pages_results)
         return JSONResponse(content={"status": "success", "results": cleaned_results})
@@ -2088,7 +3926,8 @@ async def healthcheck():
         content={
             "status": "ok",
             "service": "docs-parser",
-            "layout_ai_available": bool(layout_ai_enricher),
+            "layout_ai_available": bool(layout_ai_enricher) and EXTRACTION_AI_ENABLED,
+            "extraction_ai_enabled": EXTRACTION_AI_ENABLED,
             "results_url": "/results/",
         }
     )

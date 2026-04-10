@@ -109,6 +109,357 @@ class ReconstructorFontSizingTests(unittest.TestCase):
         min_fs = reconstructor._min_fontsize_for_item(item, 12.48, strict=True)
         self.assertGreaterEqual(min_fs, 11.9)
 
+    def test_native_style_fidelity_locks_min_fontsize_to_original(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "source": "native",
+            "descriptor_v3_contract": {"primary_structure_family": "dense_paragraph_flow"},
+            "descriptor_v3_render_unit": {"structure_priority": "secondary"},
+        }
+        self.assertEqual(reconstructor._min_fontsize_for_item(item, 15.0, strict=False), 15.0)
+        self.assertEqual(reconstructor._min_fontsize_for_item(item, 15.0, strict=True), 15.0)
+
+    def test_native_structured_editorial_body_locks_fontsize(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "source": "native",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "descriptor_typographic_class": "editorial_body",
+            "descriptor_structural_role": "body_paragraph",
+        }
+        self.assertTrue(reconstructor._item_native_style_fidelity_mode(item))
+        self.assertTrue(reconstructor._should_lock_fontsize_for_item(item))
+
+    def test_native_structured_editorial_body_keeps_source_anchor(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "source": "native",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "strict_bbox_mode": True,
+            "descriptor_typographic_class": "editorial_body",
+            "descriptor_structural_role": "body_paragraph",
+            "source_line_count": 8,
+            "page_data": {
+                "layout_type": "double_column",
+                "document_type": "mixed_unknown",
+            },
+        }
+        self.assertTrue(reconstructor._should_keep_source_anchor_for_item(item))
+
+    def test_translated_structured_table_band_body_keeps_source_anchor(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "source": "native",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "strict_bbox_mode": True,
+            "descriptor_typographic_class": "editorial_body",
+            "descriptor_structural_role": "table_value_cell",
+            "descriptor_band_role": "table_band",
+            "source_line_count": 8,
+            "page_data": {
+                "layout_type": "table_dominant",
+                "document_type": "form",
+            },
+        }
+        self.assertTrue(reconstructor._should_keep_source_anchor_for_item(item))
+
+    def test_reconstruct_translated_anchored_keeps_source_anchor_for_table_band_body(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "text": "Noms: DeBarros, Anthony, auteur.\nTitre: SQL pratique",
+            "bbox": fitz.Rect(73.44, 487.2, 506.4, 633.6),
+            "slots": [fitz.Rect(73.44, 487.2, 506.4, 498.24)],
+            "slot_w_pt": 432.96,
+            "slot_h_pt": 11.04,
+            "slot_gap_x_pt": 0.0,
+            "slot_gap_y_pt": 3.0,
+            "row_start_x_pt": 73.44,
+            "role": "body",
+            "source": "native",
+            "translated_block": True,
+            "strict_bbox_mode": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "source_lines": [
+                "Noms: DeBarros, Anthony, auteur.",
+                "Titre: SQL pratique",
+            ],
+            "source_line_count": 13,
+            "descriptor_band_role": "table_band",
+            "descriptor_structural_role": "table_value_cell",
+            "descriptor_typographic_class": "editorial_body",
+            "style": {"font": "helv", "size": 11.25, "color": "#000000", "flags": {}},
+        }
+        page_data = {
+            "page": 3,
+            "layout_type": "table_dominant",
+            "document_type": "form",
+            "blocks": [],
+        }
+
+        captured = []
+
+        def fake_extract(_page_data):
+            return [dict(item, page_data=page_data)]
+
+        def fake_render_block_slots(*, page, item, anchor_y, left, right, zone_top, zone_bottom, **kwargs):
+            captured.append((anchor_y, zone_bottom))
+            return "", anchor_y + 20.0, fitz.Rect(item["bbox"]), [fitz.Rect(item["bbox"])]
+
+        reconstructor._extract_block_slot_items = fake_extract
+        reconstructor._item_requires_anchored_render = lambda *args, **kwargs: True
+        reconstructor._group_visual_items = lambda items: ([], items)
+        reconstructor._looks_like_toc_page = lambda _page_data: False
+        reconstructor._render_block_slots = fake_render_block_slots
+
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        reconstructor._reconstruct_translated_anchored(doc, page, page_data, debug_store=None, forbidden_rects=[])
+
+        self.assertTrue(captured)
+        self.assertAlmostEqual(captured[0][0], item["bbox"].y0)
+
+    def test_translated_table_band_item_can_shift_to_avoid_overlap(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "translated_block": True,
+            "strict_bbox_mode": True,
+            "preserve_linebreaks": True,
+            "descriptor_band_role": "table_band",
+            "descriptor_structural_role": "table_value_cell",
+        }
+        self.assertTrue(reconstructor._should_shift_anchored_item_for_overlap(item))
+
+    def test_structured_strict_translated_body_can_paginate_on_overflow(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "translated_block": True,
+            "strict_bbox_mode": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "descriptor_structural_role": "body_paragraph",
+            "descriptor_typographic_class": "editorial_body",
+        }
+        self.assertTrue(reconstructor._should_paginate_strict_translated_item(item))
+
+    def test_overflow_continuation_item_relaxes_strict_bbox(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "role": "body",
+            "translated_block": True,
+            "strict_bbox_mode": True,
+            "preserve_sentence_integrity": True,
+            "keep_source_slot_geometry": True,
+        }
+        continued = reconstructor._overflow_continuation_item(item)
+        self.assertFalse(continued["strict_bbox_mode"])
+        self.assertTrue(continued["allow_vertical_expand"])
+        self.assertFalse(continued["preserve_sentence_integrity"])
+        self.assertFalse(continued["keep_source_slot_geometry"])
+
+    def test_split_text_to_preserve_fontsize_returns_multiple_lines_without_shrink(self):
+        reconstructor = DocumentReconstructor()
+        head, tail = reconstructor._split_text_to_preserve_fontsize(
+            "This is a long translated sentence that must wrap locally while preserving the original font size",
+            90.0,
+            12.0,
+            "helv",
+            None,
+        )
+        self.assertTrue(head)
+        self.assertTrue(tail)
+        self.assertLessEqual(
+            reconstructor._measure_text_width(head, 12.0, "helv", None),
+            90.0,
+        )
+
+    def test_descriptor_v3_constraint_can_lock_fontsize(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "descriptor_v3_placement_constraints": [
+                {
+                    "font_size_policy": {
+                        "mode": "lock",
+                    }
+                }
+            ]
+        }
+        self.assertTrue(reconstructor._should_lock_fontsize_for_item(item))
+        self.assertEqual(reconstructor._min_fontsize_for_item(item, 13.5), 13.5)
+
+    def test_descriptor_v3_constraint_can_lock_source_anchor(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "translated_block": True,
+            "descriptor_v3_placement_constraints": [
+                {
+                    "anchor_policy": {
+                        "source_y_locked": True,
+                    }
+                }
+            ],
+        }
+        self.assertTrue(reconstructor._should_keep_source_anchor_for_item(item))
+
+    def test_descriptor_v3_constraint_can_request_pagination(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "translated_block": True,
+            "strict_bbox_mode": True,
+            "descriptor_v3_placement_constraints": [
+                {
+                    "overflow_policy": {
+                        "mode": "paginate",
+                    }
+                }
+            ],
+        }
+        self.assertTrue(reconstructor._should_paginate_strict_translated_item(item))
+
+    def test_descriptor_v3_alignment_lock_preserves_alignment_when_line_is_wider_than_slot(self):
+        reconstructor = DocumentReconstructor()
+        item = {
+            "descriptor_v3_placement_constraints": [
+                {
+                    "style_invariants": {
+                        "preserve_alignment": True,
+                    }
+                }
+            ]
+        }
+        self.assertTrue(reconstructor._should_preserve_alignment_for_item(item))
+        applied, reason = reconstructor._resolve_applied_alignment(
+            expected_alignment="right",
+            line_w=140.0,
+            left=20.0,
+            right=100.0,
+            preserve_alignment=reconstructor._should_preserve_alignment_for_item(item),
+        )
+        self.assertEqual(applied, "right")
+        self.assertEqual(reason, "")
+        x = reconstructor._compute_aligned_x(
+            alignment="right",
+            line_w=140.0,
+            left=20.0,
+            right=100.0,
+            preferred_x=20.0,
+            preserve_alignment=True,
+        )
+        self.assertLess(x, 20.0)
+
+    def test_preserved_line_inline_segments_render_for_structured_body(self):
+        reconstructor = DocumentReconstructor()
+        reconstructor._rendered_signatures = set()
+        reconstructor._style_audit_records = []
+        captured = []
+        reconstructor._safe_insert_text_dedup = lambda page, point, text, fontsize, fontname, color: captured.append((text, fontsize, fontname))
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        item = {
+            "text": "Alpha Beta",
+            "bbox": fitz.Rect(20, 20, 180, 36),
+            "slots": [fitz.Rect(20, 20, 180, 36)],
+            "slot_h_pt": 16.0,
+            "slot_gap_y_pt": 2.0,
+            "slot_w_pt": 160.0,
+            "row_start_x_pt": 20.0,
+            "style": {"font": "helv", "size": 11.0, "color": "#000000"},
+            "source": "native",
+            "role": "body",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "source_lines": ["Alpha Beta"],
+            "source_line_styles": [{"font": "helv", "size": 11.0, "color": "#000000"}],
+            "source_line_inline_segments": [[
+                {
+                    "text": "Alpha",
+                    "bbox": fitz.Rect(20, 20, 68, 36),
+                    "style": {"font": "helv", "size": 11.0, "color": "#000000", "flags": {"bold": True}},
+                },
+                {
+                    "text": "Beta",
+                    "bbox": fitz.Rect(72, 20, 112, 36),
+                    "style": {"font": "courier", "size": 11.0, "color": "#000000", "flags": {"monospace": True}},
+                },
+            ]],
+            "descriptor_v3_placement_constraints": [
+                {
+                    "style_invariants": {"preserve_span_variation": True},
+                }
+            ],
+            "alignment": "left",
+        }
+        remaining, _, _, _ = reconstructor._render_block_slots(
+            page=page,
+            item=item,
+            anchor_y=20.0,
+            left=0.0,
+            right=300.0,
+            zone_top=0.0,
+            zone_bottom=200.0,
+            render=True,
+            forbidden_rects=[],
+        )
+        self.assertEqual(remaining, "")
+        self.assertEqual([entry[0] for entry in captured], ["Alpha", "Beta"])
+        doc.close()
+
+    def test_preserved_structured_line_uses_native_baseline_offset(self):
+        reconstructor = DocumentReconstructor()
+        reconstructor._rendered_signatures = set()
+        reconstructor._style_audit_records = []
+        captured = []
+        reconstructor._safe_insert_text_dedup = lambda page, point, text, fontsize, fontname, color: captured.append((text, point[1]))
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        item = {
+            "text": "Alpha",
+            "bbox": fitz.Rect(20, 20, 180, 36),
+            "slots": [fitz.Rect(20, 20, 180, 36)],
+            "slot_h_pt": 16.0,
+            "slot_gap_y_pt": 2.0,
+            "slot_w_pt": 160.0,
+            "row_start_x_pt": 20.0,
+            "style": {"font": "helv", "size": 11.0, "color": "#000000"},
+            "source": "native",
+            "role": "body",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "source_lines": ["Alpha"],
+            "source_line_metrics": [{"baseline_offset_pt": 5.5, "line_height_pt": 16.0}],
+            "alignment": "left",
+        }
+        remaining, _, _, _ = reconstructor._render_block_slots(
+            page=page,
+            item=item,
+            anchor_y=20.0,
+            left=0.0,
+            right=300.0,
+            zone_top=0.0,
+            zone_bottom=200.0,
+            render=True,
+            forbidden_rects=[],
+        )
+        self.assertEqual(remaining, "")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], "Alpha")
+        self.assertAlmostEqual(captured[0][1], 25.5, places=3)
+        doc.close()
+
     def test_native_dense_paragraph_flow_keeps_right_padding_margin(self):
         reconstructor = DocumentReconstructor()
         item = {
@@ -176,6 +527,119 @@ class ReconstructorFontSizingTests(unittest.TestCase):
                 "diagram_label",
             )
         )
+
+    def test_place_item_in_frames_preserves_native_fontsize_for_wrapped_body(self):
+        reconstructor = DocumentReconstructor()
+        captured = []
+        reconstructor._safe_insert_text_dedup = lambda page, point, text, fontsize, fontname, color: captured.append((text, fontsize))
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=600)
+        item = {
+            "kind": "body",
+            "text": "This translated paragraph should wrap across several lines while keeping the original native font size unchanged in the renderer.",
+            "bbox": fitz.Rect(40, 40, 220, 80),
+            "style": {"font": "helv", "size": 15.0, "color": "#000000"},
+            "source": "native",
+            "role": "body",
+            "descriptor_v3_contract": {"primary_structure_family": "dense_paragraph_flow"},
+            "descriptor_v3_render_unit": {"structure_priority": "secondary"},
+        }
+        frames = [fitz.Rect(40, 40, 170, 220)]
+        reconstructor._place_item_in_frames(page, item, frames, 0, 40, [], [])
+        self.assertTrue(captured)
+        self.assertTrue(all(abs(fontsize - 15.0) < 1e-6 for _, fontsize in captured))
+        doc.close()
+
+    def test_structured_lines_stack_from_rendered_rect_without_overlap(self):
+        reconstructor = DocumentReconstructor()
+        reconstructor._rendered_signatures = set()
+        reconstructor._style_audit_records = []
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=300)
+        item = {
+            "text": "First line\nSecond line",
+            "bbox": fitz.Rect(20, 20, 220, 42),
+            "slots": [
+                fitz.Rect(20, 20, 220, 28),
+                fitz.Rect(20, 29, 220, 37),
+            ],
+            "slot_h_pt": 8.0,
+            "slot_gap_y_pt": 1.0,
+            "slot_w_pt": 200.0,
+            "row_start_x_pt": 20.0,
+            "style": {"font": "helv", "size": 10.0, "color": "#000000"},
+            "source": "native",
+            "role": "body",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "source_lines": ["First line", "Second line"],
+            "alignment": "left",
+            "descriptor_structural_role": "body_paragraph",
+            "descriptor_band_role": "text_band",
+        }
+        remaining, _, _, used_slots = reconstructor._render_block_slots(
+            page=page,
+            item=item,
+            anchor_y=20.0,
+            left=0.0,
+            right=300.0,
+            zone_top=0.0,
+            zone_bottom=300.0,
+            render=True,
+            forbidden_rects=[],
+        )
+        self.assertEqual(remaining, "")
+        self.assertEqual(len(used_slots), 2)
+        self.assertLessEqual(used_slots[0].y1, used_slots[1].y0)
+        doc.close()
+
+    def test_structured_wrapped_line_keeps_trailing_numeric_token(self):
+        reconstructor = DocumentReconstructor()
+        reconstructor._rendered_signatures = set()
+        reconstructor._style_audit_records = []
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=400)
+        item = {
+            "text": "9781593278458 (pub) - ISBN 1593278454 (pub) - ISBN 9781593278274\n(fiche papier) - ISBN 1593278276 (fiche papier)",
+            "bbox": fitz.Rect(70, 100, 500, 150),
+            "slots": [
+                fitz.Rect(70, 100, 320, 111),
+                fitz.Rect(70, 111, 320, 122),
+                fitz.Rect(70, 122, 320, 133),
+            ],
+            "slot_h_pt": 11.0,
+            "slot_gap_y_pt": 0.5,
+            "slot_w_pt": 250.0,
+            "row_start_x_pt": 70.0,
+            "style": {"font": "UbuntuMono-Regular", "size": 11.25, "color": "#000000"},
+            "source": "native",
+            "role": "body",
+            "translated_block": True,
+            "preserve_linebreaks": True,
+            "use_structured_source_lines": True,
+            "source_lines": [
+                "9781593278458 (pub) - ISBN 1593278454 (pub) - ISBN 9781593278274",
+                "(fiche papier) - ISBN 1593278276 (fiche papier)",
+            ],
+            "descriptor_structural_role": "body_paragraph",
+            "descriptor_typographic_class": "editorial_body",
+            "alignment": "left",
+        }
+        reconstructor._render_block_slots(
+            page=page,
+            item=item,
+            anchor_y=100.0,
+            left=0.0,
+            right=600.0,
+            zone_top=0.0,
+            zone_bottom=400.0,
+            render=True,
+            forbidden_rects=[],
+        )
+        text = " ".join(page.get_text("text").split())
+        self.assertIn("9781593278274", text)
+        doc.close()
 
     def test_translated_body_lines_fit_source_slots_detects_overflow(self):
         reconstructor = DocumentReconstructor()

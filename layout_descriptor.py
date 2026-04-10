@@ -95,11 +95,11 @@ class LayoutDescriptorBuilder:
             ]
             regions.append(
                 {
-                    "id": f"region_col_{int(col.get('id', len(regions)))}",
+                    "id": f"region_col_{self._column_id_token(col, len(regions))}",
                     "type": "column",
                     "source": "synthetic_layout",
                     "bbox": bbox,
-                    "column_index": int(col.get("id", len(regions))),
+                    "column_index": self._column_numeric_index(col, len(regions)),
                     "parent_region_id": None,
                     "reading_order": len(regions),
                     "coverage_ratio": self._area(bbox) / max(1.0, page_w * page_h),
@@ -2397,12 +2397,21 @@ class LayoutDescriptorBuilder:
             x0 = float(col.get("x0", 0.0) or 0.0)
             x1 = float(col.get("x1", x0) or x0)
             if x0 <= cx <= x1:
-                return int(col.get("id", best))
+                return self._column_numeric_index(col, best)
             dist = min(abs(cx - x0), abs(cx - x1))
             if best_dist is None or dist < best_dist:
                 best_dist = dist
-                best = int(col.get("id", best))
+                best = self._column_numeric_index(col, best)
         return best
+
+    def _column_id_token(self, column, fallback):
+        return str((column or {}).get("id", fallback))
+
+    def _column_numeric_index(self, column, fallback):
+        try:
+            return int((column or {}).get("id", fallback))
+        except Exception:
+            return int(fallback)
 
     def _clean_text(self, text):
         return re.sub(r"\s+", " ", str(text or "")).strip()

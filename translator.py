@@ -2,6 +2,7 @@ import os
 import re
 import json
 import unicodedata
+import math
 from typing import Optional
 
 from block_typology import classify_block_typology
@@ -720,17 +721,282 @@ class DocumentTranslator:
             return False
         if not any(tok in src for tok in ("=", "(", ")", ".", "_")):
             return False
+        url_like = bool(
+            re.search(
+                r"(?:https?://|www\.|(?:[A-Za-z0-9-]+\.)+(?:com|org|net|io|ai|dev|app|edu|gov|fr|uk|de|jp)\b)",
+                src,
+                flags=re.IGNORECASE,
+            )
+        )
         if re.search(r"^\s*(?:def|class|return|import|from|lambda|for|while|if|else)\b", src):
             return True
         if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z_][A-Za-z0-9_]*", src):
             return True
-        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\s*\(", src):
+        if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\(", src):
             return True
         if re.search(r"\b(?:input|output|inputs|outputs|activation|name|summary)\s*=", src):
             return True
+        if url_like:
+            return False
         if re.search(r"\b[A-Za-z_][A-Za-z0-9_]{1,}\.[A-Za-z_][A-Za-z0-9_]{1,}", src):
             return True
         return False
+
+    def _line_primary_style(self, line):
+        if not isinstance(line, dict):
+            return {}
+        for phrase in line.get("phrases", []) or []:
+            if not isinstance(phrase, dict):
+                continue
+            style = phrase.get("style") or {}
+            if isinstance(style, dict) and style:
+                return style
+        return {}
+
+    def _looks_like_code_visible_line(self, line):
+        if not isinstance(line, dict):
+            return False
+        line_text = self._line_text_for_translation(line)
+        if not line_text:
+            return False
+        unit_type = self._normalize_spaces(line.get("unit_type") or "").lower()
+        phrases = line.get("phrases", []) or []
+        code_phrase = False
+        monospace_phrase = False
+        for phrase in phrases:
+            if not isinstance(phrase, dict):
+                continue
+            phrase_unit_type = self._normalize_spaces(phrase.get("unit_type") or "").lower()
+            if phrase_unit_type == "code_visible":
+                code_phrase = True
+            style = phrase.get("style") or {}
+            flags = style.get("flags") or {}
+            font_name = self._normalize_spaces(style.get("font") or "").lower()
+            if bool(flags.get("monospace")) or "courier" in font_name:
+                monospace_phrase = True
+        if unit_type == "code_visible":
+            return True
+        if code_phrase and (monospace_phrase or self._looks_like_programming_code_line(line_text)):
+            return True
+        return monospace_phrase and self._looks_like_programming_code_line(line_text)
+
+    def _block_has_immutable_programming_code(self, block):
+        if not isinstance(block, dict):
+            return False
+        if bool(block.get("immutable_code_block")):
+            return True
+        block_unit_type = self._normalize_spaces(block.get("unit_type") or "").lower()
+        if block_unit_type == "code_visible":
+            return True
+        lines = [line for line in (block.get("lines", []) or []) if self._line_text_for_translation(line)]
+        if not lines:
+            return False
+        code_lines = sum(1 for line in lines if self._looks_like_code_visible_line(line))
+        if code_lines >= max(2, len(lines) - 1):
+            return True
+        block_text = self._normalize_spaces(" ".join(self._line_text_for_translation(line) for line in lines))
+        if len(lines) == 1:
+            return code_lines >= 1 and self._looks_like_programming_code_line(block_text)
+        return code_lines >= 2 and self._looks_like_programming_code_line(block_text)
+
+    def _looks_like_heading_like_editorial_line(self, line, next_line=None):
+        if not isinstance(line, dict):
+            return False
+        text = self._line_text_for_translation(line)
+        if not text or self._looks_like_programming_code_line(text):
+            return False
+        words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", text)
+        if len(words) < 3 or len(words) > 18:
+            return False
+        alpha_chars = [ch for ch in text if ch.isalpha()]
+        if not alpha_chars:
+            return False
+        uppercase_ratio = sum(1 for ch in alpha_chars if ch.isupper()) / max(1, len(alpha_chars))
+        style = self._line_primary_style(line)
+        flags = style.get("flags") or {}
+        heading_like = uppercase_ratio >= 0.45 or bool(flags.get("uppercase"))
+        if not heading_like:
+            return False
+        if not isinstance(next_line, dict):
+            return True
+        next_text = self._line_text_for_translation(next_line)
+        if not next_text or self._looks_like_programming_code_line(next_text):
+            return False
+        next_words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", next_text)
+        if len(next_words) < 4:
+            return False
+        next_style = self._line_primary_style(next_line)
+        if self._normalize_spaces(style.get("font") or "") != self._normalize_spaces(next_style.get("font") or ""):
+            return True
+        if self._normalize_spaces(style.get("color") or "") != self._normalize_spaces(next_style.get("color") or ""):
+            return True
+        try:
+            return abs(float(style.get("size", 0.0) or 0.0) - float(next_style.get("size", 0.0) or 0.0)) >= 0.5
+        except Exception:
+            return False
+
+    def _translate_heading_like_line_fr(self, text, block_context="", domain="general", subdomain="", style="technique", tone="didactique"):
+        src = self._normalize_spaces(text)
+        if not src:
+            return src
+        if self._looks_like_programming_code_line(src):
+            return src
+        alpha_chars = [ch for ch in src if ch.isalpha()]
+        uppercase_ratio = sum(1 for ch in alpha_chars if ch.isupper()) / max(1, len(alpha_chars)) if alpha_chars else 0.0
+        marker_match = re.match(
+            r"^\s*(part|chapter|section|appendix)\s+([A-Za-z0-9IVXLC]+)\s*([:\-])?\s*(.+?)\s*$",
+            src,
+            flags=re.IGNORECASE,
+        )
+        marker_prefix = ""
+        marker_value = ""
+        separator = ""
+        core = src
+        if marker_match:
+            marker_prefix = marker_match.group(1).lower()
+            marker_value = self._normalize_spaces(marker_match.group(2))
+            separator = marker_match.group(3) or ""
+            core = self._normalize_spaces(marker_match.group(4))
+        source_for_translation = core
+        if uppercase_ratio >= 0.45 and core:
+            source_for_translation = core.lower()
+        translated_core = self._normalize_spaces(
+            self._translate_unit_text(
+                source_for_translation,
+                target_lang="fr",
+                strategy="layout_constrained",
+                block_context=block_context,
+                block_role="section_heading",
+                domain=domain,
+                subdomain=subdomain,
+                style=style,
+                tone=tone,
+            )
+        )
+        if not translated_core or translated_core.lower() == source_for_translation.lower():
+            translated_core = self._normalize_spaces(
+                self._direct_ct2_translate_chunks(source_for_translation, target_lang="fr")
+            )
+        translated_core = self._normalize_spaces(self._apply_cnn_glossary_fr(translated_core or source_for_translation))
+        translated_core = self._normalize_technical_terms_fr(self._fix_english_residuals_in_fr(translated_core))
+        translated_core = self._repair_heading_technical_terms_fr(src, translated_core)
+        if marker_prefix and translated_core:
+            prefix_map = {
+                "part": "partie",
+                "chapter": "chapitre",
+                "section": "section",
+                "appendix": "annexe",
+            }
+            prefix_fr = prefix_map.get(marker_prefix, marker_prefix)
+            translated_core = re.sub(
+                r"^\s*(?:partie|chapitre|section|annexe)\s+[A-Za-z0-9IVXLC]+\s*[:\-]?\s*",
+                "",
+                translated_core,
+                flags=re.IGNORECASE,
+            )
+            translated_core = f"{prefix_fr} {marker_value}{separator + ' ' if separator else ' '}{translated_core}".strip()
+        if uppercase_ratio >= 0.45:
+            translated_core = translated_core.upper()
+        return self._normalize_spaces(translated_core)
+
+    def _repair_heading_technical_terms_fr(self, source_text, translated_text):
+        src = self._normalize_spaces(source_text)
+        out = self._normalize_spaces(translated_text)
+        if not src or not out:
+            return out or src
+        src_lc = src.lower()
+        if "inception" in src_lc:
+            out = re.sub(r"\bmodules?\s+de\s+cr[ée]ation\b", "modules Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodules?\s+de\s+construction\b", "modules Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodules?\s+de\s+d[ée]marrage\b", "modules Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodules?\s+d['’]accueil\b", "modules Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bmodules?\s+d['’]Inception\b", "modules Inception", out, flags=re.IGNORECASE)
+            out = re.sub(r"\baccueil\b", "Inception", out, flags=re.IGNORECASE)
+        if "building" in src_lc:
+            out = re.sub(r"\bcr[ée]ation\b", "construction", out, flags=re.IGNORECASE)
+        if "max-pooling" in src_lc or "max pooling" in src_lc:
+            out = re.sub(r"\bmise en commun max\b", "max-pooling", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bcouches?\s+de\s+mise\s+en\s+commun\s+max\b", "couches de max-pooling", out, flags=re.IGNORECASE)
+            out = re.sub(r"\bcouches?\s+de\s+pooling\s+max\b", "couches de max-pooling", out, flags=re.IGNORECASE)
+        return self._normalize_spaces(out)
+
+    def _should_translate_simple_mixed_heading_body_block(self, block):
+        if not isinstance(block, dict):
+            return False
+        if self._normalize_spaces(block.get("role") or "").lower() != "body":
+            return False
+        if self._block_has_immutable_programming_code(block):
+            return False
+        lines = [line for line in (block.get("lines", []) or []) if self._line_text_for_translation(line)]
+        if len(lines) < 2 or len(lines) > 4:
+            return False
+        if any(self._looks_like_code_visible_line(line) for line in lines):
+            return False
+        if not self._looks_like_heading_like_editorial_line(lines[0], lines[1] if len(lines) > 1 else None):
+            return False
+        return all(
+            len([phrase for phrase in (line.get("phrases", []) or []) if self._normalize_spaces(phrase.get("texte") or "")]) <= 1
+            for line in lines
+        )
+
+    def _translate_simple_mixed_heading_body_block(
+        self,
+        block,
+        target_lang,
+        block_context="",
+        domain="general",
+        subdomain="",
+        style="professionnel",
+        tone="neutre",
+    ):
+        kept = []
+        for idx, line in enumerate(block.get("lines", []) or []):
+            orig_line_text = self._line_text_for_translation(line)
+            if not orig_line_text:
+                line["translated_text"] = ""
+                continue
+            if idx == 0 and self._normalize_lang_code(target_lang) == "fr":
+                translated_line = self._translate_heading_like_line_fr(
+                    orig_line_text,
+                    block_context=block_context,
+                    domain=domain,
+                    subdomain=subdomain,
+                    style=style,
+                    tone=tone,
+                )
+            else:
+                translated_line = self._translate_unit_text(
+                    orig_line_text,
+                    target_lang=target_lang,
+                    strategy="layout_constrained",
+                    block_context=block_context,
+                    block_role="body",
+                    domain=domain,
+                    subdomain=subdomain,
+                    style=style,
+                    tone=tone,
+                )
+                translated_line = self._normalize_spaces(translated_line)
+                if self._normalize_lang_code(target_lang) == "fr":
+                    translated_line = self._normalize_technical_terms_fr(
+                        self._fix_english_residuals_in_fr(
+                            self._apply_cnn_glossary_fr(translated_line)
+                        )
+                    )
+            if not translated_line:
+                translated_line = orig_line_text
+            translated_line = self._normalize_spaces(translated_line)
+            line["translated_text"] = translated_line
+            phrases = [phrase for phrase in (line.get("phrases", []) or []) if self._normalize_spaces(phrase.get("texte") or "")]
+            if len(phrases) == 1:
+                phrase = phrases[0]
+                phrase["texte_original"] = self._normalize_spaces(phrase.get("texte") or "")
+                phrase["translated_text"] = translated_line
+                phrase["texte"] = translated_line
+            kept.append(translated_line)
+        block["translated_text"] = self._normalize_spaces(" ".join(kept))
+        block["translation_compose_mode"] = "mixed_heading_body_preserved"
+        return block
 
     def _translate_short_label_fr(self, text, block_context="", block_role="body", domain="general", subdomain=""):
         src = self._normalize_spaces(text)
@@ -1375,6 +1641,15 @@ class DocumentTranslator:
                     block_contract["strategy"] = "layout_constrained"
                     block_contract["translatable"] = True
                     block_contract["coverage_required"] = "strict"
+            immutable_code_block = self._block_has_immutable_programming_code(block)
+            if immutable_code_block:
+                block["immutable_code_block"] = True
+                block_contract = {
+                    "strategy": "exact_preserve",
+                    "translatable": False,
+                    "coverage_required": "strict",
+                    "unit_type": block_unit_type or "code_visible",
+                }
             is_programming_code_line = bool(
                 role_lc in {"equation_inline", "equation_block"}
                 and self._looks_like_programming_code_line(block_text_preview)
@@ -1444,6 +1719,17 @@ class DocumentTranslator:
             block["detected_subdomain"] = subdomain
             block["detected_style"] = block_style
             block["detected_tone"] = block_tone
+            if self._should_translate_simple_mixed_heading_body_block(block):
+                self._translate_simple_mixed_heading_body_block(
+                    block,
+                    target_lang,
+                    block_context=block_ctx_txt,
+                    domain=domain,
+                    subdomain=subdomain,
+                    style=block_style,
+                    tone=block_tone,
+                )
+                continue
             if role_lc == "equation_inline" and not self._should_preserve_equation_role_text(block_text_preview):
                 kept = []
                 for line in block.get("lines", []):
@@ -1882,6 +2168,7 @@ class DocumentTranslator:
                     block_translated = re.sub(pat, repl, block_translated, flags=re.IGNORECASE)
             block["translated_text"] = self._dedupe_sentence_runs(block_translated)
 
+        self._enrich_leaf_translations_from_aux_segments(structure)
         self._post_dedupe_translated_blocks(structure)
         return structure
 
@@ -2427,18 +2714,30 @@ class DocumentTranslator:
             r["translated_label"] = translated
             page = (r.get("page") or "").strip()
             r["translated_text"] = (translated + (" " + page if page else "")).strip()
+        self._enrich_leaf_translations_from_aux_segments(structure)
         return structure
 
     def _line_text_for_translation(self, line):
-        txt = self._normalize_spaces((line.get("line_text") or "").strip())
-        if txt:
-            return txt
         parts = []
         for p in line.get("phrases", []):
             t = self._normalize_spaces((p.get("texte") or "").strip())
             if t:
                 parts.append(t)
-        return self._normalize_spaces(" ".join(parts))
+        phrase_text = self._normalize_spaces(" ".join(parts))
+        txt = self._normalize_spaces((line.get("line_text") or "").strip())
+        if not txt:
+            return phrase_text
+        if not phrase_text:
+            return txt
+        txt_score = sum(1 for c in txt if c.isalnum())
+        phrase_score = sum(1 for c in phrase_text if c.isalnum())
+        if phrase_score >= max(txt_score + 4, int(txt_score * 1.15)):
+            return phrase_text
+        if len(re.findall(r"\b[A-Z]\s+[A-Z]\b", txt)) >= 1 and phrase_score >= txt_score:
+            return phrase_text
+        if len(re.findall(r"\b[A-Z]\b", txt)) >= 2 and len(re.findall(r"\b[A-Z]\b", phrase_text)) < len(re.findall(r"\b[A-Z]\b", txt)):
+            return phrase_text
+        return txt
 
     def _is_marker_only_line(self, s):
         t = self._normalize_spaces(s)
@@ -4697,6 +4996,34 @@ class DocumentTranslator:
             str(style.get("color") or "").strip().lower(),
         )
 
+    def _span_too_small_for_phrase_translation(self, phrase, span, translated_text):
+        phrase_bbox = self._bbox_to_tuple((phrase or {}).get("bbox"))
+        span_bbox = self._bbox_to_tuple((span or {}).get("bbox"))
+        if not phrase_bbox or not span_bbox:
+            return False
+        phrase_area = self._bbox_area(phrase_bbox)
+        span_area = self._bbox_area(span_bbox)
+        if phrase_area <= 0.0 or span_area <= 0.0:
+            return False
+        translated = self._normalize_spaces(translated_text or "")
+        translated_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", translated))
+        if translated_words < 6:
+            return False
+        span_source = self._normalize_spaces((span or {}).get("texte") or (span or {}).get("text") or "")
+        span_source_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", span_source))
+        if span_source_words > 3:
+            return False
+        px0, py0, px1, py1 = phrase_bbox
+        sx0, sy0, sx1, sy1 = span_bbox
+        phrase_w = max(1.0, px1 - px0)
+        phrase_h = max(1.0, py1 - py0)
+        span_w = max(1.0, sx1 - sx0)
+        span_h = max(1.0, sy1 - sy0)
+        area_ratio = span_area / max(1.0, phrase_area)
+        width_ratio = span_w / phrase_w
+        height_ratio = span_h / phrase_h
+        return area_ratio < 0.18 and (width_ratio < 0.35 or height_ratio < 0.55)
+
     def _partition_translated_phrase_to_spans(self, translated_text, spans):
         text = self._normalize_spaces(translated_text)
         visible_spans = [
@@ -4705,13 +5032,17 @@ class DocumentTranslator:
             and not sp.get("skip_render")
             and self._normalize_spaces(sp.get("texte") or "")
         ]
-        if not text or len(visible_spans) < 2:
+        lexical_spans = [
+            sp for sp in visible_spans
+            if self._word_norm_for_match(sp.get("texte") or "")
+        ]
+        if not text or len(lexical_spans) < 2:
             return []
         tokens = text.split()
-        if len(tokens) < len(visible_spans):
+        if len(tokens) < len(lexical_spans):
             return []
         weights = []
-        for sp in visible_spans:
+        for sp in lexical_spans:
             source_text = self._normalize_spaces(sp.get("texte") or "")
             word_count = max(1, len(source_text.split()))
             char_count = max(1, len(re.sub(r"\s+", "", source_text)))
@@ -4740,7 +5071,7 @@ class DocumentTranslator:
                 return []
             parts.append(part)
             start = boundary
-        return parts if len(parts) == len(visible_spans) else []
+        return parts if len(parts) == len(lexical_spans) else []
 
     def _backfill_phrase_span_translations(self, phrase, translated_text=None):
         if not isinstance(phrase, dict):
@@ -4756,32 +5087,60 @@ class DocumentTranslator:
         ]
         if not visible_spans:
             return
+        lexical_spans = [
+            sp for sp in visible_spans
+            if self._word_norm_for_match(sp.get("texte") or "")
+        ]
         for sp in visible_spans:
             sp["texte_original"] = sp.get("texte", "")
-        if len(visible_spans) == 1:
-            if not self._normalize_spaces(visible_spans[0].get("translated_text") or ""):
-                visible_spans[0]["translated_text"] = self._normalize_spaces(
-                    translated_text or phrase.get("translated_text") or phrase.get("texte") or visible_spans[0].get("texte") or ""
+        if len(lexical_spans) == 1:
+            if self._span_too_small_for_phrase_translation(phrase, lexical_spans[0], translated_text):
+                return
+            if not self._normalize_spaces(lexical_spans[0].get("translated_text") or ""):
+                lexical_spans[0]["translated_text"] = self._normalize_spaces(
+                    translated_text or phrase.get("translated_text") or phrase.get("texte") or lexical_spans[0].get("texte") or ""
                 )
             return
-        if all(self._normalize_spaces(sp.get("translated_text") or "") for sp in visible_spans):
-            return
-        style_signatures = {self._span_style_signature(sp) for sp in visible_spans}
-        if len(style_signatures) < 2:
+        if not lexical_spans:
             return
         target_text = self._normalize_spaces(translated_text or phrase.get("translated_text") or phrase.get("texte") or "")
         if not target_text:
             return
-        source_joined = self._normalize_spaces(" ".join(self._normalize_spaces(sp.get("texte") or "") for sp in visible_spans))
+        # Détecter le cas dégénéré : tous les spans lexicaux ont déjà la traduction complète.
+        # Dans ce cas, forcer une redistribution proportionnelle plutôt que de laisser
+        # le même texte en double sur chaque span.
+        filled = [self._normalize_spaces(sp.get("translated_text") or "") for sp in lexical_spans]
+        all_filled = all(filled)
+        all_same_as_target = all_filled and all(t == target_text for t in filled)
+        # Détecter les spans "gloutons" : un span dont la traduction est significativement
+        # plus longue que la cible de la phrase a absorbé plus que sa part → forcer redistribution.
+        has_glouton = any(len(t) > len(target_text) * 1.3 for t in filled if t)
+        if all_filled and not all_same_as_target and not has_glouton:
+            # Chaque span a déjà une traduction distincte et cohérente → rien à faire.
+            return
+        # Cas normal (aucune traduction) ou cas dégénéré (même texte partout) :
+        # tenter une partition proportionnelle basée sur le poids source.
+        source_joined = self._normalize_spaces(" ".join(self._normalize_spaces(sp.get("texte") or "") for sp in lexical_spans))
         if target_text == source_joined:
-            for sp in visible_spans:
+            # La "traduction" est identique au source → passer le source tel quel span par span.
+            for sp in lexical_spans:
                 if not self._normalize_spaces(sp.get("translated_text") or ""):
                     sp["translated_text"] = self._normalize_spaces(sp.get("texte") or "")
             return
-        parts = self._partition_translated_phrase_to_spans(target_text, visible_spans)
+        parts = self._partition_translated_phrase_to_spans(target_text, lexical_spans)
         if not parts:
+            if not all_filled or has_glouton:
+                # Aucune partition possible : assigner au premier span lexical,
+                # en effaçant les éventuelles traductions gloutonnes.
+                first_assigned = False
+                for sp in lexical_spans:
+                    if not first_assigned:
+                        sp["translated_text"] = target_text
+                        first_assigned = True
+                    elif has_glouton:
+                        sp["translated_text"] = ""
             return
-        for sp, part in zip(visible_spans, parts):
+        for sp, part in zip(lexical_spans, parts):
             sp["translated_text"] = part
 
     def _dedupe_sentence_runs(self, text):
@@ -5028,3 +5387,611 @@ class DocumentTranslator:
                 st["color"] = "#101010"
         except Exception:
             return
+
+    def _bbox_to_tuple(self, bbox):
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            try:
+                return tuple(float(v) for v in bbox)
+            except Exception:
+                return None
+        return None
+
+    def _bbox_area(self, bbox):
+        rect = self._bbox_to_tuple(bbox)
+        if not rect:
+            return 0.0
+        x0, y0, x1, y1 = rect
+        return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+    def _bbox_intersection_area(self, bbox_a, bbox_b):
+        a = self._bbox_to_tuple(bbox_a)
+        b = self._bbox_to_tuple(bbox_b)
+        if not a or not b:
+            return 0.0
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+        ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+        return max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+
+    def _bbox_intersection_ratio(self, bbox_a, bbox_b):
+        area_a = self._bbox_area(bbox_a)
+        if area_a <= 0.0:
+            return 0.0
+        return self._bbox_intersection_area(bbox_a, bbox_b) / area_a
+
+    def _bbox_center_distance(self, bbox_a, bbox_b):
+        a = self._bbox_to_tuple(bbox_a)
+        b = self._bbox_to_tuple(bbox_b)
+        if not a or not b:
+            return float("inf")
+        acx = (a[0] + a[2]) / 2.0
+        acy = (a[1] + a[3]) / 2.0
+        bcx = (b[0] + b[2]) / 2.0
+        bcy = (b[1] + b[3]) / 2.0
+        return math.hypot(acx - bcx, acy - bcy)
+
+    def _normalized_aux_match_text(self, text):
+        s = self._normalize_spaces(text or "")
+        s = re.sub(r"^[\u2022\u25A0\u25AA\u25AB\u25CF\u2043\-\*]+\s*", "", s)
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    def _word_norm_for_match(self, text):
+        s = self._normalized_aux_match_text(text)
+        return "".join(ch.lower() for ch in s if ch.isalnum())
+
+    def _unit_source_text_for_hydration(self, unit):
+        return self._normalize_spaces(
+            unit.get("texte_original")
+            or unit.get("translated_text")
+            or unit.get("texte")
+            or unit.get("text")
+            or unit.get("line_text")
+            or ""
+        )
+
+    def _should_replace_with_aux_translation(self, current_text, source_text):
+        current = self._normalize_spaces(current_text or "")
+        source = self._normalize_spaces(source_text or "")
+        if not current:
+            return True
+        if not source:
+            return False
+        current_norm = self._word_norm_for_match(current)
+        source_norm = self._word_norm_for_match(source)
+        if not current_norm:
+            return True
+        if source_norm and current_norm == source_norm and any(ch.isalpha() for ch in source):
+            return True
+        return False
+
+    def _iter_aux_translated_segments(self, page_data):
+        segments = []
+        seen = set()
+
+        def add_segment(text, bbox, source_text="", segment_type="aux", path=""):
+            text_n = self._normalize_spaces(text or "")
+            bbox_n = self._bbox_to_tuple(bbox)
+            if not text_n or not bbox_n or self._bbox_area(bbox_n) <= 0.0:
+                return
+            key = (tuple(round(v, 2) for v in bbox_n), text_n, str(segment_type or "aux"))
+            if key in seen:
+                return
+            seen.add(key)
+            segments.append(
+                {
+                    "id": path or f"aux:{len(segments)}",
+                    "text": text_n,
+                    "source_text": self._normalize_spaces(source_text or ""),
+                    "bbox": bbox_n,
+                    "segment_type": str(segment_type or "aux").strip().lower(),
+                }
+            )
+
+        def walk(node, path="root"):
+            if isinstance(node, dict):
+                add_segment(
+                    node.get("translated_label"),
+                    node.get("label_bbox"),
+                    source_text=node.get("label"),
+                    segment_type="label",
+                    path=f"{path}:translated_label",
+                )
+                add_segment(
+                    node.get("translated_page_number") or node.get("page"),
+                    node.get("page_bbox"),
+                    source_text=node.get("page"),
+                    segment_type="page",
+                    path=f"{path}:page",
+                )
+                add_segment(
+                    node.get("translated_text"),
+                    node.get("bbox"),
+                    source_text=node.get("text") or node.get("texte") or node.get("label"),
+                    segment_type="translated_text",
+                    path=f"{path}:translated_text",
+                )
+                for key, value in node.items():
+                    walk(value, f"{path}.{key}")
+            elif isinstance(node, list):
+                for idx, item in enumerate(node):
+                    walk(item, f"{path}[{idx}]")
+
+        walk(page_data or {})
+        return segments
+
+    def _aux_segment_match_rank(self, unit_source, seg):
+        unit_norm = self._word_norm_for_match(unit_source)
+        seg_source_norm = self._word_norm_for_match(seg.get("source_text") or "")
+        seg_text_norm = self._word_norm_for_match(seg.get("text") or "")
+        if not unit_norm:
+            return 1 if seg_text_norm else 0
+        if seg_source_norm:
+            if unit_norm == seg_source_norm:
+                return 4
+            if unit_norm in seg_source_norm or seg_source_norm in unit_norm:
+                return 3
+        if seg_text_norm:
+            if unit_norm == seg_text_norm:
+                return 2
+            if unit_norm in seg_text_norm or seg_text_norm in unit_norm:
+                return 1
+        return 0
+
+    def _best_aux_segment_for_unit(self, unit, segments, used_segment_ids=None):
+        bbox = self._bbox_to_tuple(unit.get("bbox"))
+        if not bbox or self._bbox_area(bbox) <= 0.0:
+            return None
+        source_text = self._unit_source_text_for_hydration(unit)
+        source_norm = self._word_norm_for_match(source_text)
+        if not source_norm:
+            return None
+        best = None
+        best_key = None
+        for seg in segments or []:
+            seg_id = seg.get("id")
+            if used_segment_ids is not None and seg_id in used_segment_ids and seg.get("segment_type") != "page":
+                continue
+            overlap = max(
+                self._bbox_intersection_ratio(bbox, seg.get("bbox")),
+                self._bbox_intersection_ratio(seg.get("bbox"), bbox),
+            )
+            if overlap <= 0.0:
+                continue
+            rank = self._aux_segment_match_rank(source_text, seg)
+            if source_text and rank <= 0:
+                continue
+            dist = self._bbox_center_distance(bbox, seg.get("bbox"))
+            area_gap = abs(self._bbox_area(seg.get("bbox")) - self._bbox_area(bbox))
+            key = (-rank, -overlap, dist, area_gap, str(seg_id or ""))
+            if best_key is None or key < best_key:
+                best_key = key
+                best = seg
+        return best
+
+    def _visible_phrase_spans(self, phrase):
+        return [
+            sp for sp in (phrase.get("spans") or [])
+            if isinstance(sp, dict)
+            and not sp.get("skip_render")
+            and self._normalize_spaces(sp.get("texte") or sp.get("text") or "")
+        ]
+
+    def _compose_phrase_translation_from_spans(self, phrase):
+        visible_spans = self._visible_phrase_spans(phrase)
+        has_real_translated_span = False
+        for span in visible_spans:
+            translated = self._normalize_spaces(span.get("translated_text") or "")
+            source = self._normalize_spaces(span.get("texte") or span.get("text") or "")
+            if translated and self._word_norm_for_match(translated) and self._word_norm_for_match(translated) != self._word_norm_for_match(source):
+                has_real_translated_span = True
+                break
+        parts = []
+        for span in visible_spans:
+            translated = self._normalize_spaces(span.get("translated_text") or "")
+            source = self._normalize_spaces(span.get("texte") or span.get("text") or "")
+            text = translated
+            if not text:
+                if has_real_translated_span:
+                    # Preserve only non-lexical residue such as bullets, punctuation,
+                    # or pure numeric page markers when another sibling span already
+                    # carries the translated lexical content.
+                    source_norm = self._word_norm_for_match(source)
+                    if not source_norm or source_norm.isdigit():
+                        text = source
+                else:
+                    text = source
+            if text:
+                parts.append(text)
+        return self._normalize_spaces(" ".join(parts))
+
+    def _compose_line_translation_from_phrases(self, line):
+        parts = []
+        for phrase in (line.get("phrases") or []):
+            text = self._normalize_spaces(
+                phrase.get("translated_text")
+                or phrase.get("texte")
+                or phrase.get("text")
+                or ""
+            )
+            if text:
+                parts.append(text)
+        return self._normalize_spaces(" ".join(parts))
+
+    def _compose_block_translation_from_lines(self, block):
+        parts = []
+        for line in (block.get("lines") or []):
+            text = self._normalize_spaces(
+                line.get("translated_text")
+                or line.get("line_text")
+                or ""
+            )
+            if text:
+                parts.append(text)
+        return self._normalize_spaces(" ".join(parts))
+
+    def _line_source_text_raw(self, line):
+        if not isinstance(line, dict):
+            return ""
+        text = self._normalize_spaces(line.get("line_text") or line.get("text") or "")
+        if text:
+            return text
+        parts = []
+        for phrase in (line.get("phrases") or []):
+            if not isinstance(phrase, dict):
+                continue
+            phrase_text = self._normalize_spaces(
+                phrase.get("texte_original")
+                or phrase.get("text")
+                or phrase.get("texte")
+                or ""
+            )
+            if phrase_text:
+                parts.append(phrase_text)
+        return self._normalize_spaces(" ".join(parts))
+
+    def _set_line_translation(self, line, translated_text):
+        if not isinstance(line, dict):
+            return
+        text = self._normalize_spaces(translated_text or "")
+        if not text:
+            return
+        line["translated_text"] = text
+        self._sync_simple_line_leaves_from_translation(line, text)
+
+    def _sync_simple_line_leaves_from_translation(self, line, translated_text=None):
+        if not isinstance(line, dict):
+            return
+        text = self._normalize_spaces(translated_text or line.get("translated_text") or "")
+        if not text:
+            return
+        phrases = [ph for ph in (line.get("phrases") or []) if isinstance(ph, dict)]
+        if len(phrases) == 1:
+            phrase = phrases[0]
+            phrase["translated_text"] = text
+            phrase["texte"] = text
+            visible_spans = self._visible_phrase_spans(phrase)
+            lexical_spans = [
+                sp for sp in visible_spans
+                if self._word_norm_for_match(sp.get("texte") or sp.get("text") or "")
+            ]
+            if len(visible_spans) == 1:
+                if not self._span_too_small_for_phrase_translation(phrase, visible_spans[0], text):
+                    visible_spans[0]["translated_text"] = text
+                return
+            if len(lexical_spans) == 1:
+                lexical_span = lexical_spans[0]
+                if self._span_too_small_for_phrase_translation(phrase, lexical_span, text):
+                    return
+                lexical_text = text
+                prefix_parts = []
+                for sp in visible_spans:
+                    if sp is lexical_span:
+                        break
+                    if self._word_norm_for_match(sp.get("texte") or sp.get("text") or ""):
+                        continue
+                    prefix_text = self._normalize_spaces(
+                        sp.get("translated_text")
+                        or sp.get("texte")
+                        or sp.get("text")
+                        or ""
+                    )
+                    if prefix_text:
+                        prefix_parts.append(prefix_text)
+                prefix = self._normalize_spaces(" ".join(prefix_parts))
+                if prefix and lexical_text.startswith(prefix):
+                    lexical_text = self._normalize_spaces(lexical_text[len(prefix):])
+                lexical_span["translated_text"] = lexical_text or text
+                return
+            self._backfill_phrase_span_translations(phrase, text)
+
+    def _is_marker_only_line_text(self, text):
+        s = self._normalize_spaces(text or "")
+        if not s:
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:\d+(?:\.\d+)*|[IVXLCDM]+(?:\.\d+)*|[A-Z])",
+                s,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _split_marker_translation(self, source_text, translated_text):
+        source = self._normalize_spaces(source_text or "")
+        translated = self._normalize_spaces(translated_text or "")
+        if not source or not translated:
+            return None
+        source_escaped = re.escape(source)
+        match = re.match(rf"^\s*{source_escaped}(?:\s+|:\s+|-+\s+)?(.+?)\s*$", translated)
+        if not match:
+            return None
+        remainder = self._normalize_spaces(match.group(1) or "")
+        if not self._word_norm_for_match(remainder):
+            return None
+        return source, remainder
+
+    def _strip_multiline_source_suffixes(self, translated_text, source_lines):
+        cleaned = self._normalize_spaces(translated_text or "")
+        if not cleaned:
+            return cleaned
+        for src in reversed(list(source_lines or [])[1:]):
+            source = self._normalize_spaces(src or "")
+            if not source or not self._word_norm_for_match(source):
+                continue
+            if len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", source)) < 2:
+                continue
+            if self._word_norm_for_match(cleaned) == self._word_norm_for_match(source):
+                continue
+            if cleaned.lower().endswith(source.lower()):
+                prefix = self._normalize_spaces(cleaned[:-len(source)])
+                if self._word_norm_for_match(prefix):
+                    cleaned = prefix
+        return cleaned
+
+    def _rebalance_block_line_translations(self, block):
+        if not isinstance(block, dict):
+            return
+        lines = [ln for ln in (block.get("lines") or []) if isinstance(ln, dict)]
+        if not lines:
+            return
+
+        for idx in range(len(lines) - 1):
+            line = lines[idx]
+            next_line = lines[idx + 1]
+            source = self._line_source_text_raw(line)
+            if not self._is_marker_only_line_text(source):
+                continue
+            split = self._split_marker_translation(source, line.get("translated_text"))
+            if not split:
+                continue
+            marker_text, lexical_remainder = split
+            next_source = self._line_source_text_raw(next_line)
+            if not self._word_norm_for_match(next_source):
+                continue
+            if not self._should_replace_with_aux_translation(next_line.get("translated_text"), next_source):
+                continue
+            self._set_line_translation(line, marker_text)
+            self._set_line_translation(next_line, lexical_remainder)
+
+        for phrase in (block.get("semantic_phrases") or []):
+            if not isinstance(phrase, dict):
+                continue
+            line_indices = [
+                int(v) for v in (phrase.get("line_indices") or [])
+                if isinstance(v, (int, float)) and 0 <= int(v) < len(lines)
+            ]
+            if len(line_indices) < 2:
+                continue
+            phrase_source = self._normalize_spaces(phrase.get("text") or phrase.get("texte") or "")
+            phrase_translated = self._normalize_spaces(phrase.get("translated_text") or "")
+            if not phrase_translated or self._should_replace_with_aux_translation(phrase_translated, phrase_source):
+                continue
+            source_lines = [self._line_source_text_raw(lines[i]) for i in line_indices]
+            phrase_translated = self._strip_multiline_source_suffixes(phrase_translated, source_lines)
+            if phrase_translated:
+                phrase["translated_text"] = phrase_translated
+            if not any(self._word_norm_for_match(src) for src in source_lines):
+                continue
+            if any(self._is_marker_only_line_text(src) or self._word_norm_for_match(src).isdigit() for src in source_lines):
+                continue
+            markers = [(lines[i].get("leading_marker") or "").strip() for i in line_indices]
+            redistributed = self._redistribute_translated_to_lines(phrase_translated, source_lines, markers)
+            if not redistributed or len(redistributed) != len(line_indices):
+                continue
+            should_apply = False
+            for rel_idx, line_idx in enumerate(line_indices):
+                candidate = self._normalize_spaces(redistributed[rel_idx] or "")
+                source_line = self._normalize_spaces(source_lines[rel_idx] or "")
+                current_line = self._normalize_spaces((lines[line_idx] or {}).get("translated_text") or "")
+                if not candidate:
+                    continue
+                if (
+                    self._should_replace_with_aux_translation(current_line, source_line)
+                    and self._word_norm_for_match(candidate) != self._word_norm_for_match(source_line)
+                ):
+                    should_apply = True
+                    break
+            if not should_apply:
+                continue
+            for rel_idx, line_idx in enumerate(line_indices):
+                candidate = self._normalize_spaces(redistributed[rel_idx] or "")
+                source_line = self._normalize_spaces(source_lines[rel_idx] or "")
+                if not candidate:
+                    continue
+                current_line = self._normalize_spaces((lines[line_idx] or {}).get("translated_text") or "")
+                if self._should_replace_with_aux_translation(current_line, source_line):
+                    self._set_line_translation(lines[line_idx], candidate)
+
+        # Phase 3: if a translated lexical line still carries content that
+        # visibly belongs to following lexical continuation lines, redistribute
+        # it over the local lexical run instead of keeping everything on the
+        # first rendered line.
+        idx = 0
+        while idx < len(lines) - 1:
+            current_line = lines[idx]
+            current_source = self._line_source_text_raw(current_line)
+            current_translated = self._normalize_spaces(current_line.get("translated_text") or "")
+            if (
+                not self._word_norm_for_match(current_source)
+                or self._is_marker_only_line_text(current_source)
+                or self._word_norm_for_match(current_source).isdigit()
+                or not current_translated
+                or self._should_replace_with_aux_translation(current_translated, current_source)
+            ):
+                idx += 1
+                continue
+            run_indices = [idx]
+            probe = idx + 1
+            while probe < len(lines):
+                probe_source = self._line_source_text_raw(lines[probe])
+                if (
+                    not self._word_norm_for_match(probe_source)
+                    or self._is_marker_only_line_text(probe_source)
+                    or self._word_norm_for_match(probe_source).isdigit()
+                ):
+                    break
+                probe_translated = self._normalize_spaces(lines[probe].get("translated_text") or "")
+                if not self._should_replace_with_aux_translation(probe_translated, probe_source):
+                    break
+                run_indices.append(probe)
+                probe += 1
+            if len(run_indices) < 2:
+                idx += 1
+                continue
+            run_source_lines = [self._line_source_text_raw(lines[i]) for i in run_indices]
+            candidate_text = self._strip_multiline_source_suffixes(current_translated, run_source_lines)
+            run_markers = [(lines[i].get("leading_marker") or "").strip() for i in run_indices]
+            redistributed = self._redistribute_translated_to_lines(candidate_text, run_source_lines, run_markers)
+            if redistributed and len(redistributed) == len(run_indices):
+                changed = any(
+                    self._normalize_spaces(redistributed[pos] or "")
+                    != self._normalize_spaces(lines[line_idx].get("translated_text") or "")
+                    for pos, line_idx in enumerate(run_indices)
+                )
+                improved = any(
+                    self._word_norm_for_match(self._normalize_spaces(redistributed[pos] or ""))
+                    != self._word_norm_for_match(self._line_source_text_raw(lines[line_idx]))
+                    for pos, line_idx in enumerate(run_indices[1:], start=1)
+                )
+                if changed and improved:
+                    for pos, line_idx in enumerate(run_indices):
+                        candidate = self._normalize_spaces(redistributed[pos] or "")
+                        if candidate:
+                            self._set_line_translation(lines[line_idx], candidate)
+            idx = run_indices[-1] + 1
+
+        for line in lines:
+            self._sync_simple_line_leaves_from_translation(line)
+
+    def _sync_semantic_translations_from_lines(self, block):
+        lines = list(block.get("lines") or [])
+        for phrase in (block.get("semantic_phrases") or []):
+            line_indices = [
+                int(v) for v in (phrase.get("line_indices") or [])
+                if isinstance(v, (int, float))
+            ]
+            parts = []
+            for idx in line_indices:
+                if 0 <= idx < len(lines):
+                    text = self._normalize_spaces((lines[idx] or {}).get("translated_text") or "")
+                    if text:
+                        parts.append(text)
+            composed = self._normalize_spaces(" ".join(parts))
+            if composed and self._should_replace_with_aux_translation(phrase.get("translated_text"), phrase.get("text") or phrase.get("texte")):
+                phrase["translated_text"] = composed
+        for semantic_span in (block.get("semantic_spans") or []):
+            best = self._best_nested_span_for_semantic_span(block, semantic_span)
+            if best:
+                translated = self._normalize_spaces(best.get("translated_text") or best.get("texte") or best.get("text") or "")
+                if translated and self._should_replace_with_aux_translation(semantic_span.get("translated_text"), semantic_span.get("text") or semantic_span.get("texte")):
+                    semantic_span["translated_text"] = translated
+
+    def _best_nested_span_for_semantic_span(self, block, semantic_span):
+        target_bbox = self._bbox_to_tuple(semantic_span.get("bbox"))
+        if not target_bbox:
+            return None
+        target_source = self._unit_source_text_for_hydration(semantic_span)
+        best = None
+        best_key = None
+        for line in (block.get("lines") or []):
+            for phrase in (line.get("phrases") or []):
+                for span in self._visible_phrase_spans(phrase):
+                    span_bbox = self._bbox_to_tuple(span.get("bbox"))
+                    if not span_bbox:
+                        continue
+                    overlap = max(
+                        self._bbox_intersection_ratio(target_bbox, span_bbox),
+                        self._bbox_intersection_ratio(span_bbox, target_bbox),
+                    )
+                    if overlap <= 0.0:
+                        continue
+                    rank = self._aux_segment_match_rank(target_source, {"source_text": span.get("texte") or span.get("text"), "text": span.get("translated_text") or span.get("texte") or span.get("text")})
+                    if target_source and rank <= 0:
+                        continue
+                    dist = self._bbox_center_distance(target_bbox, span_bbox)
+                    key = (-rank, -overlap, dist)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best = span
+        return best
+
+    def _enrich_leaf_translations_from_aux_segments(self, structure):
+        if not isinstance(structure, dict):
+            return structure
+        segments = self._iter_aux_translated_segments(structure)
+        if not segments:
+            return structure
+        for block in structure.get("blocks", []) or []:
+            block_bbox = self._bbox_to_tuple(block.get("bbox"))
+            if not block_bbox:
+                continue
+            block_segments = [
+                seg for seg in segments
+                if self._bbox_intersection_area(block_bbox, seg.get("bbox")) > 0.0
+            ]
+            if not block_segments:
+                continue
+            used_segment_ids = set()
+            for line in (block.get("lines") or []):
+                for phrase in (line.get("phrases") or []):
+                    for span in self._visible_phrase_spans(phrase):
+                        best = self._best_aux_segment_for_unit(span, block_segments, used_segment_ids=used_segment_ids)
+                        if not best:
+                            continue
+                        source_text = span.get("texte_original") or span.get("texte") or span.get("text") or ""
+                        if not self._should_replace_with_aux_translation(span.get("translated_text"), source_text):
+                            continue
+                        span["texte_original"] = source_text
+                        span["translated_text"] = self._normalize_spaces(best.get("text") or "")
+                        used_segment_ids.add(best.get("id"))
+                    phrase_source = phrase.get("texte_original") or phrase.get("text") or phrase.get("texte") or ""
+                    composed_phrase = self._compose_phrase_translation_from_spans(phrase)
+                    if composed_phrase and self._should_replace_with_aux_translation(phrase.get("translated_text"), phrase_source):
+                        phrase["texte_original"] = phrase_source or phrase.get("texte_original") or ""
+                        phrase["translated_text"] = composed_phrase
+                        phrase["texte"] = composed_phrase
+                    elif self._should_replace_with_aux_translation(phrase.get("translated_text"), phrase_source):
+                        best = self._best_aux_segment_for_unit(phrase, block_segments, used_segment_ids=used_segment_ids)
+                        if best:
+                            phrase["texte_original"] = phrase_source or phrase.get("texte_original") or ""
+                            phrase["translated_text"] = self._normalize_spaces(best.get("text") or "")
+                            phrase["texte"] = phrase["translated_text"]
+                            used_segment_ids.add(best.get("id"))
+                line_source = line.get("line_text") or line.get("text") or ""
+                composed_line = self._compose_line_translation_from_phrases(line)
+                if composed_line and self._should_replace_with_aux_translation(line.get("translated_text"), line_source):
+                    line["translated_text"] = composed_line
+                elif self._should_replace_with_aux_translation(line.get("translated_text"), line_source):
+                    best = self._best_aux_segment_for_unit(line, block_segments, used_segment_ids=used_segment_ids)
+                    if best:
+                        line["translated_text"] = self._normalize_spaces(best.get("text") or "")
+                        used_segment_ids.add(best.get("id"))
+            self._rebalance_block_line_translations(block)
+            block_source = block.get("text") or block.get("raw_text") or ""
+            composed_block = self._compose_block_translation_from_lines(block)
+            if composed_block and self._should_replace_with_aux_translation(block.get("translated_text"), block_source):
+                block["translated_text"] = composed_block
+            self._sync_semantic_translations_from_lines(block)
+        return structure

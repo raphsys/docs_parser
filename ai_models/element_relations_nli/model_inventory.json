@@ -1,0 +1,28 @@
+{
+  "default_model": "cross_encoder_nli_deberta_v3_xsmall_onnx_quint8_avx2",
+  "models": {
+    "cross_encoder_nli_deberta_v3_xsmall_onnx_quint8_avx2": {
+      "backend": "onnx_nli",
+      "license": "Apache-2.0",
+      "source_repo": "cross-encoder/nli-deberta-v3-xsmall",
+      "target_dir": "ai_models/element_relations_nli",
+      "target_model_path": "onnx/model_quint8_avx2.onnx",
+      "required_files": [
+        "config.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json"
+      ],
+      "optional_files": [
+        "tokenizer.json",
+        "vocab.json",
+        "merges.txt",
+        "sentencepiece.bpe.model",
+        "onnx/model.onnx",
+        "onnx/model_qint8_arm64.onnx",
+        "onnx/model_qint8_avx512.onnx",
+        "onnx/model_qint8_avx512_vnni.onnx"
+      ],
+      "notes": "Recommended default for CPU inference. Keep Hugging Face tokenizer/config files in the root and the quantized ONNX model under onnx/."
+    }
+  }
+}

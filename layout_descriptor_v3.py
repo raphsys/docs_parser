@@ -80,7 +80,7 @@ class LayoutDescriptorBuilderV3:
         for col in columns:
             observed_regions.append(
                 {
-                    "id": f"obs_col_{int(col.get('id', len(observed_regions)) or len(observed_regions))}",
+                    "id": f"obs_col_{self._column_id_token(col, len(observed_regions))}",
                     "type": "column",
                     "bbox": [
                         float(col.get("x0", 0.0) or 0.0),
@@ -106,6 +106,7 @@ class LayoutDescriptorBuilderV3:
             )
 
         elements = []
+        phrase_elements = []
         spans = []
         for block_idx, block in enumerate(blocks):
             block_id = str(block.get("id") or f"block_{block_idx}")
@@ -122,6 +123,7 @@ class LayoutDescriptorBuilderV3:
                 "source": str(block.get("source") or "ocr"),
                 "text": self._clean_text(block.get("translated_text") or block.get("text") or ""),
                 "style": self._style_payload(block),
+                "translation_ruleset_summary": dict(block.get("translation_ruleset_summary") or {}),
             }
             elements.append(block_node)
             for line_idx, line in enumerate(block.get("lines") or []):
@@ -143,10 +145,10 @@ class LayoutDescriptorBuilderV3:
                 for phrase_idx, phrase in enumerate(line.get("phrases") or []):
                     phrase_bbox = self._norm_bbox(phrase.get("bbox"))
                     phrase_text = self._clean_text(phrase.get("translated_text") or phrase.get("text") or phrase.get("texte") or "")
-                    phrase_id = f"{line_id}::span::{phrase_idx}"
-                    span_node = {
+                    phrase_id = f"{line_id}::phrase::{phrase_idx}"
+                    phrase_node = {
                         "id": phrase_id,
-                        "type": "span",
+                        "type": "phrase",
                         "role": role,
                         "parent_id": line_id,
                         "bbox": phrase_bbox or line_node["bbox"],
@@ -154,12 +156,34 @@ class LayoutDescriptorBuilderV3:
                         "source": block_node["source"],
                         "text": phrase_text,
                         "style": self._style_payload(phrase),
+                        "translation_ruleset": dict(phrase.get("translation_ruleset") or phrase.get("element_ruleset") or {}),
                     }
-                    spans.append(span_node)
+                    elements.append(phrase_node)
+                    phrase_elements.append(phrase_node)
+                    for span_idx, span in enumerate(phrase.get("spans") or []):
+                        span_bbox = self._norm_bbox(span.get("bbox"))
+                        span_text = self._clean_text(span.get("translated_text") or span.get("text") or span.get("texte") or "")
+                        if not span_text and not span_bbox:
+                            continue
+                        spans.append(
+                            {
+                                "id": f"{phrase_id}::span::{span_idx}",
+                                "type": "span",
+                                "role": role,
+                                "parent_id": phrase_id,
+                                "bbox": span_bbox or phrase_node["bbox"],
+                                "column_index": block_node["column_index"],
+                                "source": str(span.get("source") or phrase.get("source") or block_node["source"]),
+                                "source_kind": str(span.get("source_kind") or "observed_span"),
+                                "text": span_text,
+                                "style": self._style_payload(span),
+                            }
+                        )
 
         return {
             "regions": observed_regions,
             "elements": elements,
+            "phrases": phrase_elements,
             "spans": spans,
             "images": [
                 {
@@ -390,7 +414,7 @@ class LayoutDescriptorBuilderV3:
                 "margins": margins,
                 "columns": [
                     {
-                        "id": f"guide_col_{int(col.get('id', idx) or idx)}",
+                        "id": f"guide_col_{self._column_id_token(col, idx)}",
                         "bbox": [float(col.get("x0", 0.0) or 0.0), 0.0, float(col.get("x1", page_w) or page_w), page_h],
                     }
                     for idx, col in enumerate(columns)
@@ -617,6 +641,7 @@ class LayoutDescriptorBuilderV3:
         containers = []
         page_role = str(page_data.get("page_role") or "").strip().lower()
         line_elements = [el for el in observed.get("elements") or [] if el.get("type") == "line"]
+        observed_node_map, observed_children = self._observed_node_maps(observed)
         if page_role == "toc":
             for entry in inferred.get("toc_entries") or []:
                 containers.append(
@@ -696,6 +721,17 @@ class LayoutDescriptorBuilderV3:
                 for container in containers
                 if block["id"] in (container.get("member_ids") or [])
             ]
+            structure_priority = self._unit_structure_priority(container_ids, active_container_ids, secondary_container_ids)
+            reflow_policy = self._render_reflow_policy(page_data, block, dependency_graph)
+            descendant_metrics = self._descendant_metrics(block["id"], observed_node_map, observed_children)
+            executable_policies = self._render_unit_policies(
+                page_data=page_data,
+                source_node=block,
+                unit_kind=unit_kind,
+                structure_priority=structure_priority,
+                reflow_policy=reflow_policy,
+                descendant_metrics=descendant_metrics,
+            )
             render_units.append(
                 {
                     "id": f"render::{block['id']}",
@@ -713,9 +749,14 @@ class LayoutDescriptorBuilderV3:
                         for edge in spatial_graph.get("edges") or []
                         if edge.get("source") == block["id"] and edge.get("type") in {"same_row", "same_column", "aligned_left", "aligned_right", "shares_baseline"}
                     ],
+                    "descendant_line_ids": list(descendant_metrics.get("line_ids") or []),
+                    "descendant_phrase_ids": list(descendant_metrics.get("phrase_ids") or []),
+                    "descendant_span_ids": list(descendant_metrics.get("span_ids") or []),
+                    "source_metrics": descendant_metrics,
+                    "executable_policies": executable_policies,
                     "container_ids": container_ids,
-                    "structure_priority": self._unit_structure_priority(container_ids, active_container_ids, secondary_container_ids),
-                    "reflow_policy": self._render_reflow_policy(page_data, block, dependency_graph),
+                    "structure_priority": structure_priority,
+                    "reflow_policy": reflow_policy,
                     "confidence": 0.9,
                 }
             )
@@ -730,6 +771,16 @@ class LayoutDescriptorBuilderV3:
             ]
             if not container_ids:
                 continue
+            structure_priority = self._unit_structure_priority(container_ids, active_container_ids, secondary_container_ids)
+            descendant_metrics = self._descendant_metrics(line_id, observed_node_map, observed_children)
+            executable_policies = self._render_unit_policies(
+                page_data=page_data,
+                source_node=line,
+                unit_kind="line_flow_member",
+                structure_priority=structure_priority,
+                reflow_policy="line_chain_locked",
+                descendant_metrics=descendant_metrics,
+            )
             render_units.append(
                 {
                     "id": f"render::{line_id}",
@@ -743,8 +794,13 @@ class LayoutDescriptorBuilderV3:
                         if edge.get("source") == line_id and edge.get("type") in {"continues_paragraph", "belongs_to_section"}
                     ],
                     "spatial_dependencies": [],
+                    "descendant_line_ids": list(descendant_metrics.get("line_ids") or [line_id]),
+                    "descendant_phrase_ids": list(descendant_metrics.get("phrase_ids") or []),
+                    "descendant_span_ids": list(descendant_metrics.get("span_ids") or []),
+                    "source_metrics": descendant_metrics,
+                    "executable_policies": executable_policies,
                     "container_ids": container_ids,
-                    "structure_priority": self._unit_structure_priority(container_ids, active_container_ids, secondary_container_ids),
+                    "structure_priority": structure_priority,
                     "reflow_policy": "line_chain_locked",
                     "confidence": 0.82,
                 }
@@ -780,15 +836,24 @@ class LayoutDescriptorBuilderV3:
         placement_constraints = []
         for unit in render_model.get("render_units") or []:
             bbox = unit.get("bbox") or [0.0, 0.0, 0.0, 0.0]
+            executable_policies = unit.get("executable_policies") or {}
             placement_constraints.append(
                 {
                     "unit_id": unit["id"],
                     "source_element_id": unit.get("source_element_id"),
                     "column_index": unit.get("column_index"),
+                    "source_element_type": str(unit.get("kind") or ""),
                     "bbox_lock": bbox,
                     "reflow_policy": unit.get("reflow_policy"),
                     "container_ids": list(unit.get("container_ids") or []),
                     "must_follow_dependencies": bool(unit.get("hierarchy_dependencies") or unit.get("spatial_dependencies")),
+                    "font_size_policy": dict(executable_policies.get("font_size_policy") or {}),
+                    "anchor_policy": dict(executable_policies.get("anchor_policy") or {}),
+                    "linebreak_policy": dict(executable_policies.get("linebreak_policy") or {}),
+                    "overflow_policy": dict(executable_policies.get("overflow_policy") or {}),
+                    "geometry_budget": dict(executable_policies.get("geometry_budget") or {}),
+                    "style_invariants": dict(executable_policies.get("style_invariants") or {}),
+                    "source_metrics": dict(unit.get("source_metrics") or {}),
                 }
             )
 
@@ -1101,16 +1166,24 @@ class LayoutDescriptorBuilderV3:
         }
 
     def _style_key(self, element):
-        style = (element or {}).get("style") or {}
+        style = self._style_payload(element)
         size = round(float(style.get("font_size_px", style.get("size", 0.0)) or 0.0), 1)
         weight = int(style.get("font_weight", 400) or 400)
+        italic = 1 if bool(style.get("italic")) else 0
         align = str(style.get("align") or "left").strip().lower()
+        font_name = str(style.get("font_name") or "").strip().lower()
         if size <= 0.0:
             return ""
-        return f"{size}|{weight}|{align}"
+        return f"{size}|{weight}|{italic}|{align}|{font_name}"
 
     def _style_payload(self, node):
-        style = (node or {}).get("style") or {}
+        style = (node or {}).get("style") or (node or {}).get("resolved_style") or {}
+        if not style and isinstance((node or {}).get("spans"), list):
+            for span in (node.get("spans") or []):
+                candidate = (span or {}).get("style") or (span or {}).get("resolved_style") or {}
+                if candidate:
+                    style = candidate
+                    break
         flags = style.get("flags") or {}
         size = float(style.get("font_size_px", style.get("size", 0.0)) or 0.0)
         return {
@@ -1119,6 +1192,225 @@ class LayoutDescriptorBuilderV3:
             "italic": bool(flags.get("italic") or style.get("italic")),
             "align": str(style.get("align") or "left").strip().lower(),
             "font_name": str(style.get("font") or ""),
+            "color": str(style.get("color") or ""),
+            "uppercase": bool(flags.get("uppercase") or style.get("uppercase")),
+        }
+
+    def _observed_node_maps(self, observed):
+        node_map = {}
+        children_by_parent = {}
+        for node in list(observed.get("elements") or []) + list(observed.get("spans") or []):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "")
+            if not node_id:
+                continue
+            node_map[node_id] = node
+            parent_id = str(node.get("parent_id") or "")
+            if parent_id:
+                children_by_parent.setdefault(parent_id, []).append(node_id)
+        return node_map, children_by_parent
+
+    def _collect_descendant_ids(self, root_id, children_by_parent):
+        root = str(root_id or "")
+        if not root:
+            return []
+        descendants = []
+        queue = list(children_by_parent.get(root, []))
+        seen = set()
+        while queue:
+            node_id = queue.pop(0)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            descendants.append(node_id)
+            queue.extend(children_by_parent.get(node_id, []))
+        return descendants
+
+    def _descendant_metrics(self, root_id, node_map, children_by_parent):
+        root = node_map.get(str(root_id)) or {}
+        descendant_ids = self._collect_descendant_ids(root_id, children_by_parent)
+        descendants = [node_map[node_id] for node_id in descendant_ids if node_id in node_map]
+        line_nodes = [node for node in descendants if node.get("type") == "line"]
+        phrase_nodes = [node for node in descendants if node.get("type") == "phrase"]
+        span_nodes = [node for node in descendants if node.get("type") == "span"]
+        line_bboxes = [self._norm_bbox(node.get("bbox")) for node in line_nodes if self._norm_bbox(node.get("bbox"))]
+        line_heights = [float(bbox[3]) - float(bbox[1]) for bbox in line_bboxes]
+        baseline_positions = [float(bbox[3]) for bbox in line_bboxes]
+        baseline_gaps = [
+            baseline_positions[idx] - baseline_positions[idx - 1]
+            for idx in range(1, len(baseline_positions))
+            if baseline_positions[idx] > baseline_positions[idx - 1]
+        ]
+        style_signatures = {
+            self._style_key(node)
+            for node in (span_nodes or phrase_nodes or line_nodes or [root])
+            if self._style_key(node)
+        }
+        text_nodes = span_nodes or phrase_nodes or line_nodes or [root]
+        source_text = " ".join(self._clean_text(node.get("text")) for node in text_nodes if self._clean_text(node.get("text"))).strip()
+        effective_line_count = len(line_nodes)
+        if effective_line_count <= 0 and source_text:
+            effective_line_count = 1
+        effective_span_count = len(span_nodes)
+        if effective_span_count <= 0 and source_text:
+            effective_span_count = max(1, effective_line_count)
+        return {
+            "line_ids": [str(node.get("id")) for node in line_nodes],
+            "phrase_ids": [str(node.get("id")) for node in phrase_nodes],
+            "span_ids": [str(node.get("id")) for node in span_nodes],
+            "line_count": int(effective_line_count),
+            "phrase_count": int(len(phrase_nodes)),
+            "span_count": int(effective_span_count),
+            "char_count": int(len(source_text)),
+            "line_height_px": round(sum(line_heights) / max(1, len(line_heights)), 4) if line_heights else 0.0,
+            "baseline_step_px": round(sum(baseline_gaps) / max(1, len(baseline_gaps)), 4) if baseline_gaps else 0.0,
+            "style_variation_count": int(len(style_signatures)),
+            "preserve_span_variation": bool(len(style_signatures) >= 2),
+        }
+
+    def _render_unit_policies(self, page_data, source_node, unit_kind, structure_priority, reflow_policy, descendant_metrics):
+        page_role = str(page_data.get("page_role") or "").strip().lower()
+        layout_type = str(page_data.get("layout_type") or "").strip().lower()
+        document_type = str(page_data.get("document_type") or "").strip().lower()
+        role = str((source_node or {}).get("role") or "").strip().lower()
+        source = str((source_node or {}).get("source") or "").strip().lower()
+        ruleset_summary = dict((source_node or {}).get("translation_ruleset_summary") or {})
+        translation_ruleset = dict((source_node or {}).get("translation_ruleset") or {})
+        ruleset_rules = dict(translation_ruleset.get("rules") or {})
+        preferred_horizontal_anchor = str(
+            ruleset_rules.get("preserve_horizontal_anchor")
+            or ruleset_summary.get("preferred_horizontal_anchor")
+            or ""
+        ).strip().lower()
+        preferred_vertical_anchor = str(
+            ruleset_rules.get("preserve_vertical_anchor")
+            or ruleset_summary.get("preferred_vertical_anchor")
+            or ""
+        ).strip().lower()
+        semantic_role = str(
+            ruleset_rules.get("semantic_role")
+            or ruleset_summary.get("dominant_semantic_role")
+            or ""
+        ).strip().lower()
+        bbox = self._norm_bbox((source_node or {}).get("bbox")) or [0.0, 0.0, 0.0, 0.0]
+        style = self._style_payload(source_node)
+        font_size_px = float(style.get("font_size_px", 0.0) or 0.0)
+        line_count = int((descendant_metrics or {}).get("line_count") or 0)
+        span_count = int((descendant_metrics or {}).get("span_count") or 0)
+        preserve_span_variation = bool((descendant_metrics or {}).get("preserve_span_variation"))
+        role_locked = role in {"title", "section_heading", "header", "footer", "figure_caption", "diagram_label", "diagram_text_label"}
+        preserve_source_lines = bool(
+            page_role == "toc"
+            or reflow_policy in {"toc_row_locked", "pair_locked", "line_chain_locked"}
+            or (source == "native" and line_count >= 2)
+        )
+        font_lock = bool(
+            source == "native"
+            and (
+                role_locked
+                or preserve_source_lines
+                or preserve_span_variation
+                or structure_priority == "primary"
+                or reflow_policy in {"toc_row_locked", "pair_locked", "anchored_locked"}
+            )
+        )
+        if reflow_policy == "anchored_locked":
+            anchor_policy = {
+                "mode": "attachment_locked",
+                "source_y_locked": False,
+                "allow_shift_y": True,
+                "respect_attachment": True,
+                "preferred_horizontal_anchor": preferred_horizontal_anchor,
+                "preferred_vertical_anchor": preferred_vertical_anchor,
+                "semantic_role": semantic_role,
+            }
+        else:
+            source_y_locked = bool(
+                source == "native"
+                and (
+                    reflow_policy in {"toc_row_locked", "pair_locked", "line_chain_locked"}
+                    or (preserve_source_lines and role in {"body", "paragraph", "list_item", "title", "section_heading"})
+                    or (layout_type == "table_dominant" and role in {"body", "paragraph", "list_item"} and line_count >= 2)
+                    or role in {"header", "footer"}
+                )
+            )
+            anchor_policy = {
+                "mode": "source_bbox" if source_y_locked else "flow",
+                "source_y_locked": source_y_locked,
+                "allow_shift_y": not source_y_locked,
+                "respect_attachment": False,
+                "preferred_horizontal_anchor": preferred_horizontal_anchor,
+                "preferred_vertical_anchor": preferred_vertical_anchor,
+                "semantic_role": semantic_role,
+                "force_end_anchor": bool(semantic_role == "toc_page_number"),
+                "force_start_anchor": bool(semantic_role == "toc_section_number"),
+                "preserve_pairing": bool(str(semantic_role).startswith("toc_")),
+            }
+        if preserve_source_lines and role in {"body", "paragraph", "list_item"}:
+            overflow_mode = "paginate"
+        elif reflow_policy == "paragraph_reflow":
+            overflow_mode = "allow_vertical_expand"
+        else:
+            overflow_mode = "clip"
+        linebreak_policy = {
+            "mode": "preserve_source_lines" if preserve_source_lines else "rewrap",
+            "source_line_count": line_count,
+            "source_span_count": span_count,
+            "preserve_span_variation": preserve_span_variation,
+        }
+        if font_lock and font_size_px > 0.0:
+            min_size_px = font_size_px
+        elif source == "native" and font_size_px > 0.0:
+            min_size_px = font_size_px * 0.92
+        elif font_size_px > 0.0:
+            min_size_px = max(6.0, font_size_px * 0.78)
+        else:
+            min_size_px = 0.0
+        font_size_policy = {
+            "mode": "lock" if font_lock and font_size_px > 0.0 else ("soft_lock" if source == "native" and font_size_px > 0.0 else "adaptive"),
+            "target_size_px": round(font_size_px, 4) if font_size_px > 0.0 else 0.0,
+            "min_size_px": round(min_size_px, 4),
+            "max_size_px": round(font_size_px, 4) if font_size_px > 0.0 else 0.0,
+        }
+        geometry_budget = {
+            "target_bbox": bbox,
+            "target_width_px": round(max(0.0, float(bbox[2]) - float(bbox[0])), 4),
+            "target_height_px": round(max(0.0, float(bbox[3]) - float(bbox[1])), 4),
+            "line_height_hint_px": round(float((descendant_metrics or {}).get("line_height_px") or 0.0), 4),
+            "baseline_step_px": round(float((descendant_metrics or {}).get("baseline_step_px") or 0.0), 4),
+            "allow_width_expand": bool(reflow_policy == "paragraph_reflow" and not preserve_source_lines),
+            "allow_height_expand": bool(overflow_mode == "allow_vertical_expand"),
+            "columnar_context": bool(layout_type in {"single_column", "double_column"}),
+            "document_type": document_type,
+        }
+        style_invariants = {
+            "font_name": str(style.get("font_name") or ""),
+            "font_weight": int(style.get("font_weight", 400) or 400),
+            "italic": bool(style.get("italic")),
+            "align": str(style.get("align") or "left"),
+            "color": str(style.get("color") or ""),
+            "uppercase": bool(style.get("uppercase")),
+            "preserve_family": bool(source == "native"),
+            "preserve_color": bool(source == "native"),
+            "preserve_weight": bool(source == "native" or preserve_span_variation),
+            "preserve_alignment": bool(source == "native"),
+            "preserve_span_variation": preserve_span_variation,
+        }
+        return {
+            "reflow_policy": str(reflow_policy or ""),
+            "font_size_policy": font_size_policy,
+            "anchor_policy": anchor_policy,
+            "linebreak_policy": linebreak_policy,
+            "overflow_policy": {
+                "mode": overflow_mode,
+                "allow_vertical_expand": bool(overflow_mode == "allow_vertical_expand"),
+                "allow_continuation_page": bool(overflow_mode in {"paginate", "allow_vertical_expand"}),
+            },
+            "geometry_budget": geometry_budget,
+            "style_invariants": style_invariants,
+            "source_metrics": dict(descendant_metrics or {}),
+            "unit_kind": str(unit_kind or ""),
         }
 
     def _column_index_for_bbox(self, bbox, columns):
@@ -1136,9 +1428,18 @@ class LayoutDescriptorBuilderV3:
             center = (x0 + x1) * 0.5
             dist = abs(cx - center)
             if best_dist is None or dist < best_dist:
-                best_idx = int(col.get("id", idx) or idx)
+                best_idx = self._column_numeric_index(col, idx)
                 best_dist = dist
         return best_idx
+
+    def _column_id_token(self, column, fallback):
+        return str((column or {}).get("id", fallback))
+
+    def _column_numeric_index(self, column, fallback):
+        try:
+            return int((column or {}).get("id", fallback))
+        except Exception:
+            return int(fallback)
 
     def _center_x(self, bbox):
         return (float(bbox[0]) + float(bbox[2])) * 0.5

@@ -7,8 +7,13 @@ from PIL import Image, ImageOps
 from page_case_classifier import PageCaseClassifier
 from page_case_classifier_v2 import PageCaseClassifierV2
 from page_family_registry import get_family_config
+from element_relations import enrich_element_relations
+from element_relations_ai import get_element_relations_ai_enricher
+from element_rulesets import enrich_element_rulesets
 from layout_descriptor import LayoutDescriptorBuilder
 from layout_descriptor_v3 import LayoutDescriptorBuilderV3
+from positioning_policy import enrich_positioning_policy
+from relative_geometry import enrich_page_relative_geometry
 
 class VisualAttributeExtractor:
     def analyze(self, pil_image, bbox, text=""):
@@ -302,16 +307,46 @@ class DocumentParser:
                 # On ré-extrait les phrases pour le style local si nécessaire
                 # Mais ici on peut déjà utiliser line_info
                 phrases = self._extract_phrases(line_info["raw_words"], image)
+                line_scores = [
+                    float(word.get("score", 0.0) or 0.0)
+                    for word in (line_info.get("raw_words") or [])
+                    if isinstance(word, dict)
+                ]
+                line_text = str(line_info.get("text") or "").strip()
                 enriched_lines.append({
                     "bbox": line_info["bbox"],
                     "peak_y": line_info["peak_y"],
-                    "phrases": phrases
+                    "phrases": phrases,
+                    "line_text": line_text,
+                    "text": line_text,
+                    "source": "ocr",
+                    "source_kind": "ocr_line",
+                    "ocr_word_count": len(line_info.get("raw_words") or []),
+                    "ocr_confidence_mean": float(np.mean(line_scores)) if line_scores else 0.0,
+                    "ocr_confidence_min": float(np.min(line_scores)) if line_scores else 0.0,
+                    "raw_words": list(line_info.get("raw_words") or []),
                 })
-            
+            block_text = " ".join(
+                str((line or {}).get("text") or "").strip()
+                for line in enriched_lines
+                if str((line or {}).get("text") or "").strip()
+            ).strip()
+            block_scores = [
+                float((line or {}).get("ocr_confidence_mean", 0.0) or 0.0)
+                for line in enriched_lines
+                if float((line or {}).get("ocr_confidence_mean", 0.0) or 0.0) > 0.0
+            ]
             final_structure.append({
                 "id": blk["id"],
                 "bbox": blk["bbox"],
                 "lines": enriched_lines,
+                "text": block_text,
+                "source": "ocr",
+                "source_kind": "ocr_block",
+                "ocr_line_count": len(enriched_lines),
+                "ocr_word_count": int(sum(int((line or {}).get("ocr_word_count", 0) or 0) for line in enriched_lines)),
+                "ocr_confidence_mean": float(np.mean(block_scores)) if block_scores else 0.0,
+                "ocr_confidence_min": float(np.min(block_scores)) if block_scores else 0.0,
                 "line_spacing": blk["line_spacing"],
                 "avg_line_height": blk["avg_line_height"],
                 "peak_to_peak_spacing": blk.get("peak_to_peak_spacing", 0)
@@ -476,7 +511,13 @@ class DocumentParser:
         return {
             "texte": text,
             "bbox": styled_spans[0]["bbox"] if styled_spans else bbox,
-            "spans": styled_spans
+            "spans": styled_spans,
+            "text": text,
+            "source": "ocr",
+            "source_kind": "ocr_phrase",
+            "ocr_word_count": len(words),
+            "ocr_confidence_mean": float(np.mean([float(w.get("score", 0.0) or 0.0) for w in words])) if words else 0.0,
+            "ocr_confidence_min": float(np.min([float(w.get("score", 0.0) or 0.0) for w in words])) if words else 0.0,
         }
 
     def _merge_bboxes(self, bboxes):
@@ -528,8 +569,13 @@ class LayoutV2Builder:
 
         all_lines = self._iter_lines(page_data)
         margins = self._infer_margins(all_lines, page_w, page_h)
-        columns = self._infer_columns(all_lines, margins, page_w)
         page_data.setdefault("layout", {})
+        existing_columns = [
+            column
+            for column in (page_data.get("layout", {}).get("columns") or [])
+            if isinstance(column, dict) and column.get("x0") is not None and column.get("x1") is not None
+        ]
+        columns = existing_columns or self._infer_columns(all_lines, margins, page_w)
         page_data["layout"]["margins"] = margins
         page_data["layout"]["columns"] = columns
 
@@ -583,6 +629,13 @@ class LayoutV2Builder:
                 "toc_rows": toc_rows,
                 "tab_stops": tab_stops,
             }
+
+        enrich_page_relative_geometry(page_data)
+        enrich_element_relations(page_data)
+        get_element_relations_ai_enricher().enrich(page_data)
+        enrich_positioning_policy(page_data)
+        enrich_element_rulesets(page_data)
+        page_data["layout"]["layout_direction"] = page_data.get("layout_direction") or "ltr"
 
         layout_descriptor = self.layout_descriptor_builder.build(page_data)
         page_data["layout_descriptor"] = layout_descriptor

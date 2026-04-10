@@ -149,6 +149,269 @@ class LayoutDescriptorTests(unittest.TestCase):
         self.assertEqual(enriched["layout"]["descriptor_version"], "layout_descriptor.v2")
         self.assertEqual(enriched["layout"]["descriptor_v3_version"], "layout_descriptor.v3")
 
+    def test_layout_v2_builder_attaches_relative_geometry_schema(self):
+        page = self._sample_page()
+        page["dimensions"]["dpi"] = 150
+        enriched = self.layout_builder.build(page)
+        self.assertIn("relative_layout", enriched)
+        self.assertIn("relative_layout", enriched["layout"])
+        self.assertIn("element_relations_ai", enriched)
+        self.assertIn("element_relations_ai", enriched["layout"])
+        self.assertIn("positioning_policy", enriched)
+        self.assertIn("positioning_policy", enriched["layout"])
+        self.assertIn("element_rulesets", enriched)
+        self.assertIn("element_rulesets", enriched["layout"])
+        self.assertEqual(enriched["relative_layout"]["schema_version"], "relative_geometry.v1")
+        self.assertEqual(enriched["relative_layout"]["page_features"]["orientation"], "portrait")
+        self.assertEqual(enriched["relative_layout"]["page_features"]["column_count"], 2)
+        self.assertEqual(enriched["layout_direction"], "ltr")
+
+        reading_order = enriched["relative_layout"]["reading_order"]
+        self.assertEqual(reading_order, ["b1", "b2", "b3"])
+        self.assertIn("flat_nodes", enriched["relative_layout"])
+        self.assertIn("relative_layout_flat", enriched)
+
+        block = next(block for block in enriched["blocks"] if block["id"] == "b2")
+        rel = block["relative_geometry"]
+        self.assertEqual(rel["bbox_absolute"], [40.0, 110.0, 180.0, 220.0])
+        self.assertEqual(rel["bbox_relative_to_parent"], [40.0, 110.0, 180.0, 220.0])
+        self.assertEqual(rel["borders"]["left"]["relative_to_parent_borders"]["to_left"]["haut"], 40.0)
+        self.assertEqual(rel["borders"]["left"]["relative_to_parent_borders"]["to_top"]["haut"], 110.0)
+        self.assertEqual(rel["borders"]["right"]["relative_to_parent_borders"]["to_right"]["haut"], 220.0)
+
+        phrase = block["lines"][0]["phrases"][0]
+        phrase_rel = phrase["relative_geometry"]
+        self.assertEqual(phrase_rel["container_block_id"], "b2")
+        self.assertEqual(phrase_rel["bbox_relative_to_container_block"], [0.0, 0.0, 140.0, 35.0])
+        self.assertEqual(
+            phrase_rel["borders_relative_to_container_block"]["left"]["relative_to_container_block_borders"]["to_left"]["haut"],
+            0.0,
+        )
+        self.assertEqual(
+            phrase_rel["borders_relative_to_container_block"]["bottom"]["relative_to_container_block_borders"]["to_bottom"]["haut"],
+            75.0,
+        )
+        flat_phrase = next(
+            node
+            for node in enriched["relative_layout_flat"]
+            if node["type"] == "phrase" and node.get("container_block_id") == "b2"
+        )
+        self.assertEqual(flat_phrase["container_block_id"], "b2")
+        self.assertEqual(flat_phrase["reading_order_path"], [2, 1, 1])
+        self.assertEqual(phrase["element_ruleset"]["container_block_id"], "b2")
+        self.assertEqual(phrase["translation_ruleset"]["rules"]["preserve_horizontal_anchor"], "start")
+
+    def test_layout_v2_builder_uses_explicit_columns_for_block_reading_order(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 500, "height": 700, "dpi": 150},
+            "blocks": [
+                {
+                    "id": "left",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [40, 220, 220, 280],
+                    "text": "Left column body",
+                    "lines": [{"bbox": [40, 220, 220, 280], "line_text": "Left column body", "phrases": []}],
+                },
+                {
+                    "id": "right",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [280, 120, 460, 180],
+                    "text": "Right column body",
+                    "lines": [{"bbox": [280, 120, 460, 180], "line_text": "Right column body", "phrases": []}],
+                },
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"id": 0, "x0": 30, "x1": 240}, {"id": 1, "x0": 260, "x1": 470}]},
+        }
+        enriched = self.layout_builder.build(page)
+        self.assertEqual(enriched["relative_layout"]["reading_order"], ["left", "right"])
+        left_block = next(node for node in enriched["relative_layout"]["children"] if node["id"] == "left")
+        right_block = next(node for node in enriched["relative_layout"]["children"] if node["id"] == "right")
+        self.assertEqual(left_block["column_id"], "0")
+        self.assertEqual(right_block["column_id"], "1")
+
+    def test_layout_v2_builder_attaches_inline_phrase_continuation_relations(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 400, "height": 300},
+            "blocks": [
+                {
+                    "id": "b_inline",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [40, 40, 300, 90],
+                    "text": "Deep learning works",
+                    "lines": [
+                        {
+                            "bbox": [40, 40, 300, 90],
+                            "line_index": 0,
+                            "line_text": "Deep learning works",
+                            "phrases": [
+                                {
+                                    "id": "p1",
+                                    "bbox": [40, 40, 140, 60],
+                                    "text": "Deep learning",
+                                    "line_index": 0,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [40, 40, 140, 60], "texte": "Deep learning", "style": {"font": "Times", "size": 11}}],
+                                },
+                                {
+                                    "id": "p2",
+                                    "bbox": [152, 40, 230, 60],
+                                    "text": "works",
+                                    "line_index": 0,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [152, 40, 230, 60], "texte": "works", "style": {"font": "Times", "size": 11}}],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"id": 0, "x0": 30, "x1": 360}]},
+        }
+        enriched = self.layout_builder.build(page)
+        block = enriched["blocks"][0]
+        relations = block["element_relations"]["pair_relations"]
+        self.assertEqual(len(relations), 1)
+        relation = relations[0]
+        self.assertEqual(relation["visual_relation"], "continues_inline")
+        self.assertEqual(relation["logical_relation"], "same_sentence_continuation")
+        self.assertTrue(relation["continuation"])
+        self.assertFalse(relation["ai_review_required"])
+        self.assertEqual(block["lines"][0]["phrases"][0]["flow_to_next_phrase"]["target_phrase_id"], "p2")
+        self.assertEqual(block["lines"][0]["phrases"][1]["flow_from_previous_phrase"]["source_phrase_id"], "p1")
+
+    def test_layout_v2_builder_attaches_wrapped_phrase_continuation_relations(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 400, "height": 300},
+            "blocks": [
+                {
+                    "id": "b_wrap",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [40, 40, 240, 130],
+                    "text": "This pipeline remains stable across pages",
+                    "lines": [
+                        {
+                            "bbox": [40, 40, 210, 64],
+                            "line_index": 0,
+                            "line_text": "This pipeline remains",
+                            "phrases": [
+                                {
+                                    "id": "p1",
+                                    "bbox": [40, 40, 210, 64],
+                                    "text": "This pipeline remains",
+                                    "line_index": 0,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [40, 40, 210, 64], "texte": "This pipeline remains", "style": {"font": "Times", "size": 11}}],
+                                }
+                            ],
+                        },
+                        {
+                            "bbox": [42, 70, 220, 94],
+                            "line_index": 1,
+                            "line_text": "stable across pages",
+                            "phrases": [
+                                {
+                                    "id": "p2",
+                                    "bbox": [42, 70, 220, 94],
+                                    "text": "stable across pages",
+                                    "line_index": 1,
+                                    "hard_break_before": False,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [42, 70, 220, 94], "texte": "stable across pages", "style": {"font": "Times", "size": 11}}],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"id": 0, "x0": 30, "x1": 360}]},
+        }
+        enriched = self.layout_builder.build(page)
+        relation = enriched["blocks"][0]["element_relations"]["pair_relations"][0]
+        self.assertEqual(relation["visual_relation"], "continues_wrapped_line")
+        self.assertEqual(relation["logical_relation"], "same_paragraph_continuation")
+        self.assertTrue(relation["continuation"])
+        self.assertFalse(relation["ai_review_required"])
+
+    def test_layout_v2_builder_marks_new_structural_unit_between_phrases(self):
+        page = {
+            "page": 1,
+            "dimensions": {"width": 400, "height": 320},
+            "blocks": [
+                {
+                    "id": "b_break",
+                    "role": "body",
+                    "source": "native",
+                    "bbox": [40, 40, 240, 150],
+                    "text": "The experiment ended. Results follow.",
+                    "lines": [
+                        {
+                            "bbox": [40, 40, 200, 64],
+                            "line_index": 0,
+                            "line_text": "The experiment ended.",
+                            "phrases": [
+                                {
+                                    "id": "p1",
+                                    "bbox": [40, 40, 200, 64],
+                                    "text": "The experiment ended.",
+                                    "line_index": 0,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [40, 40, 200, 64], "texte": "The experiment ended.", "style": {"font": "Times", "size": 11}}],
+                                }
+                            ],
+                        },
+                        {
+                            "bbox": [40, 78, 210, 102],
+                            "line_index": 1,
+                            "line_text": "Results follow.",
+                            "phrases": [
+                                {
+                                    "id": "p2",
+                                    "bbox": [40, 78, 210, 102],
+                                    "text": "Results follow.",
+                                    "line_index": 1,
+                                    "hard_break_before": True,
+                                    "line_break_after": True,
+                                    "spans": [{"bbox": [40, 78, 210, 102], "texte": "Results follow.", "style": {"font": "Times", "size": 11}}],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+            "images": [],
+            "drawings": [],
+            "non_text_zones": [],
+            "layout": {"columns": [{"id": 0, "x0": 30, "x1": 360}]},
+        }
+        enriched = self.layout_builder.build(page)
+        relation = enriched["blocks"][0]["element_relations"]["pair_relations"][0]
+        self.assertEqual(relation["visual_relation"], "new_structural_unit")
+        self.assertEqual(relation["logical_relation"], "new_sentence_or_unit")
+        self.assertFalse(relation["continuation"])
+        self.assertTrue(relation["ai_review_required"])
+        self.assertIn("heuristic_decision", relation)
+        self.assertEqual(relation["heuristic_decision"]["visual_relation"], "new_structural_unit")
+        self.assertLessEqual(relation["heuristic_decision"]["confidence"], 0.5)
+        self.assertIn("semantic_ai_review", relation)
+        self.assertIn("element_relations", enriched)
+        self.assertIn("element_relations", enriched["layout"])
+
     def test_layout_v2_builder_splits_abbreviation_blocks_before_descriptor(self):
         page = {
             "page": 1,

@@ -261,13 +261,23 @@ class FontResolver:
     def _find_unicode_safe_fallback(self, font_name: str, flags: Dict, text: str) -> Optional[str]:
         seen = set()
         for family in self._family_unicode_preferences(font_name, flags):
+            family_paths = []
             for key, paths in self._by_name.items():
                 if family not in key or not paths:
                     continue
-                path = self._pick_best_font_file(paths, flags)
-                if not path or path in seen:
-                    continue
-                seen.add(path)
+                for path in paths:
+                    if not path or path in seen:
+                        continue
+                    seen.add(path)
+                    family_paths.append(path)
+            if not family_paths:
+                continue
+            ordered = sorted(
+                family_paths,
+                key=lambda path: self._score_font_path(path, bool(flags.get("bold")), bool(flags.get("italic"))),
+                reverse=True,
+            )
+            for path in ordered:
                 if self._font_supports_text(path, None, text):
                     return path
         return None

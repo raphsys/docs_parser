@@ -16,6 +16,12 @@ export type ReconstructOptions = {
   exportHtml: boolean;
 };
 
+export type TranslateOptions = {
+  targetLang: string;
+  style: string;
+  tone: string;
+};
+
 type BackendDiscoveryResult = {
   baseUrl: string;
   payload: any;
@@ -128,6 +134,22 @@ export async function runReconstructRequest(baseUrl: string, pages: any[], optio
     target_lang: options.targetLang,
     debug_compare: options.debugCompare,
     export_html: options.exportHtml,
+    style: options.style,
+    tone: options.tone,
+  });
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ pages }),
+  });
+  return ensureJson(response);
+}
+
+export async function runTranslateStructureRequest(baseUrl: string, pages: any[], options: TranslateOptions) {
+  const url = buildUrl(baseUrl, "/translate", {
+    target_lang: options.targetLang,
     style: options.style,
     tone: options.tone,
   });

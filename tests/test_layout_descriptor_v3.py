@@ -292,6 +292,89 @@ class LayoutDescriptorV3Tests(unittest.TestCase):
         self.assertEqual(descriptor["primary_structure_family"], "glossary_pairs")
         self.assertIn("sections", descriptor["structure_arbitration"]["suppressed_inferred_collections"])
 
+    def test_v3_preserves_phrase_span_granularity_and_executable_policies(self):
+        page = self._sample_page()
+        page["blocks"] = [
+            {
+                "id": "body_fine",
+                "role": "body",
+                "source": "native",
+                "bbox": [40, 110, 180, 156],
+                "text": "Bold term\nRegular term",
+                "style": {"font": "Times", "size": 11, "color": "#111111"},
+                "lines": [
+                    {
+                        "bbox": [40, 110, 180, 126],
+                        "line_text": "Bold term",
+                        "phrases": [
+                            {
+                                "bbox": [40, 110, 180, 126],
+                                "texte": "Bold term",
+                                "spans": [
+                                    {
+                                        "bbox": [40, 110, 86, 126],
+                                        "texte": "Bold",
+                                        "style": {"font": "Times-Bold", "size": 11, "color": "#111111", "flags": {"bold": True}},
+                                    },
+                                    {
+                                        "bbox": [88, 110, 140, 126],
+                                        "texte": "term",
+                                        "style": {"font": "Times", "size": 11, "color": "#111111", "flags": {}},
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "bbox": [40, 130, 180, 146],
+                        "line_text": "Regular term",
+                        "phrases": [
+                            {
+                                "bbox": [40, 130, 180, 146],
+                                "texte": "Regular term",
+                                "spans": [
+                                    {
+                                        "bbox": [40, 130, 124, 146],
+                                        "texte": "Regular",
+                                        "style": {"font": "Times", "size": 11, "color": "#111111", "flags": {}},
+                                    },
+                                    {
+                                        "bbox": [126, 130, 180, 146],
+                                        "texte": "term",
+                                        "style": {"font": "Times-Italic", "size": 11, "color": "#111111", "flags": {"italic": True}},
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ]
+        page["images"] = []
+
+        descriptor = self.builder.build(page)
+        observed = descriptor["observed_structure"]
+        phrase_nodes = [node for node in observed["elements"] if node.get("type") == "phrase"]
+        self.assertEqual(len(phrase_nodes), 2)
+        self.assertEqual(len(observed["spans"]), 4)
+
+        render_unit = next(unit for unit in descriptor["render_model"]["render_units"] if unit["source_element_id"] == "body_fine")
+        self.assertEqual(render_unit["source_metrics"]["line_count"], 2)
+        self.assertEqual(render_unit["source_metrics"]["span_count"], 4)
+        self.assertEqual(len(render_unit["descendant_phrase_ids"]), 2)
+        self.assertEqual(len(render_unit["descendant_span_ids"]), 4)
+
+        constraint = next(
+            constraint
+            for constraint in descriptor["reconstruction_contract"]["placement_constraints"]
+            if constraint["source_element_id"] == "body_fine"
+        )
+        self.assertEqual(constraint["font_size_policy"]["mode"], "lock")
+        self.assertEqual(constraint["linebreak_policy"]["mode"], "preserve_source_lines")
+        self.assertTrue(constraint["anchor_policy"]["source_y_locked"])
+        self.assertEqual(constraint["overflow_policy"]["mode"], "paginate")
+        self.assertTrue(constraint["style_invariants"]["preserve_span_variation"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,19 @@ class EmbeddedFontResolutionTests(unittest.TestCase):
         self.assertTrue(Path(resolved.get("fontfile") or "").is_file(), resolved)
         self.assertIsNone(resolved.get("builtin"))
 
+    def test_unicode_safe_fallback_keeps_italic_variant_when_embedded_subset_lacks_glyphs(self):
+        style = self._find_style_matching(
+            461,
+            lambda style: "newbaskerville" in str(style.get("font") or "").lower() and "itali" in str(style.get("font") or "").lower(),
+        )
+
+        resolved = self.resolver.resolve(style, text="Paramètres vs hyperparamètres")
+
+        fontfile = Path(resolved.get("fontfile") or "")
+        self.assertTrue(fontfile.is_file(), resolved)
+        self.assertIn("italic", fontfile.name.lower())
+        self.assertIsNone(resolved.get("builtin"))
+
     def test_native_extractor_resolves_subset_obfuscated_font_to_embedded_font(self):
         with fitz.open(self.advances_pdf_path) as doc:
             native = self.extractor.extract_page(doc[11], sx=1.0, sy=1.0)

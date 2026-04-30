@@ -578,6 +578,8 @@ class LayoutV2Builder:
         columns = existing_columns or self._infer_columns(all_lines, margins, page_w)
         page_data["layout"]["margins"] = margins
         page_data["layout"]["columns"] = columns
+        if len(columns) >= 2:
+            self._assign_and_reorder_columns(page_data, columns)
 
         page_role = self._detect_page_role(page_data, all_lines)
         page_data["page_role"] = page_role
@@ -1268,6 +1270,75 @@ class LayoutV2Builder:
                 {"id": 1, "x0": split_x, "x1": margins["right"]},
             ]
         return [{"id": 0, "x0": margins["left"], "x1": margins["right"]}]
+
+    def _assign_and_reorder_columns(self, page_data, columns):
+        """Annote chaque bloc avec son column_id et réordonne en ordre de lecture multi-colonnes.
+
+        Ordre de lecture : blocs pleine largeur avant les colonnes, puis colonne 0
+        (top→bottom), puis colonne 1 (top→bottom), puis blocs pleine largeur après.
+        Les blocs pleine largeur intercalés dans la zone colonnes sont insérés entre
+        les deux colonnes (typiquement des titres de section qui couvrent toute la largeur).
+        """
+        blocks = page_data.get("blocks") or []
+        if not blocks:
+            return
+
+        col_zone_width = max(float(c["x1"]) for c in columns) - min(float(c["x0"]) for c in columns)
+
+        def _col_id_for_block(block):
+            bb = block.get("bbox")
+            if not bb or len(bb) != 4:
+                return -1
+            bx0, _, bx1, _ = [float(v) for v in bb]
+            bw = bx1 - bx0
+            # Bloc pleine largeur : couvre > 65 % de la zone colonnes
+            if col_zone_width > 0 and bw / col_zone_width > 0.65:
+                return -1
+            bx_center = (bx0 + bx1) / 2.0
+            best, best_dist = 0, float("inf")
+            for col in columns:
+                cx = (float(col["x0"]) + float(col["x1"])) / 2.0
+                dist = abs(bx_center - cx)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = int(col["id"])
+            return best
+
+        for block in blocks:
+            block["column_id"] = _col_id_for_block(block)
+
+        def _y0(block):
+            bb = block.get("bbox") or [0, 0, 0, 0]
+            return float(bb[1])
+
+        full_width = sorted(
+            [b for b in blocks if b.get("column_id") == -1], key=_y0
+        )
+        col_buckets: dict = {}
+        for block in blocks:
+            cid = block.get("column_id", 0)
+            if cid != -1:
+                col_buckets.setdefault(cid, []).append(block)
+        for cid in col_buckets:
+            col_buckets[cid].sort(key=_y0)
+
+        # Y limites de la zone colonnes
+        col_ys = [_y0(b) for cid, lst in col_buckets.items() for b in lst]
+        col_y_start = min(col_ys) if col_ys else float("inf")
+        col_y_end = max(col_ys) if col_ys else 0.0
+
+        before_cols = [b for b in full_width if _y0(b) < col_y_start]
+        mid_cols = [b for b in full_width if col_y_start <= _y0(b) <= col_y_end]
+        after_cols = [b for b in full_width if _y0(b) > col_y_end]
+
+        ordered = []
+        ordered.extend(before_cols)
+        for cid in sorted(col_buckets.keys()):
+            ordered.extend(col_buckets[cid])
+        ordered.extend(mid_cols)   # titres de section couvrant toute la largeur
+        ordered.extend(after_cols)
+
+        page_data["blocks"] = ordered
 
     def _detect_page_role(self, page_data, lines):
         blocks = page_data.get("blocks") or []

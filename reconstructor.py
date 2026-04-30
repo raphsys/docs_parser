@@ -164,6 +164,8 @@ class BlockReconstructionPlan:
     relative_geometry: dict[str, Any]
     editorial_semantics: dict[str, Any]
     editorial_relations: dict[str, Any]
+    source_layout_mode: dict[str, Any]
+    adaptive_profile: dict[str, Any]
     constraints: dict[str, Any]
     source_block: dict[str, Any] = field(default_factory=dict)
     semantic_profile: "BlockSemanticProfile | None" = field(default=None)
@@ -328,6 +330,15 @@ class DocumentReconstructor:
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r" ?\n ?", "\n", text)
         return text.strip()
+
+    def _format_toc_label_for_render(self, label_type, text):
+        text = self._clean_text_for_render(text or "")
+        if not text:
+            return ""
+        if label_type == "part_title":
+            text = re.sub(r'^(?:partie|part)\s+', '', text, flags=re.IGNORECASE)
+            text = text.upper()
+        return text
 
     def _merge_styles(self, preferred, fallback):
         pref = preferred if isinstance(preferred, dict) else {}
@@ -558,10 +569,40 @@ class DocumentReconstructor:
                 segment_type = item["segment_type"]
                 is_first = col_idx == 0
                 is_last = col_idx == len(row_items) - 1
+                raw_unit = {
+                    "unit_id": str(item["seg"].get("unit_id") or f"{block_id}:external:{item['idx']}"),
+                    "unit_type": f"external_{segment_type}",
+                    "layout_attributes": {
+                        "horizontal_anchor": "end" if segment_type == "page" else "start",
+                        "vertical_anchor": "top",
+                    },
+                    "editorial_semantics": {
+                        "flow_class": "reference_run" if segment_type == "page" else "anchored_annotation",
+                        "reflowable": bool(segment_type != "page"),
+                    },
+                    "bbox": item["bbox"],
+                    "render_policy": "external_flow",
+                }
+                positioning = self._positioning_preferences_for_unit(
+                    raw_unit,
+                    text=item["text"],
+                    child_units=None,
+                    block=block,
+                    page_data=page_data,
+                    default_anchor_horizontal="end" if segment_type == "page" else "start",
+                    default_anchor_vertical="top",
+                    default_render_policy="external_flow",
+                    default_keep_with_previous=not is_first,
+                    default_keep_with_next=not is_last,
+                    default_hard_break_before=is_first,
+                    default_hard_break_after=is_last,
+                    default_reflowable=(segment_type != "page"),
+                    default_break_priority=20,
+                )
                 units.append(
                     PlacableUnit(
-                        unit_id=str(item["seg"].get("unit_id") or f"{block_id}:external:{item['idx']}"),
-                        unit_type=f"external_{segment_type}",
+                        unit_id=raw_unit["unit_id"],
+                        unit_type=raw_unit["unit_type"],
                         source_kind="page_external_segment",
                         parent_unit_id=block_id or None,
                         block_unit_id=block_id,
@@ -573,28 +614,25 @@ class DocumentReconstructor:
                         inline_class="reference" if segment_type == "page" else None,
                         group_class=segment_type if segment_type in {"label", "page"} else None,
                         style=item["style"],
-                        layout_attributes={
-                            "horizontal_anchor": "end" if segment_type == "page" else "start",
-                            "vertical_anchor": "top",
-                        },
+                        layout_attributes=dict(raw_unit["layout_attributes"]),
                         text_attributes={},
                         relative_bbox=item["bbox"],
-                        anchor_horizontal="end" if segment_type == "page" else "start",
-                        anchor_vertical="top",
+                        anchor_horizontal=positioning["anchor_horizontal"],
+                        anchor_vertical=positioning["anchor_vertical"],
                         continuation_before=not is_first,
                         continuation_after=not is_last,
-                        hard_break_before=is_first,
-                        hard_break_after=is_last,
-                        keep_with_previous=not is_first,
-                        keep_with_next=not is_last,
-                        reflowable=(segment_type != "page"),
+                        hard_break_before=positioning["hard_break_before"],
+                        hard_break_after=positioning["hard_break_after"],
+                        keep_with_previous=positioning["keep_with_previous"],
+                        keep_with_next=positioning["keep_with_next"],
+                        reflowable=positioning["reflowable"],
                         protected_inline=False,
                         immutable=False,
-                        render_policy="external_flow",
-                        justification_eligible=(segment_type != "page"),
-                        break_priority=20,
+                        render_policy=positioning["render_policy"],
+                        justification_eligible=(segment_type != "page") and not positioning["protected_inline"],
+                        break_priority=positioning["break_priority"],
                         paragraph_id=f"{block_id}:external:{row_idx}",
-                        metadata={"target_lang": target_lang, "segment_type": segment_type, "raw_unit": dict(item["seg"])},
+                        metadata={"target_lang": target_lang, "segment_type": segment_type, "raw_unit": dict(item["seg"]), **positioning["metadata"]},
                     )
                 )
         units.sort(key=lambda unit: ((unit.line_indices or [0])[0], (unit.relative_bbox or (0, 0, 0, 0))[0], unit.unit_id))
@@ -699,7 +737,11 @@ class DocumentReconstructor:
         descriptor_group_ids = dict((block or {}).get("descriptor_group_ids") or {})
         editorial_semantics = dict((block or {}).get("editorial_semantics") or {})
         flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
-        if self._block_is_immutable_programming_code(block) or self._is_symbolic_visual_block(block):
+        if (
+            self._block_is_immutable_programming_code(block)
+            or self._is_symbolic_visual_block(block)
+            or self._block_looks_technical_structured(block)
+        ):
             return "code"
         if role == "figure_caption" or bool(editorial_semantics.get("caption_like")):
             return "caption"
@@ -833,10 +875,20 @@ class DocumentReconstructor:
         elif role in {"figure_caption", "table_caption", "caption"}:
             content_class = "caption"
             render_strategy = "prose_reflow"
+        elif role in {"body", "paragraph", "text", "list_item"} or flow_class in {"prose", "editorial"}:
+            # Si des semantic_groups existent ET l'heuristique label s'applique : label_stack
+            _has_semantic_groups = bool((block or {}).get("semantic_groups"))
+            _label_heuristic = is_column_shape or (short_line_ratio >= 0.8 and avg_words_per_line <= 4) or repeated_structure
+            if _has_semantic_groups and _label_heuristic:
+                content_class = "label"
+                render_strategy = "label_stack"
+            else:
+                content_class = "prose"
+                render_strategy = "prose_reflow"
         elif is_column_shape or (short_line_ratio >= 0.8 and avg_words_per_line <= 4) or repeated_structure:
             content_class = "label"
             render_strategy = "label_stack"
-        elif role in {"body", "paragraph", "text", "list_item"} or flow_class in {"prose", "editorial"} or (line_count >= 2 and avg_words_per_line >= 6):
+        elif line_count >= 2 and avg_words_per_line >= 6:
             content_class = "prose"
             render_strategy = "prose_reflow"
         else:
@@ -1004,10 +1056,189 @@ class DocumentReconstructor:
         # Dernier recours : helv (supporte Latin-1 dont tous les accents francais)
         return None, "helv"
 
+    def _document_adaptive_profile(self, page_data):
+        layout_type = str((page_data or {}).get("layout_type") or "").strip().lower()
+        document_type = str((page_data or {}).get("document_type") or "").strip().lower()
+        page_family = str((page_data or {}).get("page_family") or "").strip().lower()
+        style_profile = str((page_data or {}).get("style_profile") or "").strip().lower()
+        if layout_type in {"double_column", "reference_page"} or document_type in {"scientific_paper"} or style_profile == "academic_dense":
+            return {
+                "document_profile": "academic_dense",
+                "dense_layout": True,
+                "technical_bias": bool(style_profile in {"academic_dense", "tabular_structured"}),
+                "visual_bias": False,
+            }
+        if layout_type in {"annotated_page", "image_dominant"} or page_family in {"illustrated_label_page", "chart_label_page"} or style_profile in {"editorial_visual", "marketing_visual"}:
+            return {
+                "document_profile": "visual_labels",
+                "dense_layout": False,
+                "technical_bias": False,
+                "visual_bias": True,
+            }
+        if layout_type == "table_dominant" or style_profile == "tabular_structured":
+            return {
+                "document_profile": "technical_structured",
+                "dense_layout": True,
+                "technical_bias": True,
+                "visual_bias": False,
+            }
+        return {
+            "document_profile": "editorial_standard",
+            "dense_layout": False,
+            "technical_bias": False,
+            "visual_bias": False,
+        }
+
+    def _page_adaptive_profile(self, page_data):
+        doc_profile = self._document_adaptive_profile(page_data)
+        layout_type = str((page_data or {}).get("layout_type") or "").strip().lower()
+        page_family = str((page_data or {}).get("page_family") or "").strip().lower()
+        style_profile = str((page_data or {}).get("style_profile") or "").strip().lower()
+        page_role = str((page_data or {}).get("page_role") or "body").strip().lower()
+        profile_name = doc_profile["document_profile"]
+        if page_role == "toc":
+            profile_name = "toc"
+        elif layout_type == "table_dominant" or style_profile == "tabular_structured":
+            profile_name = "technical_structured"
+        elif layout_type in {"annotated_page", "image_dominant"} or page_family in {"illustrated_label_page", "chart_label_page"}:
+            profile_name = "visual_labels"
+        elif layout_type in {"double_column", "reference_page"}:
+            profile_name = "academic_dense"
+
+        if profile_name == "academic_dense":
+            return {
+                **doc_profile,
+                "page_profile": profile_name,
+                "fallback_scales": (1.0, 0.94, 0.88, 0.82, 0.76, 0.7, 0.64, 0.58),
+                "editorial_scales": (1.0, 0.96, 0.92, 0.88, 0.84, 0.8, 0.76, 0.72, 0.68),
+                "line_spacing_factor": 0.96,
+                "allow_aggressive_reflow": False,
+                "prefer_bbox_anchor": False,
+                "prefer_atomic_short_units": True,
+            }
+        if profile_name == "technical_structured":
+            return {
+                **doc_profile,
+                "page_profile": profile_name,
+                "fallback_scales": (1.0, 0.92, 0.84, 0.76, 0.68, 0.6),
+                "editorial_scales": (1.0, 0.94, 0.88, 0.82, 0.76),
+                "line_spacing_factor": 0.93,
+                "allow_aggressive_reflow": False,
+                "prefer_bbox_anchor": True,
+                "prefer_atomic_short_units": True,
+            }
+        if profile_name == "visual_labels":
+            return {
+                **doc_profile,
+                "page_profile": profile_name,
+                "fallback_scales": (1.0, 0.95, 0.9, 0.85, 0.8),
+                "editorial_scales": (1.0, 0.97, 0.94, 0.91, 0.88, 0.85),
+                "line_spacing_factor": 1.0,
+                "allow_aggressive_reflow": False,
+                "prefer_bbox_anchor": True,
+                "prefer_atomic_short_units": True,
+            }
+        if profile_name == "toc":
+            return {
+                **doc_profile,
+                "page_profile": profile_name,
+                "fallback_scales": (1.0, 0.95, 0.9, 0.85),
+                "editorial_scales": (1.0, 0.97, 0.94, 0.91),
+                "line_spacing_factor": 0.98,
+                "allow_aggressive_reflow": False,
+                "prefer_bbox_anchor": True,
+                "prefer_atomic_short_units": True,
+            }
+        return {
+            **doc_profile,
+            "page_profile": "editorial_standard",
+            "fallback_scales": (1.0, 0.9, 0.8, 0.7, 0.6),
+            "editorial_scales": (1.0, 0.96, 0.92, 0.88, 0.84, 0.8, 0.76, 0.72),
+            "line_spacing_factor": 1.0,
+            "allow_aggressive_reflow": True,
+            "prefer_bbox_anchor": False,
+            "prefer_atomic_short_units": False,
+        }
+
+    def _block_adaptive_profile(self, block, page_data=None, block_type=None):
+        page_profile = self._page_adaptive_profile(page_data)
+        block_type = block_type or self._classify_block_for_reconstruction(block, page_data)
+        unit_type = str((block or {}).get("unit_type") or "").strip().lower()
+        render_policy = str((block or {}).get("render_policy") or "").strip().lower()
+        editorial_semantics = dict((block or {}).get("editorial_semantics") or {})
+        flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
+        block_name = "editorial_flow"
+        if block_type == "code" or self._block_looks_technical_structured(block):
+            block_name = "technical_structured"
+        elif block_type == "table":
+            block_name = "tabular_dense"
+        elif block_type in {"annotation", "caption"} or flow_class == "anchored_annotation":
+            block_name = "visual_label_cluster"
+        elif unit_type in {"short_label", "chart_label", "diagram_label"} or render_policy in {"anchored_text", "fixed_preserve"}:
+            block_name = "anchored_microcopy"
+        elif page_profile.get("page_profile") == "academic_dense":
+            block_name = "dense_editorial"
+
+        profile = {
+            **page_profile,
+            "block_profile": block_name,
+            "block_type": block_type,
+            "force_whiteout": bool(block_type in {"editorial", "heading", "caption", "annotation", "table"}),
+            "line_spacing_factor": float(page_profile.get("line_spacing_factor") or 1.0),
+            "prefer_bbox_anchor": bool(page_profile.get("prefer_bbox_anchor")),
+            "allow_aggressive_reflow": bool(page_profile.get("allow_aggressive_reflow")),
+            "allow_linewise_fallback": True,
+            "presence_fallback_requires_progress": True,
+        }
+        if block_name in {"technical_structured", "tabular_dense"}:
+            profile["line_spacing_factor"] = min(profile["line_spacing_factor"], 0.92)
+            profile["prefer_bbox_anchor"] = True
+            profile["allow_aggressive_reflow"] = False
+        elif block_name in {"visual_label_cluster", "anchored_microcopy"}:
+            profile["prefer_bbox_anchor"] = True
+            profile["allow_aggressive_reflow"] = False
+            profile["line_spacing_factor"] = max(profile["line_spacing_factor"], 0.98)
+        elif block_name == "dense_editorial":
+            profile["line_spacing_factor"] = min(profile["line_spacing_factor"], 0.95)
+            profile["allow_aggressive_reflow"] = False
+        return profile
+
+    def _unit_adaptive_profile(self, raw_unit, *, text="", child_units=None, block=None, page_data=None):
+        block_profile = self._block_adaptive_profile(block or {}, page_data=page_data, block_type=self._classify_block_for_reconstruction(block or {}, page_data))
+        expression_semantics = dict((raw_unit or {}).get("expression_semantics") or {})
+        inline_class = str(expression_semantics.get("inline_class") or "").strip().lower()
+        unit_type = str((raw_unit or {}).get("unit_type") or "").strip().lower()
+        editorial_semantics = dict((raw_unit or {}).get("editorial_semantics") or {})
+        flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
+        text_clean = self._clean_text_for_render(text or "")
+        short_text = bool(text_clean and len(text_clean) <= 64)
+        child_summary = self._protected_fragment_summary(child_units)
+        unit_profile = "editorial_phrase"
+        if inline_class in {"formula", "reference", "code"} or child_summary["has_immutable"]:
+            unit_profile = "protected_inline"
+        elif unit_type in {"short_label", "chart_label", "diagram_label", "formula_label"} or flow_class == "anchored_annotation":
+            unit_profile = "anchored_label"
+        elif block_profile.get("block_profile") in {"technical_structured", "tabular_dense"}:
+            unit_profile = "technical_inline_cluster" if short_text else "dense_editorial_phrase"
+        elif block_profile.get("block_profile") in {"visual_label_cluster", "anchored_microcopy"}:
+            unit_profile = "anchored_label"
+        elif block_profile.get("page_profile") == "academic_dense":
+            unit_profile = "dense_editorial_phrase"
+        return {
+            **block_profile,
+            "unit_profile": unit_profile,
+            "short_text": short_text,
+            "inline_class": inline_class,
+            "has_protected_fragments": bool(child_summary["has_protected"]),
+            "has_immutable_fragments": bool(child_summary["has_immutable"]),
+        }
+
     def _build_page_reconstruction_context(self, page_data, target_lang):
+        adaptive_profile = self._page_adaptive_profile(page_data)
         return {
             "target_lang": target_lang,
             "writing_direction": "right_to_left" if target_lang in {"ar", "he", "fa"} else "left_to_right",
+            "adaptive_profile": adaptive_profile,
         }
 
     def _iter_renderable_blocks(self, page_data):
@@ -1033,12 +1264,11 @@ class DocumentReconstructor:
         padding_bottom = float(layout_attrs.get("padding_bottom_px", 0.0) or 0.0) * self.pixel_to_point
         background_strategy = "preserve"
         block_type = self._classify_block_for_reconstruction(block, page_data)
-        # Utilise _page_background_path (vérifie background_path ET source_image_path)
-        # pour ne pas effacer un fond déjà propre — évite le double-whiteout.
-        has_clean_background = bool(self._page_background_path(page_data))
+        adaptive_profile = self._block_adaptive_profile(block, page_data=page_data, block_type=block_type)
+        has_clean_background = bool(self._clean_page_background_path(page_data))
         if (
             self._is_translated_block(block)
-            and block_type in {"editorial", "heading", "caption", "annotation", "table"}
+            and bool(adaptive_profile.get("force_whiteout"))
             and not has_clean_background
         ):
             background_strategy = "whiteout"
@@ -1054,11 +1284,16 @@ class DocumentReconstructor:
             protected_regions=protected_regions,
             background_strategy=background_strategy,
             background_color=None,
-            constraints={"page_role": str((page_data or {}).get("page_role") or "").strip().lower()},
+            constraints={
+                "page_role": str((page_data or {}).get("page_role") or "").strip().lower(),
+                "adaptive_profile": adaptive_profile,
+            },
         )
 
     def _build_line_templates(self, block, geometry_ctx):
         block_rect = fitz.Rect(geometry_ctx.block_bbox)
+        adaptive_profile = dict((geometry_ctx.constraints or {}).get("adaptive_profile") or {})
+        line_spacing_factor = max(0.86, min(1.08, float(adaptive_profile.get("line_spacing_factor") or 1.0)))
         lines = list((block or {}).get("lines") or [])
         templates = []
         paragraph_index = 0
@@ -1083,7 +1318,7 @@ class DocumentReconstructor:
                 paragraph_index += 1
                 line_index_in_paragraph = 0
             indent_px = float((line or {}).get("indent_px", 0.0) or 0.0) * self.pixel_to_point
-            line_h = max(6.0, line_rect.height)
+            line_h = max(6.0, line_rect.height * line_spacing_factor)
             top = max(line_rect.y0, previous_bottom if idx > 0 else inner_top)
             bottom = min(inner_bottom, max(top + line_h, line_rect.y1))
             if bottom - top < 4.0:
@@ -1113,37 +1348,6 @@ class DocumentReconstructor:
                 )
             )
             line_index_in_paragraph += 1
-        if templates:
-            sorted_heights = sorted(line_heights or [12.0])
-            line_h = sorted_heights[len(sorted_heights) // 2]
-            last = templates[-1]
-            next_top = last.bbox[3]
-            extra_idx = 0
-            while next_top + max(6.0, line_h * 0.75) <= inner_bottom:
-                next_bottom = min(inner_bottom, next_top + line_h)
-                templates.append(
-                    LineTemplate(
-                        line_id=f"{block.get('id') or 'block'}:extra:{extra_idx}",
-                        source_line_indices=list(last.source_line_indices),
-                        bbox=(inner_left, next_top, inner_right, next_bottom),
-                        baseline_y=next_top + min(line_h * 0.82, max(1.0, line_h - 1.0)),
-                        ascent=line_h * 0.82,
-                        descent=max(1.0, line_h * 0.18),
-                        left_x=inner_left,
-                        right_x=inner_right,
-                        usable_width=max(8.0, inner_right - inner_left - last.indent_px),
-                        indent_px=last.indent_px,
-                        first_line_indent_px=0.0,
-                        alignment=alignment,
-                        paragraph_id=last.paragraph_id,
-                        paragraph_index=last.paragraph_index,
-                        line_index_in_paragraph=last.line_index_in_paragraph + 1 + extra_idx,
-                        is_first_paragraph_line=False,
-                        is_last_paragraph_line_hint=False,
-                    )
-                )
-                next_top = next_bottom
-                extra_idx += 1
         if not templates:
             line_h = max(8.0, block_rect.height)
             templates.append(
@@ -1208,6 +1412,271 @@ class DocumentReconstructor:
             if selected:
                 return sorted(selected, key=lambda unit: self._semantic_unit_sort_key(unit, 0))
         return []
+
+    def _translation_ruleset_for_unit(self, unit):
+        if not isinstance(unit, dict):
+            return {}
+        for key in ("translation_ruleset", "element_ruleset"):
+            value = unit.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    def _positioning_policy_for_unit(self, unit):
+        if not isinstance(unit, dict):
+            return {}
+        value = unit.get("positioning_policy")
+        return value if isinstance(value, dict) else {}
+
+    def _protected_fragment_summary(self, child_units):
+        fragments = [dict(unit) for unit in (child_units or []) if isinstance(unit, dict)]
+        if not fragments:
+            return {
+                "count": 0,
+                "protected_count": 0,
+                "immutable_count": 0,
+                "has_protected": False,
+                "has_immutable": False,
+                "dominant_inline_class": "",
+            }
+        protected_count = 0
+        immutable_count = 0
+        inline_classes = []
+        for fragment in fragments:
+            sem = dict(fragment.get("expression_semantics") or {})
+            if bool(sem.get("protected_inline")):
+                protected_count += 1
+            if bool(sem.get("immutable_inline")):
+                immutable_count += 1
+            inline_class = str(sem.get("inline_class") or "").strip().lower()
+            if inline_class:
+                inline_classes.append(inline_class)
+        dominant_inline_class = ""
+        if inline_classes:
+            dominant_inline_class = max(sorted(set(inline_classes)), key=inline_classes.count)
+        return {
+            "count": len(fragments),
+            "protected_count": protected_count,
+            "immutable_count": immutable_count,
+            "has_protected": protected_count > 0,
+            "has_immutable": immutable_count > 0,
+            "dominant_inline_class": dominant_inline_class,
+        }
+
+    def _positioning_preferences_for_unit(
+        self,
+        raw_unit,
+        *,
+        text="",
+        child_units=None,
+        block=None,
+        page_data=None,
+        default_anchor_horizontal=None,
+        default_anchor_vertical=None,
+        default_render_policy="translated_editorial",
+        default_keep_with_previous=False,
+        default_keep_with_next=False,
+        default_hard_break_before=False,
+        default_hard_break_after=False,
+        default_reflowable=True,
+        default_break_priority=10,
+    ):
+        ruleset = self._translation_ruleset_for_unit(raw_unit)
+        rules = dict(ruleset.get("rules") or {})
+        constraints = dict(ruleset.get("constraints") or {})
+        policy = self._positioning_policy_for_unit(raw_unit)
+        primary_ref = dict(policy.get("primary_position_reference") or {})
+        anchor_horizontal = (
+            str(rules.get("preserve_horizontal_anchor") or "").strip().lower()
+            or str((primary_ref or {}).get("horizontal") or "").strip().lower()
+            or str(default_anchor_horizontal or "").strip().lower()
+            or None
+        )
+        anchor_vertical = (
+            str(rules.get("preserve_vertical_anchor") or "").strip().lower()
+            or str((primary_ref or {}).get("vertical") or "").strip().lower()
+            or str(default_anchor_vertical or "").strip().lower()
+            or None
+        )
+        text_clean = self._clean_text_for_render(text or "")
+        child_summary = self._protected_fragment_summary(child_units)
+        adaptive_profile = self._unit_adaptive_profile(raw_unit, text=text_clean, child_units=child_units, block=block, page_data=page_data)
+        anchor_confidence = float(primary_ref.get("confidence") or 0.0)
+        semantic_role = str(rules.get("semantic_role") or "").strip().lower()
+        horizontal_growth = str(rules.get("horizontal_growth") or "").strip().lower()
+        vertical_growth = str(rules.get("vertical_growth") or "").strip().lower()
+        allow_horizontal_reflow = bool(constraints.get("allow_horizontal_reflow", True))
+        preserve_center = bool(constraints.get("preserve_center_if_possible", False))
+        short_text = bool(text_clean and len(text_clean) <= 64)
+        has_bbox = bool(self._unit_fitz_bbox(raw_unit))
+        anchored_role = semantic_role in {"attached_label", "end_value", "centered_title"}
+        force_bbox_anchor = False
+        render_policy = str(default_render_policy or "translated_editorial")
+        reflowable = bool(default_reflowable)
+        # "external_flow" est une politique verrouillée qui ne doit pas être écrasée
+        _locked_policy = render_policy in {"external_flow"}
+        if not _locked_policy and has_bbox and (
+            anchored_role
+            or preserve_center
+            or adaptive_profile.get("prefer_bbox_anchor")
+            or (not allow_horizontal_reflow and short_text and anchor_confidence >= 0.55)
+            or (child_summary["has_protected"] and short_text)
+            or child_summary["dominant_inline_class"] in {"formula", "reference", "code"}
+        ):
+            force_bbox_anchor = True
+            render_policy = "anchored_text"
+            reflowable = False
+        if not _locked_policy and child_summary["has_immutable"] and short_text:
+            render_policy = "fixed_preserve"
+            reflowable = False
+            force_bbox_anchor = True
+        unit_profile = str(adaptive_profile.get("unit_profile") or "")
+        if not _locked_policy and unit_profile in {"protected_inline", "anchored_label", "technical_inline_cluster"}:
+            render_policy = "fixed_preserve" if unit_profile == "protected_inline" and short_text else "anchored_text"
+            reflowable = False
+            force_bbox_anchor = force_bbox_anchor or has_bbox
+        elif unit_profile == "dense_editorial_phrase" and not adaptive_profile.get("allow_aggressive_reflow", True):
+            reflowable = False if short_text and has_bbox else reflowable
+        keep_with_previous = bool(rules.get("keep_with_previous", default_keep_with_previous))
+        keep_with_next = bool(rules.get("keep_with_next", default_keep_with_next))
+        hard_break_before = bool(rules.get("hard_break_before", default_hard_break_before))
+        hard_break_after = bool(rules.get("hard_break_after", default_hard_break_after))
+        break_priority = int(default_break_priority)
+        if anchored_role or child_summary["has_protected"]:
+            break_priority = max(break_priority, 18)
+        if unit_profile in {"protected_inline", "anchored_label", "technical_inline_cluster"}:
+            break_priority = max(break_priority, 20)
+        metadata = {
+            "translation_positioning_mode": str(rules.get("translation_positioning_mode") or "").strip().lower(),
+            "semantic_role": semantic_role,
+            "horizontal_growth": horizontal_growth,
+            "vertical_growth": vertical_growth,
+            "anchor_confidence": anchor_confidence,
+            "force_bbox_anchor": bool(force_bbox_anchor),
+            "allow_horizontal_reflow": allow_horizontal_reflow,
+            "preserve_center_if_possible": preserve_center,
+            "has_protected_fragments": bool(child_summary["has_protected"]),
+            "has_immutable_fragments": bool(child_summary["has_immutable"]),
+            "dominant_inline_class": child_summary["dominant_inline_class"],
+            "adaptive_profile": adaptive_profile,
+        }
+        return {
+            "anchor_horizontal": anchor_horizontal,
+            "anchor_vertical": anchor_vertical,
+            "render_policy": render_policy,
+            "reflowable": reflowable,
+            "keep_with_previous": keep_with_previous,
+            "keep_with_next": keep_with_next,
+            "hard_break_before": hard_break_before,
+            "hard_break_after": hard_break_after,
+            "break_priority": break_priority,
+            "protected_inline": bool(child_summary["has_protected"]),
+            "immutable": bool(child_summary["has_immutable"]),
+            "metadata": metadata,
+        }
+
+    def _line_looks_technical_structured(self, line, block=None):
+        if not isinstance(line, dict):
+            return False
+        unit_type = str(line.get("unit_type") or "").strip().lower()
+        if unit_type == "code_visible":
+            return True
+        text = self._clean_text_for_render(
+            line.get("line_text")
+            or line.get("translated_text")
+            or ""
+        )
+        phrases = list(line.get("phrases") or [])
+        if any(str((phrase or {}).get("unit_type") or "").strip().lower() == "code_visible" for phrase in phrases):
+            return True
+        if any(bool((((phrase or {}).get("style") or {}).get("flags") or {}).get("monospace")) for phrase in phrases):
+            return True
+        if not text:
+            return False
+        technical_patterns = (
+            r"[A-Za-z_][A-Za-z0-9_]*\s*\(",
+            r"\b(?:Conv\dD|Dense|MaxPool|AvgPool|BatchNorm|ReLU|Dropout)\b",
+            r"\b(?:padding|stride|strides|filters|kernel_size|activation)\s*=",
+            r"^#\s*\w+",
+            r"\b[a-z]+_[a-z0-9_]+\b",
+        )
+        if any(re.search(pattern, text) for pattern in technical_patterns):
+            return True
+        punctuation = len(re.findall(r"[^A-Za-z0-9\s]", text))
+        lexical = len(re.findall(r"[A-Za-z]+", text))
+        if "_" in text and punctuation >= 2:
+            return True
+        if punctuation >= 6 and lexical <= 14 and ("=" in text or "(" in text or ")" in text):
+            return True
+        if bool((block or {}).get("immutable_code_block")):
+            return True
+        return False
+
+    def _block_looks_technical_structured(self, block):
+        if not isinstance(block, dict):
+            return False
+        descriptor_role = str((block or {}).get("descriptor_structural_role") or "").strip().lower()
+        if descriptor_role in {"code_block", "listing", "table_code_listing"}:
+            return True
+        lines = [line for line in ((block or {}).get("lines") or []) if isinstance(line, dict)]
+        if not lines:
+            return False
+        technical_lines = sum(1 for line in lines if self._line_looks_technical_structured(line, block=block))
+        if technical_lines >= max(2, math.ceil(len(lines) * 0.35)):
+            return True
+        return False
+
+    def _unit_horizontal_alignment(self, unit, fallback):
+        alignment = self._normalize_alignment(fallback)
+        anchor = str(getattr(unit, "anchor_horizontal", "") or "").strip().lower()
+        metadata = dict(getattr(unit, "metadata", {}) or {})
+        horizontal_growth = str(metadata.get("horizontal_growth") or "").strip().lower()
+        if anchor in {"start", "left"}:
+            return "left"
+        if anchor in {"end", "right"}:
+            return "right"
+        if anchor == "center":
+            return "center"
+        if horizontal_growth == "grow_to_start":
+            return "right"
+        if horizontal_growth == "grow_symmetrically":
+            return "center"
+        return alignment
+
+    def _unit_render_tuning(self, unit, plan=None):
+        metadata = dict(getattr(unit, "metadata", {}) or {})
+        adaptive = dict(metadata.get("adaptive_profile") or {})
+        plan_profile = dict((getattr(plan, "adaptive_profile", {}) or {}))
+        line_spacing_factor = float(adaptive.get("line_spacing_factor") or plan_profile.get("line_spacing_factor") or 1.0)
+        unit_profile = str(adaptive.get("unit_profile") or "")
+        page_profile = str(adaptive.get("page_profile") or plan_profile.get("page_profile") or "")
+        min_fontsize = 5.5
+        if page_profile in {"academic_dense", "technical_structured"} or unit_profile in {"protected_inline", "technical_inline_cluster", "dense_editorial_phrase"}:
+            min_fontsize = 5.0
+        if unit_profile in {"anchored_label", "protected_inline"}:
+            line_spacing_factor = max(line_spacing_factor, 0.98)
+        if unit_profile in {"technical_inline_cluster", "dense_editorial_phrase"}:
+            line_spacing_factor = min(line_spacing_factor, 0.94)
+        return {
+            "adaptive_profile": adaptive,
+            "unit_profile": unit_profile,
+            "line_spacing_factor": max(0.84, min(1.08, line_spacing_factor)),
+            "min_fontsize": min_fontsize,
+            "prefer_bbox_anchor": bool(adaptive.get("prefer_bbox_anchor") or plan_profile.get("prefer_bbox_anchor")),
+            "prefer_atomic_short_units": bool(adaptive.get("prefer_atomic_short_units") or plan_profile.get("prefer_atomic_short_units")),
+        }
+
+    def _anchored_line_baseline(self, rect, unit, fontsize, line_h, line_index, line_count):
+        anchor = str(getattr(unit, "anchor_vertical", "") or "").strip().lower()
+        if anchor == "middle":
+            total_h = max(line_h, line_h * max(1, line_count))
+            top_y = rect.y0 + max(0.0, (rect.height - total_h) / 2.0)
+        elif anchor == "bottom":
+            total_h = max(line_h, line_h * max(1, line_count))
+            top_y = max(rect.y0, rect.y1 - total_h)
+        else:
+            top_y = rect.y0
+        return top_y + min(rect.height - 1.0, (line_index + 1) * line_h * 0.82)
 
     def _line_translated_text(self, line):
         text = self._clean_text_for_render((line or {}).get("translated_text") or "")
@@ -1281,7 +1750,7 @@ class DocumentReconstructor:
             return self._clean_text_for_render(" ".join(parts))
         return fallback_text
 
-    def _phrase_units(self, block, semantic_payload, target_lang):
+    def _phrase_units(self, block, semantic_payload, target_lang, page_data=None):
         block_id = str((block or {}).get("id") or "")
         block_role = str((block or {}).get("role") or "body").strip().lower()
         block_style = self._style_from_block(block)
@@ -1300,6 +1769,22 @@ class DocumentReconstructor:
             phrase_id = str(ctx.get("phrase_unit_id") or phrase.get("unit_id") or f"{block_id}:phrase:{idx}")
             editorial_rel = dict((phrase.get("editorial_relations") or {}).get("with_previous") or {})
             child_units = self._children_for_phrase(phrase_id, semantic_payload)
+            positioning = self._positioning_preferences_for_unit(
+                phrase,
+                text=translated_text,
+                child_units=child_units,
+                default_anchor_horizontal=((phrase.get("layout_attributes") or {}).get("horizontal_anchor")),
+                default_anchor_vertical=((phrase.get("layout_attributes") or {}).get("vertical_anchor")),
+                block=block,
+                page_data=page_data,
+                default_render_policy=str(phrase.get("render_policy") or block.get("render_policy") or "translated_editorial"),
+                default_keep_with_previous=bool(editorial_rel.get("relation") in {"keep_with_previous", "label_value"}),
+                default_keep_with_next=bool(((phrase.get("editorial_relations") or {}).get("with_next") or {}).get("relation") in {"keep_with_next", "label_value"}),
+                default_hard_break_before=bool(phrase.get("hard_break_before") or editorial_rel.get("relation") in {"paragraph_break", "new_line"}),
+                default_hard_break_after=bool(phrase.get("hard_break_after")),
+                default_reflowable=bool((phrase.get("editorial_semantics") or {}).get("reflowable", True)),
+                default_break_priority=10,
+            )
             units.append(
                 PlacableUnit(
                     unit_id=str(phrase.get("unit_id") or phrase_id),
@@ -1318,22 +1803,27 @@ class DocumentReconstructor:
                     layout_attributes=dict(phrase.get("layout_attributes") or {}),
                     text_attributes=dict(phrase.get("text_attributes") or {}),
                     relative_bbox=self._unit_fitz_bbox(phrase),
-                    anchor_horizontal=((phrase.get("layout_attributes") or {}).get("horizontal_anchor")),
-                    anchor_vertical=((phrase.get("layout_attributes") or {}).get("vertical_anchor")),
+                    anchor_horizontal=positioning["anchor_horizontal"],
+                    anchor_vertical=positioning["anchor_vertical"],
                     continuation_before=bool(editorial_rel.get("continuation")),
                     continuation_after=bool(((phrase.get("editorial_relations") or {}).get("with_next") or {}).get("continuation")),
-                    hard_break_before=bool(phrase.get("hard_break_before") or editorial_rel.get("relation") in {"paragraph_break", "new_line"}),
-                    hard_break_after=bool(phrase.get("hard_break_after")),
-                    keep_with_previous=bool(editorial_rel.get("relation") in {"keep_with_previous", "label_value"}),
-                    keep_with_next=bool(((phrase.get("editorial_relations") or {}).get("with_next") or {}).get("relation") in {"keep_with_next", "label_value"}),
-                    reflowable=bool((phrase.get("editorial_semantics") or {}).get("reflowable", True)),
-                    protected_inline=False,
-                    immutable=False,
-                    render_policy=str(phrase.get("render_policy") or block.get("render_policy") or "translated_editorial"),
-                    justification_eligible=True,
-                    break_priority=10,
+                    hard_break_before=positioning["hard_break_before"],
+                    hard_break_after=positioning["hard_break_after"],
+                    keep_with_previous=positioning["keep_with_previous"],
+                    keep_with_next=positioning["keep_with_next"],
+                    reflowable=positioning["reflowable"],
+                    protected_inline=positioning["protected_inline"],
+                    immutable=positioning["immutable"],
+                    render_policy=positioning["render_policy"],
+                    justification_eligible=not positioning["protected_inline"],
+                    break_priority=positioning["break_priority"],
                     paragraph_id=str(ctx.get("paragraph_id") or phrase_id),
-                    metadata={"target_lang": target_lang, "raw_unit": dict(phrase), "fragments": child_units},
+                    metadata={
+                        "target_lang": target_lang,
+                        "raw_unit": dict(phrase),
+                        "fragments": child_units,
+                        **positioning["metadata"],
+                    },
                 )
             )
         return units
@@ -1424,7 +1914,7 @@ class DocumentReconstructor:
                     return True
         return False
 
-    def _line_units(self, block, target_lang):
+    def _line_units(self, block, target_lang, page_data=None):
         block_id = str((block or {}).get("id") or "")
         block_role = str((block or {}).get("role") or "body").strip().lower()
         block_style = self._style_from_block(block)
@@ -1436,6 +1926,22 @@ class DocumentReconstructor:
             source_text = self._line_source_text(line) or translated_text
             line_rect = self._fitz_rect_from_bbox_like((line or {}).get("bbox"))
             bbox = (line_rect.x0, line_rect.y0, line_rect.x1, line_rect.y1) if isinstance(line_rect, fitz.Rect) else None
+            positioning = self._positioning_preferences_for_unit(
+                line,
+                text=translated_text,
+                child_units=None,
+                block=block,
+                page_data=page_data,
+                default_anchor_horizontal=((line.get("layout_attributes") or {}).get("horizontal_anchor")),
+                default_anchor_vertical=((line.get("layout_attributes") or {}).get("vertical_anchor")),
+                default_render_policy=str((line or {}).get("render_policy") or (block or {}).get("render_policy") or "translated_editorial"),
+                default_keep_with_previous=False,
+                default_keep_with_next=False,
+                default_hard_break_before=bool((line or {}).get("hard_break_before") or idx > 0),
+                default_hard_break_after=bool((line or {}).get("line_break_after")),
+                default_reflowable=False,
+                default_break_priority=15,
+            )
             units.append(
                 PlacableUnit(
                     unit_id=f"{block_id}:line_unit:{idx}",
@@ -1454,27 +1960,27 @@ class DocumentReconstructor:
                     layout_attributes=dict((line or {}).get("layout_attributes") or {}),
                     text_attributes={},
                     relative_bbox=bbox,
-                    anchor_horizontal=((line.get("layout_attributes") or {}).get("horizontal_anchor")) if isinstance(line, dict) else None,
-                    anchor_vertical=((line.get("layout_attributes") or {}).get("vertical_anchor")) if isinstance(line, dict) else None,
+                    anchor_horizontal=positioning["anchor_horizontal"],
+                    anchor_vertical=positioning["anchor_vertical"],
                     continuation_before=False,
                     continuation_after=False,
-                    hard_break_before=bool((line or {}).get("hard_break_before") or idx > 0),
-                    hard_break_after=bool((line or {}).get("line_break_after")),
-                    keep_with_previous=False,
-                    keep_with_next=False,
-                    reflowable=False,
-                    protected_inline=False,
-                    immutable=False,
-                    render_policy=str((block or {}).get("render_policy") or "translated_editorial"),
-                    justification_eligible=True,
-                    break_priority=15,
+                    hard_break_before=positioning["hard_break_before"],
+                    hard_break_after=positioning["hard_break_after"],
+                    keep_with_previous=positioning["keep_with_previous"],
+                    keep_with_next=positioning["keep_with_next"],
+                    reflowable=positioning["reflowable"],
+                    protected_inline=positioning["protected_inline"],
+                    immutable=positioning["immutable"],
+                    render_policy=positioning["render_policy"],
+                    justification_eligible=not positioning["protected_inline"],
+                    break_priority=positioning["break_priority"],
                     paragraph_id=f"{block_id}:line_paragraph:{idx}",
-                    metadata={"target_lang": target_lang, "raw_unit": dict(line or {})},
+                    metadata={"target_lang": target_lang, "raw_unit": dict(line or {}), **positioning["metadata"]},
                 )
             )
         return units
 
-    def _nested_span_units(self, block, target_lang):
+    def _nested_span_units(self, block, target_lang, page_data=None):
         block_id = str((block or {}).get("id") or "")
         block_role = str((block or {}).get("role") or "body").strip().lower()
         block_style = self._style_from_block(block)
@@ -1543,6 +2049,22 @@ class DocumentReconstructor:
                         continue
                     expression_semantics = dict((span or {}).get("expression_semantics") or {})
                     inline_class = str(expression_semantics.get("inline_class") or "").strip().lower() or None
+                    positioning = self._positioning_preferences_for_unit(
+                        span,
+                        text=translated_text,
+                        child_units=None,
+                        block=block,
+                        page_data=page_data,
+                        default_anchor_horizontal=(((span or {}).get("layout_attributes") or {}).get("horizontal_anchor")),
+                        default_anchor_vertical=(((span or {}).get("layout_attributes") or {}).get("vertical_anchor")),
+                        default_render_policy=render_policy,
+                        default_keep_with_previous=False,
+                        default_keep_with_next=False,
+                        default_hard_break_before=bool(si == 0),
+                        default_hard_break_after=bool(si == len((phrase or {}).get("spans") or []) - 1),
+                        default_reflowable=False,
+                        default_break_priority=20,
+                    )
                     units.append(
                         PlacableUnit(
                             unit_id=str((span or {}).get("unit_id") or f"{phrase_id}:span:{si}"),
@@ -1561,27 +2083,27 @@ class DocumentReconstructor:
                             layout_attributes=dict((span or {}).get("layout_attributes") or {}),
                             text_attributes=dict((span or {}).get("text_attributes") or {}),
                             relative_bbox=bbox,
-                            anchor_horizontal=(((span or {}).get("layout_attributes") or {}).get("horizontal_anchor")),
-                            anchor_vertical=(((span or {}).get("layout_attributes") or {}).get("vertical_anchor")),
+                            anchor_horizontal=positioning["anchor_horizontal"],
+                            anchor_vertical=positioning["anchor_vertical"],
                             continuation_before=False,
                             continuation_after=False,
-                            hard_break_before=bool(si == 0),
-                            hard_break_after=bool(si == len((phrase or {}).get("spans") or []) - 1),
-                            keep_with_previous=False,
-                            keep_with_next=False,
-                            reflowable=False,
-                            protected_inline=bool(expression_semantics.get("protected_inline", False)),
-                            immutable=bool(expression_semantics.get("immutable_inline", False)),
-                            render_policy=render_policy,
-                            justification_eligible=inline_class not in {"code", "formula", "reference"},
-                            break_priority=20,
+                            hard_break_before=positioning["hard_break_before"],
+                            hard_break_after=positioning["hard_break_after"],
+                            keep_with_previous=positioning["keep_with_previous"],
+                            keep_with_next=positioning["keep_with_next"],
+                            reflowable=positioning["reflowable"],
+                            protected_inline=bool(expression_semantics.get("protected_inline", False)) or positioning["protected_inline"],
+                            immutable=bool(expression_semantics.get("immutable_inline", False)) or positioning["immutable"],
+                            render_policy=positioning["render_policy"],
+                            justification_eligible=inline_class not in {"code", "formula", "reference"} and not positioning["protected_inline"],
+                            break_priority=positioning["break_priority"],
                             paragraph_id=f"{block_id}:nested_span_line:{li}",
-                            metadata={"target_lang": target_lang, "raw_unit": dict(span or {})},
+                            metadata={"target_lang": target_lang, "raw_unit": dict(span or {}), **positioning["metadata"]},
                         )
                     )
         return units
 
-    def _fallback_units(self, block, semantic_payload, target_lang):
+    def _fallback_units(self, block, semantic_payload, target_lang, page_data=None):
         block_id = str((block or {}).get("id") or "")
         block_role = str((block or {}).get("role") or "body").strip().lower()
         block_style = self._style_from_block(block)
@@ -1629,6 +2151,22 @@ class DocumentReconstructor:
             ctx = dict(unit.get("structural_context") or {})
             editorial_rel = dict((unit.get("editorial_relations") or {}).get("with_previous") or {})
             expression_semantics = dict(unit.get("expression_semantics") or {})
+            positioning = self._positioning_preferences_for_unit(
+                unit,
+                text=text,
+                child_units=None,
+                default_anchor_horizontal=((unit.get("layout_attributes") or {}).get("horizontal_anchor")),
+                default_anchor_vertical=((unit.get("layout_attributes") or {}).get("vertical_anchor")),
+                block=block,
+                page_data=page_data,
+                default_render_policy=str(unit.get("render_policy") or render_policy or "translated_editorial"),
+                default_keep_with_previous=bool(editorial_rel.get("relation") in {"keep_with_previous", "label_value"}),
+                default_keep_with_next=bool(((unit.get("editorial_relations") or {}).get("with_next") or {}).get("relation") in {"keep_with_next", "label_value"}),
+                default_hard_break_before=bool(unit.get("hard_break_before") or editorial_rel.get("relation") in {"paragraph_break", "new_line"}),
+                default_hard_break_after=bool(unit.get("hard_break_after")),
+                default_reflowable=bool((unit.get("editorial_semantics") or {}).get("reflowable", True)),
+                default_break_priority=10 if str(unit.get("group_class") or "").strip() else 5,
+            )
             normalized.append(
                 PlacableUnit(
                     unit_id=str(unit.get("unit_id") or f"{block_id}:{idx}"),
@@ -1647,32 +2185,32 @@ class DocumentReconstructor:
                     layout_attributes=dict(unit.get("layout_attributes") or {}),
                     text_attributes=dict(unit.get("text_attributes") or {}),
                     relative_bbox=self._unit_fitz_bbox(unit),
-                    anchor_horizontal=((unit.get("layout_attributes") or {}).get("horizontal_anchor")),
-                    anchor_vertical=((unit.get("layout_attributes") or {}).get("vertical_anchor")),
+                    anchor_horizontal=positioning["anchor_horizontal"],
+                    anchor_vertical=positioning["anchor_vertical"],
                     continuation_before=bool(editorial_rel.get("continuation")),
                     continuation_after=bool(((unit.get("editorial_relations") or {}).get("with_next") or {}).get("continuation")),
-                    hard_break_before=bool(unit.get("hard_break_before") or editorial_rel.get("relation") in {"paragraph_break", "new_line"}),
-                    hard_break_after=bool(unit.get("hard_break_after")),
-                    keep_with_previous=bool(editorial_rel.get("relation") in {"keep_with_previous", "label_value"}),
-                    keep_with_next=bool(((unit.get("editorial_relations") or {}).get("with_next") or {}).get("relation") in {"keep_with_next", "label_value"}),
-                    reflowable=bool((unit.get("editorial_semantics") or {}).get("reflowable", True)),
-                    protected_inline=bool(expression_semantics.get("protected_inline", False)),
-                    immutable=bool(expression_semantics.get("immutable_inline", False)),
-                    render_policy=str(unit.get("render_policy") or render_policy or "translated_editorial"),
+                    hard_break_before=positioning["hard_break_before"],
+                    hard_break_after=positioning["hard_break_after"],
+                    keep_with_previous=positioning["keep_with_previous"],
+                    keep_with_next=positioning["keep_with_next"],
+                    reflowable=positioning["reflowable"],
+                    protected_inline=bool(expression_semantics.get("protected_inline", False)) or positioning["protected_inline"],
+                    immutable=bool(expression_semantics.get("immutable_inline", False)) or positioning["immutable"],
+                    render_policy=positioning["render_policy"],
                     justification_eligible=str(expression_semantics.get("inline_class") or "").strip().lower() not in {"code", "formula", "reference"},
-                    break_priority=10 if str(unit.get("group_class") or "").strip() else 5,
+                    break_priority=positioning["break_priority"],
                     paragraph_id=str(ctx.get("paragraph_id") or ctx.get("phrase_unit_id") or f"{block_id}:paragraph:0"),
-                    metadata={"target_lang": target_lang, "raw_unit": dict(unit)},
+                    metadata={"target_lang": target_lang, "raw_unit": dict(unit), **positioning["metadata"]},
                 )
             )
         return normalized
 
-    def _orphan_semantic_units(self, block, semantic_payload, target_lang, phrase_units):
+    def _orphan_semantic_units(self, block, semantic_payload, target_lang, phrase_units, page_data=None):
         phrase_ids = {str(unit.phrase_unit_id or "") for unit in phrase_units or []}
         phrase_unit_ids = {str(unit.unit_id or "") for unit in phrase_units or []}
         extras = []
         seen_unit_ids = set()
-        for unit in self._fallback_units(block, semantic_payload, target_lang):
+        for unit in self._fallback_units(block, semantic_payload, target_lang, page_data=page_data):
             if unit.unit_id in phrase_unit_ids or unit.unit_id in seen_unit_ids:
                 continue
             phrase_id = str(unit.phrase_unit_id or "")
@@ -1685,19 +2223,29 @@ class DocumentReconstructor:
     def _normalize_placable_units(self, block, semantic_payload, target_lang, page_data=None):
         render_policy = str((block or {}).get("render_policy") or "").strip().lower()
         if render_policy in {"anchored_text", "fixed_preserve"}:
-            nested_span_units = self._nested_span_units(block, target_lang)
+            nested_span_units = self._nested_span_units(block, target_lang, page_data=page_data)
             if nested_span_units:
                 return self._canonicalize_block_units(block, nested_span_units)
-        phrase_units = self._phrase_units(block, semantic_payload, target_lang)
+        # Pour les blocs non-ancrés, semantic_groups sont prioritaires sur semantic_phrases
+        if render_policy not in {"anchored_text", "fixed_preserve"}:
+            _group_candidates = [
+                u for u in (semantic_payload.get("semantic_groups") or [])
+                if isinstance(u, dict) and self._clean_text_for_render((u or {}).get("translated_text") or "")
+            ]
+            if _group_candidates:
+                group_units = self._fallback_units(block, semantic_payload, target_lang, page_data=page_data)
+                if group_units:
+                    return self._canonicalize_block_units(block, group_units)
+        phrase_units = self._phrase_units(block, semantic_payload, target_lang, page_data=page_data)
         if phrase_units and self._semantic_phrases_are_overlapping(semantic_payload.get("semantic_phrases") or []):
-            line_units = self._line_units(block, target_lang)
+            line_units = self._line_units(block, target_lang, page_data=page_data)
             if line_units:
                 phrase_units = line_units
         external_units = [] if self._has_translated_payload(block) else self._external_units_for_block(block, page_data, target_lang)
         if external_units and not phrase_units:
             return external_units
         if phrase_units:
-            units = phrase_units + self._orphan_semantic_units(block, semantic_payload, target_lang, phrase_units)
+            units = phrase_units + self._orphan_semantic_units(block, semantic_payload, target_lang, phrase_units, page_data=page_data)
             if external_units:
                 seen = {
                     (
@@ -1715,7 +2263,7 @@ class DocumentReconstructor:
                         units.append(unit)
                         seen.add(key)
             return self._canonicalize_block_units(block, units)
-        fallback_units = self._fallback_units(block, semantic_payload, target_lang)
+        fallback_units = self._fallback_units(block, semantic_payload, target_lang, page_data=page_data)
         if external_units:
             merged = external_units if not fallback_units else external_units + fallback_units
             return self._canonicalize_block_units(block, merged)
@@ -1774,7 +2322,16 @@ class DocumentReconstructor:
                 cur_seg_type = str(((cur_unit.metadata or {}).get("segment_type") or "")).strip().lower()
                 large_gap = gap is not None and gap > 18.0
                 repeated_cluster_start = prev_seg_type == "page" and cur_seg_type == "label"
-                if large_gap and repeated_cluster_start:
+                protected_edge = any(
+                    bool(candidate.protected_inline or candidate.immutable)
+                    for candidate in (prev_unit, cur_unit)
+                )
+                anchor_change = (
+                    str(prev_unit.anchor_horizontal or "").strip().lower()
+                    and str(cur_unit.anchor_horizontal or "").strip().lower()
+                    and str(prev_unit.anchor_horizontal or "").strip().lower() != str(cur_unit.anchor_horizontal or "").strip().lower()
+                )
+                if large_gap and (repeated_cluster_start or protected_edge or anchor_change):
                     islands.append([item])
                 else:
                     islands[-1].append(item)
@@ -1835,12 +2392,85 @@ class DocumentReconstructor:
             edges.append(GraphEdge(prev_unit.unit_id, unit.unit_id, relation, hard, weight))
         return edges
 
+    def _source_layout_paragraph_for_line(self, source_layout_mode, line_index):
+        try:
+            target = int(line_index)
+        except Exception:
+            target = 0
+        paragraph_index = 0
+        for item in source_layout_mode.get("line_breaks") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("line_index", 0) or 0)
+            except Exception:
+                idx = 0
+            if idx >= target:
+                break
+            if str(item.get("after") or "").strip().lower() == "paragraph_break":
+                paragraph_index += 1
+        return paragraph_index
+
+    def _apply_source_layout_mode_to_units(self, block, units):
+        if not units:
+            return units
+        mode = dict((block or {}).get("source_layout_mode") or {})
+        line_flow = str(mode.get("line_flow") or "").strip().lower()
+        render_contract = str(mode.get("render_contract") or "").strip().lower()
+        if not line_flow:
+            return units
+
+        block_id = str((block or {}).get("id") or "block")
+        preserve_lines = bool(mode.get("preserve_line_breaks")) or line_flow in {"fixed_lines", "preserve_line_breaks"}
+        can_reflow = bool(mode.get("can_reflow_within_paragraph", True))
+        updated = []
+        previous_paragraph = None
+        for idx, unit in enumerate(units):
+            line_indices = list(unit.line_indices or [idx])
+            first_line = int(line_indices[0]) if line_indices else idx
+            paragraph_index = (
+                first_line
+                if preserve_lines
+                else self._source_layout_paragraph_for_line(mode, first_line)
+            )
+            paragraph_id = f"{block_id}:source_layout:{paragraph_index}"
+            paragraph_changed = previous_paragraph is not None and paragraph_index != previous_paragraph
+            metadata = dict(unit.metadata or {})
+            metadata["source_layout_mode"] = {
+                "mode": mode.get("mode"),
+                "line_flow": line_flow,
+                "render_contract": render_contract,
+                "paragraph_index": paragraph_index,
+            }
+            if preserve_lines:
+                updated_unit = replace(
+                    unit,
+                    paragraph_id=paragraph_id,
+                    hard_break_before=bool(idx == 0 or first_line != (updated[-1].line_indices[-1] if updated and updated[-1].line_indices else first_line)),
+                    continuation_before=False,
+                    reflowable=bool(can_reflow and line_flow != "fixed_lines" and unit.reflowable),
+                    metadata=metadata,
+                )
+            else:
+                updated_unit = replace(
+                    unit,
+                    paragraph_id=paragraph_id,
+                    hard_break_before=bool(idx == 0 or paragraph_changed),
+                    continuation_before=bool(idx > 0 and not paragraph_changed),
+                    reflowable=bool(can_reflow and unit.reflowable),
+                    metadata=metadata,
+                )
+            updated.append(updated_unit)
+            previous_paragraph = paragraph_index
+        return updated
+
     def _build_block_reconstruction_plan(self, page, page_data, block, target_lang):
         block_type = self._classify_block_for_reconstruction(block, page_data)
         geometry_ctx = self._build_block_geometry_context(page, page_data, block)
         line_templates = self._build_line_templates(block, geometry_ctx)
         semantic_payload = self._collect_block_semantic_payload(block)
         units = self._normalize_placable_units(block, semantic_payload, target_lang, page_data=page_data)
+        units = self._apply_source_layout_mode_to_units(block, units)
         graph_edges = self._build_reconstruction_graph(units)
         block_rect = self._fitz_rect_from_bbox_like((block or {}).get("bbox"))
         block_rect_tuple = (
@@ -1905,6 +2535,8 @@ class DocumentReconstructor:
             relative_geometry=dict((block or {}).get("relative_geometry") or {}),
             editorial_semantics=dict((block or {}).get("editorial_semantics") or {}),
             editorial_relations=dict((block or {}).get("editorial_relations") or {}),
+            source_layout_mode=dict((block or {}).get("source_layout_mode") or {}),
+            adaptive_profile=dict((geometry_ctx.constraints or {}).get("adaptive_profile") or {}),
             constraints=constraints,
             source_block=dict(block or {}),
         )
@@ -2041,6 +2673,54 @@ class DocumentReconstructor:
                 text_rects.append(rect)
         return findings
 
+    def _prune_block_draw_ops(self, plan, ops):
+        block_rect = fitz.Rect(plan.block_bbox)
+        tolerance = 2.0
+        protected_rects = []
+        for region in plan.protected_regions or []:
+            rect = self._fitz_rect_from_bbox_like((region or {}).get("bbox"))
+            if isinstance(rect, fitz.Rect) and rect.get_area() > 0:
+                protected_rects.append(rect)
+
+        ancillary_ops = []
+        kept_text_ops = []
+        kept_text_rects = []
+        for op in ops or []:
+            if op.op_type != "draw_text_run":
+                ancillary_ops.append(op)
+                continue
+            rect = fitz.Rect(op.bbox) if isinstance(op.bbox, (list, tuple)) and len(op.bbox) == 4 else None
+            text = self._clean_text_for_render(op.text or "")
+            if not text or not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+                continue
+            if (
+                rect.x0 < block_rect.x0 - tolerance
+                or rect.x1 > block_rect.x1 + tolerance
+                or rect.y0 < block_rect.y0 - tolerance
+                or rect.y1 > block_rect.y1 + tolerance
+            ):
+                continue
+            if any((rect & prev_rect).get_area() > 0.5 for prev_rect in kept_text_rects):
+                continue
+            if any((rect & protected_rect).get_area() > 0.5 for protected_rect in protected_rects):
+                continue
+            kept_text_ops.append(op)
+            kept_text_rects.append(rect)
+
+        overlay_ops = [op for op in ancillary_ops if op.op_type == "draw_overlay_image"]
+        if not kept_text_ops:
+            return overlay_ops
+
+        pruned_ops = []
+        text_op_ids = {id(op) for op in kept_text_ops}
+        for op in ancillary_ops:
+            if op.op_type == "erase_rect" or op.op_type == "draw_overlay_image":
+                pruned_ops.append(op)
+        for op in ops or []:
+            if op.op_type == "draw_text_run" and id(op) in text_op_ids:
+                pruned_ops.append(op)
+        return pruned_ops
+
     def _normalized_rgb(self, rgb):
         if not isinstance(rgb, (list, tuple)) or len(rgb) != 3:
             return (0, 0, 0)
@@ -2085,6 +2765,12 @@ class DocumentReconstructor:
                         page.insert_text(point, op.text or "", fontname=fontname, **insert_kwargs)
                 except Exception:
                     page.insert_text(point, op.text or "", fontname="helv", **insert_kwargs)
+
+    def _clean_page_background_path(self, page_data):
+        path = str((page_data or {}).get("background_path") or "").strip()
+        if path and os.path.exists(path):
+            return path
+        return None
 
     def _page_background_path(self, page_data):
         for key in ("background_path", "source_image_path"):
@@ -2134,13 +2820,18 @@ class DocumentReconstructor:
         findings = self._validate_block_layout(plan, ops)
         severe = {"overflow", "text_overlap", "protected_overlap"}
         if any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in findings):
+            pruned_ops = self._prune_block_draw_ops(plan, ops)
+            if pruned_ops:
+                pruned_findings = self._validate_block_layout(plan, pruned_ops)
+                if not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in pruned_findings):
+                    return pruned_ops, pruned_findings
             return [], findings
         return ops, findings
 
     def _translated_coverage_entries_for_block(self, block, target_lang, page_data=None):
         semantic_payload = self._collect_block_semantic_payload(block)
-        phrase_units = self._phrase_units(block, semantic_payload, target_lang)
-        orphan_units = self._orphan_semantic_units(block, semantic_payload, target_lang, phrase_units) if phrase_units else []
+        phrase_units = self._phrase_units(block, semantic_payload, target_lang, page_data=page_data)
+        orphan_units = self._orphan_semantic_units(block, semantic_payload, target_lang, phrase_units, page_data=page_data) if phrase_units else []
         entries = []
         used_ids = set()
         used_text_bbox = set()
@@ -2230,15 +2921,17 @@ class DocumentReconstructor:
     def _expected_block_text_units(self, block, target_lang, page_data=None):
         return len(self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data))
 
-    def _render_block_presence_fallback_ops(self, page, page_data, block, target_lang):
+    def _render_block_presence_fallback_ops(self, page, page_data, block, target_lang, font_scale=1.0):
         block_rect = self._fitz_rect_from_bbox_like((block or {}).get("bbox"))
         if not isinstance(block_rect, fitz.Rect) or block_rect.get_area() <= 0:
             return []
+        adaptive_profile = self._block_adaptive_profile(block, page_data=page_data)
         entries = self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data)
         if not entries:
             return []
-        # N'efface que si le fond n'est pas déjà propre — évite le double-whiteout sur bg_master.
-        has_clean_background = bool(self._page_background_path(page_data))
+        # N'efface que si le fond n'est pas déjà propre — un source_image_path brut
+        # ne compte pas comme fond propre, sinon on réintroduit le texte source.
+        has_clean_background = bool(self._clean_page_background_path(page_data))
         ops = []
         if not has_clean_background:
             ops.append(
@@ -2280,13 +2973,17 @@ class DocumentReconstructor:
                 continue
             style = self._merge_styles(entry.get("style") or {}, self._style_from_block(block))
             _, fontfile, builtin, fontname = self._resolve_style_font( page, style, text=text)
-            fontsize = min(float(style.get("size") or 12.0), max(6.0, rect.height * 0.72))
+            fontsize = min(float(style.get("size") or 12.0) * max(0.4, float(font_scale)), max(4.5, rect.height * 0.72))
             wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
-            line_h = max(6.0, rect.height / max(1, len(wrapped)))
+            while fontsize > 4.5 and wrapped and (len(wrapped) * max(4.8, fontsize * 1.05)) > max(rect.height, fontsize * 1.15):
+                fontsize -= 0.5
+                wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+            spacing_factor = max(0.84, min(1.05, float(adaptive_profile.get("line_spacing_factor") or 1.0)))
+            line_h = max(4.8, min(rect.height / max(1, len(wrapped)), fontsize * 1.08 * spacing_factor))
             rgb = self._resolve_text_color( style, block)
             for line_idx, line_text in enumerate(wrapped):
                 cur_size = fontsize
-                while cur_size > 5.5:
+                while cur_size > 4.5:
                     width = self._measure_text_width( line_text, cur_size, fontname, fontfile)
                     if width <= max(8.0, rect.width):
                         break
@@ -2321,6 +3018,26 @@ class DocumentReconstructor:
                 )
         return ops
 
+    def _validated_block_presence_fallback_ops(self, page, page_data, block, target_lang, plan=None):
+        plan = plan or self._build_block_reconstruction_plan(page, page_data, block, target_lang)
+        severe = {"overflow", "text_overlap", "protected_overlap"}
+        best_ops = []
+        best_text_ops = 0
+        scale_ladder = tuple((plan.adaptive_profile or {}).get("fallback_scales") or (1.0, 0.9, 0.8, 0.7, 0.6))
+        for scale in scale_ladder:
+            ops = self._render_block_presence_fallback_ops(page, page_data, block, target_lang, font_scale=scale)
+            if not ops:
+                continue
+            findings = self._validate_block_layout(plan, ops)
+            if not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in findings):
+                return ops
+            pruned_ops = self._prune_block_draw_ops(plan, ops)
+            text_ops = sum(1 for op in pruned_ops if op.op_type == "draw_text_run")
+            if text_ops > best_text_ops:
+                best_ops = pruned_ops
+                best_text_ops = text_ops
+        return best_ops
+
     def reconstruct(self, structure, output_path):
         pages = list((structure or {}).get("pages") or [])
         output_path = Path(output_path)
@@ -2349,10 +3066,11 @@ class DocumentReconstructor:
                     text_ops = sum(1 for op in ops if op.op_type == "draw_text_run")
                     expected_units = self._expected_block_text_units(block, target_lang, page_data=page_data)
                     if (findings and not ops) or (expected_units > 0 and text_ops < expected_units):
-                        fallback_ops = self._render_block_presence_fallback_ops(page, page_data, block, target_lang)
-                        if fallback_ops:
+                        fallback_ops = self._validated_block_presence_fallback_ops(page, page_data, block, target_lang, plan=plan)
+                        fallback_text_ops = sum(1 for op in fallback_ops if op.op_type == "draw_text_run")
+                        if fallback_text_ops > text_ops:
                             ops = fallback_ops
-                            text_ops = sum(1 for op in ops if op.op_type == "draw_text_run")
+                            text_ops = fallback_text_ops
                             findings = []
                     if findings and not ops:
                         rendered_block_stats[plan.block_id] = {
@@ -2380,8 +3098,9 @@ class DocumentReconstructor:
                         continue
                     if committed and text_ops >= expected_units:
                         continue
-                    fallback_ops = self._render_block_presence_fallback_ops(page, page_data, block, target_lang)
-                    if fallback_ops:
+                    fallback_ops = self._validated_block_presence_fallback_ops(page, page_data, block, target_lang)
+                    fallback_text_ops = sum(1 for op in fallback_ops if op.op_type == "draw_text_run")
+                    if fallback_text_ops > text_ops:
                         self._commit_block_draw_ops(page, fallback_ops)
                 self._render_page_debug_image(page, output_path, page_index + 1)
             doc.save(str(output_path))
@@ -2485,20 +3204,26 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             return False
         if not all(unit.relative_bbox for unit in units):
             return False
+        if any(self.reconstructor._unit_render_tuning(unit, plan).get("prefer_bbox_anchor") for unit in units):
+            return False
         return all(str(unit.render_policy or "").strip().lower() == "external_flow" for unit in units)
 
     def _should_render_bbox_anchored(self, plan):
         units = [unit for unit in (plan.units or []) if self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)]
         if not units:
             return False
-        if any(str(unit.unit_type or "").strip().lower() == "translated_line" for unit in units):
+        if any(
+            str(unit.unit_type or "").strip().lower() == "translated_line"
+            for unit in units
+        ):
             return False
         if not all(unit.relative_bbox for unit in units):
             return False
         anchored_count = 0
         for unit in units:
             policy = str(unit.render_policy or "").strip().lower()
-            if policy in {"anchored_external", "anchored_text", "fixed_preserve"} or not unit.reflowable:
+            tuning = self.reconstructor._unit_render_tuning(unit, plan)
+            if policy in {"anchored_external", "anchored_text", "fixed_preserve"} or not unit.reflowable or tuning.get("prefer_bbox_anchor"):
                 anchored_count += 1
         return anchored_count == len(units)
 
@@ -2539,9 +3264,10 @@ class EditorialBlockRenderer(BaseBlockRenderer):
 
     def _segments_for_unit(self, unit):
         raw_unit = dict((unit.metadata or {}).get("raw_unit") or {})
-        raw_fragments = list((unit.metadata or {}).get("fragments") or [])
+        raw_fragments = list((unit.metadata or {}).get("fragments") or raw_unit.get("fragments") or [])
         render_policy = str(unit.render_policy or "").strip().lower()
         unit_type = str(unit.unit_type or "").strip().lower()
+        tuning = self.reconstructor._unit_render_tuning(unit)
         if unit_type == "translated_line":
             _tr = self.reconstructor._clean_text_for_render(unit.text_translated or "")
             _sr = self.reconstructor._clean_text_for_render(unit.text_source or "")
@@ -2549,9 +3275,16 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             if not text:
                 return []
             return [{"text": text, "style": dict(unit.style or {}), "unit": unit}]
-        preserve_as_single = render_policy in {"anchored_text", "fixed_preserve"} or not unit.reflowable
+        preserve_as_single = render_policy in {"anchored_text", "fixed_preserve"} or not unit.reflowable or tuning.get("prefer_atomic_short_units")
         if raw_fragments:
             segments = []
+            protected_classes = {"technical_inline", "reference", "formula", "code"}
+            fragment_classes = [
+                str(((fragment.get("expression_semantics") or {}).get("inline_class") or "")).strip().lower()
+                for fragment in raw_fragments
+            ]
+            preserve_fragment_runs = bool((unit.metadata or {}).get("has_protected_fragments"))
+            atomic_fragments = preserve_as_single or preserve_fragment_runs or any(cls in protected_classes for cls in fragment_classes)
             for fragment in raw_fragments:
                 text = self.reconstructor._clean_text_for_render(
                     fragment.get("translated_text") or fragment.get("text") or fragment.get("texte") or ""
@@ -2559,11 +3292,11 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 if not text:
                     continue
                 style = self.reconstructor._merge_styles(fragment.get("style") or {}, unit.style)
-                if preserve_as_single:
+                if atomic_fragments:
                     tokens = [text]
                 else:
                     inline_class = str(((fragment.get("expression_semantics") or {}).get("inline_class") or "")).strip().lower()
-                    tokens = [text] if inline_class in {"technical_inline", "reference", "formula", "code"} else self._tokenize_text(text)
+                    tokens = [text] if inline_class in protected_classes else self._tokenize_text(text)
                 for token in tokens:
                     segments.append({"text": token, "style": style, "unit": unit})
             if segments:
@@ -2616,6 +3349,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
 
     def _linewise_fallback(self, page, plan):
         block = plan.source_block or {}
+        adaptive_profile = dict(plan.adaptive_profile or {})
         lines = list((block.get("lines") or []))
         if not lines:
             return []
@@ -2635,7 +3369,8 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             template_index = idx
             remaining_lines = [text]
             fontsize = float(style.get("size") or 12.0)
-            while fontsize >= 5.5:
+            min_fontsize = 5.0 if str(adaptive_profile.get("page_profile") or "") in {"academic_dense", "technical_structured"} else 5.5
+            while fontsize >= min_fontsize:
                 probe_template = templates[min(template_index, len(templates) - 1)]
                 wrapped = self._wrap_text(page, {**style, "size": fontsize}, text, max(8.0, probe_template.usable_width))
                 if template_index + len(wrapped) <= len(templates):
@@ -2675,6 +3410,11 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 template_index += 1
         return ops
 
+    def _validate_fallback_ops(self, plan, ops):
+        severe = {"overflow", "text_overlap", "protected_overlap"}
+        findings = self.reconstructor._validate_block_layout(plan, ops)
+        return not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in findings)
+
     def _render_bbox_anchored(self, page, plan):
         units = sorted(
             [unit for unit in (plan.units or []) if unit.relative_bbox],
@@ -2692,6 +3432,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             text = _tr if _tr else _sr
             if not text:
                 continue
+            tuning = self.reconstructor._unit_render_tuning(unit, plan)
             rect = fitz.Rect(unit.relative_bbox)
             rect = fitz.Rect(
                 max(block_rect.x0, rect.x0),
@@ -2705,12 +3446,12 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font( page, style, text=text)
             fontsize = min(float(style.get("size") or 12.0), max(6.0, rect.height * 0.78))
             wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
-            while fontsize > 5.5 and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12)) > max(rect.height, fontsize * 1.3):
+            while fontsize > tuning["min_fontsize"] and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])) > max(rect.height, fontsize * 1.3):
                 fontsize -= 0.5
                 wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             rgb = self.reconstructor._resolve_text_color( style, plan.source_block)
-            line_h = max(6.0, fontsize * 1.12)
-            align = self.reconstructor._normalize_alignment(unit.anchor_horizontal or plan.paragraph_alignment or plan.alignment)
+            line_h = max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])
+            align = self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
             for line_idx, line_text in enumerate(wrapped):
                 width = self.reconstructor._measure_text_width( line_text, fontsize, fontname, fontfile)
                 x = rect.x0
@@ -2718,7 +3459,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                     x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
                 elif align == "right":
                     x = max(rect.x0, rect.x1 - width)
-                baseline = rect.y0 + min(rect.height - 1.0, (line_idx + 1) * line_h * 0.82)
+                baseline = self.reconstructor._anchored_line_baseline(rect, unit, fontsize, line_h, line_idx, len(wrapped))
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
@@ -2757,6 +3498,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             text = _tr if _tr else _sr
             if not text:
                 continue
+            tuning = self.reconstructor._unit_render_tuning(unit, plan)
             rect = fitz.Rect(unit.relative_bbox)
             rect = fitz.Rect(
                 max(block_rect.x0, rect.x0),
@@ -2770,25 +3512,24 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font( page, style, text=text)
             fontsize = min(float(style.get("size") or 12.0), max(6.0, rect.height * 0.78))
             wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
-            while fontsize > 5.5 and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12)) > max(rect.height, fontsize * 1.3):
+            while fontsize > tuning["min_fontsize"] and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])) > max(rect.height, fontsize * 1.3):
                 fontsize -= 0.5
                 wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             rgb = self.reconstructor._resolve_text_color( style, plan.source_block)
-            align = self.reconstructor._normalize_alignment(unit.anchor_horizontal or plan.paragraph_alignment or plan.alignment)
+            align = self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
             if align == "end":
                 align = "right"
             elif align == "start":
                 align = "left"
-            line_h = max(6.0, fontsize * 1.12)
-            top_y = rect.y0
-            for line_text in wrapped:
+            line_h = max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])
+            for line_idx, line_text in enumerate(wrapped):
                 width = self.reconstructor._measure_text_width( line_text, fontsize, fontname, fontfile)
                 x = rect.x0
                 if align == "center":
                     x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
                 elif align == "right":
                     x = max(rect.x0, rect.x1 - width)
-                baseline = top_y + min(rect.height - 1.0, fontsize * 0.82)
+                baseline = self.reconstructor._anchored_line_baseline(rect, unit, fontsize, line_h, line_idx, len(wrapped))
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
@@ -2810,8 +3551,8 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                         unit_id=unit.unit_id,
                     )
                 )
-                top_y += line_h
-                if top_y + line_h * 0.6 > rect.y1:
+                next_baseline = self.reconstructor._anchored_line_baseline(rect, unit, fontsize, line_h, line_idx + 1, len(wrapped))
+                if next_baseline + line_h * 0.18 > rect.y1:
                     break
         return ops
 
@@ -2819,7 +3560,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         if not segments:
             return []
         alignment = self.reconstructor._normalize_alignment(template.alignment or plan.paragraph_alignment or plan.alignment)
-        default_gap = max(2.0, min(6.0, template.ascent * 0.22))
+        dense_profile = str((plan.adaptive_profile or {}).get("page_profile") or "") in {"academic_dense", "technical_structured"}
+        gap_factor = 0.85 if dense_profile else 1.0
+        default_gap = max(1.5, min(6.0, template.ascent * 0.22 * gap_factor))
         widths = []
         measurements = []
         for seg in segments:
@@ -2898,6 +3641,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 previous_unit = unit
                 continue
             preserve_as_single = str(unit.render_policy or "").strip().lower() in {"anchored_text", "fixed_preserve"} or not unit.reflowable
+            tuning = self.reconstructor._unit_render_tuning(unit, plan)
             for seg in segments:
                 scaled_style = self._scaled_style(seg["style"], scale)
                 width, _, _, _, _, _ = self._measure_text(page, scaled_style, seg["text"])
@@ -2908,7 +3652,10 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                         existing_width += prev_w
                     existing_width += max(2.0, min(6.0, current_template.ascent * 0.22)) * max(0, len(current_segments))
                 projected = existing_width + width
-                can_wrap_segment = (unit.reflowable and not preserve_as_single) or str(unit.unit_type or "").strip().lower() == "translated_line"
+                can_wrap_segment = (
+                    ((unit.reflowable and not preserve_as_single) or str(unit.unit_type or "").strip().lower() == "translated_line")
+                    and not tuning.get("prefer_atomic_short_units")
+                )
                 if current_segments and projected > current_template.usable_width and can_wrap_segment:
                     ops.extend(self._finalize_line(page, plan, current_template, current_segments, is_last_line=False))
                     current_segments = []
@@ -2995,8 +3742,8 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         alignment = self.reconstructor._normalize_alignment(
             plan.paragraph_alignment or plan.alignment or "left"
         )
-        # Utiliser les templates si disponibles, sinon calculer les baselines
-        templates = list(plan.line_templates or [])
+        # Utiliser les templates avec compaction heading_to_body si disponibles
+        templates = self._prepare_templates(plan)
         y = block_rect.y0 + fontsize * 0.82
         for line_idx, line_text in enumerate(wrapped):
             if templates and line_idx < len(templates):
@@ -3098,7 +3845,12 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         if plan.semantic_profile is None:
             plan = replace(plan, semantic_profile=profile)
         # Dispatch base sur le profil semantique si le bloc est traduit
-        if profile is not None and profile.source_is_translated:
+        _units_have_mixed_style_fragments = any(
+            list((u.metadata or {}).get("fragments") or {}) or
+            list((((u.metadata or {}).get("raw_unit") or {})).get("fragments") or [])
+            for u in (plan.units or [])
+        )
+        if profile is not None and profile.source_is_translated and not _units_have_mixed_style_fragments:
             strategy = profile.render_strategy
             if strategy in ("prose_reflow", "heading_reflow", "caption_reflow"):
                 return self._render_prose_reflow(page, plan)
@@ -3113,7 +3865,8 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         best_ops = []
         best_finding_count = None
         severe = {"overflow", "text_overlap", "protected_overlap"}
-        for scale in (1.0, 0.96, 0.92, 0.88, 0.84, 0.8, 0.76, 0.72):
+        scale_ladder = tuple((plan.adaptive_profile or {}).get("editorial_scales") or (1.0, 0.96, 0.92, 0.88, 0.84, 0.8, 0.76, 0.72))
+        for scale in scale_ladder:
             ops = self._render_with_scale(page, plan, scale)
             findings = self.reconstructor._validate_block_layout(plan, ops)
             severe_findings = [
@@ -3126,7 +3879,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             if not severe_findings:
                 return ops
         fallback_ops = self._linewise_fallback(page, plan)
-        if fallback_ops:
+        if fallback_ops and self._validate_fallback_ops(plan, fallback_ops):
             return fallback_ops
         return best_ops
 
@@ -3157,31 +3910,42 @@ class CodeBlockRenderer(BaseBlockRenderer):
         ops = []
         block_rect = fitz.Rect(plan.block_bbox)
         base_style = self.reconstructor._style_from_block(block)
-        # Forcer monospace pour le code
         mono_style = {**base_style, "font": base_style.get("font") or "courier", "flags": {**(base_style.get("flags") or {}), "monospace": True}}
-        _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font( page, mono_style, text="x")
-        fontsize = min(float(mono_style.get("size") or 10.0), max(5.5, block_rect.height / max(1, len(lines)) * 0.82))
-        rgb = self.reconstructor._resolve_text_color( mono_style, block)
         for idx, line in enumerate(lines):
-            text = self.reconstructor._clean_text_for_render(
-                self.reconstructor._line_source_text(line) or self.reconstructor._line_translated_text(line)
-            )
+            line_is_technical = self.reconstructor._line_looks_technical_structured(line, block=block)
+            source_text = self.reconstructor._line_source_text(line)
+            translated_text = self.reconstructor._line_translated_text(line)
+            text = self.reconstructor._clean_text_for_render(source_text if line_is_technical else (translated_text or source_text))
             if not text:
                 continue
+            line_style = self.reconstructor._merge_styles((line or {}).get("style") or {}, base_style)
+            effective_style = (
+                {**line_style, "font": line_style.get("font") or "courier", "flags": {**(line_style.get("flags") or {}), "monospace": True}}
+                if line_is_technical
+                else line_style
+            )
             template_lines = plan.line_templates
             if template_lines and idx < len(template_lines):
                 tmpl = template_lines[idx]
                 baseline = tmpl.baseline_y
                 x = tmpl.left_x
+                available_width = max(8.0, tmpl.right_x - tmpl.left_x)
             else:
-                line_h = max(fontsize * 1.15, block_rect.height / max(1, len(lines)))
+                fontsize_probe = float(effective_style.get("size") or 10.0)
+                line_h = max(fontsize_probe * 1.15, block_rect.height / max(1, len(lines)))
                 baseline = block_rect.y0 + (idx + 0.82) * line_h
                 x = block_rect.x0
-            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), block_rect.x1, baseline + max(1.0, fontsize * 0.18))
+                available_width = max(8.0, block_rect.x1 - x)
+            _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font(page, effective_style, text=text)
+            fontsize = min(float(effective_style.get("size") or 10.0), max(5.5, block_rect.height / max(1, len(lines)) * 0.82))
+            while fontsize > 5.5 and self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile) > available_width:
+                fontsize -= 0.5
+            rgb = self.reconstructor._resolve_text_color(effective_style, block)
+            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(block_rect.x1, x + available_width), baseline + max(1.0, fontsize * 0.18))
             ops.append(
                 self._emit_text_run(
                     plan, text, text_rect, (x, baseline),
-                    {**mono_style, "size": fontsize},
+                    {**effective_style, "size": fontsize},
                     fontname, fontfile, builtin, fontsize, rgb,
                     unit_id=f"{plan.block_id}:code:{idx}",
                 )
@@ -3226,6 +3990,16 @@ class TableBlockRenderer(BaseBlockRenderer):
 
     def render(self, page, plan):
         block = plan.source_block or {}
+        descriptor_group_ids = dict((block or {}).get("descriptor_group_ids") or {})
+        has_explicit_cell = bool(
+            plan.constraints.get("table_cell_bbox")
+            or str(descriptor_group_ids.get("cell_id") or "").strip()
+            or str(descriptor_group_ids.get("table_row_group_id") or "").strip()
+        )
+        if self.reconstructor._block_looks_technical_structured(block):
+            return CodeBlockRenderer(self.reconstructor).render(page, plan)
+        if not has_explicit_cell:
+            return EditorialBlockRenderer(self.reconstructor).render(page, plan)
         cell_bbox = plan.constraints.get("table_cell_bbox") or plan.block_bbox
         cell_rect = fitz.Rect(cell_bbox)
         ops = []

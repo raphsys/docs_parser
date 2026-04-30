@@ -12,7 +12,11 @@ from translator import DocumentTranslator
 from reconstructor import DocumentReconstructor, BlockRenderOp, EditorialBlockRenderer
 from reconstructor import PlacableUnit
 from structure_extractor import LayoutV2Builder
-from ocr_server import _is_immutable_inline_text, _is_equation_like_text
+from ocr_server import (
+    _classify_semantic_phrase_kind,
+    _is_equation_like_text,
+    _is_immutable_inline_text,
+)
 
 
 class TranslationEnrichmentTests(unittest.TestCase):
@@ -3473,7 +3477,439 @@ class TranslationEnrichmentTests(unittest.TestCase):
             semantic_phrases[0]["text"],
             "The goal of the pooling layer is to downsample the feature maps produced by the convolutional layer into a smaller number of parameters, thus reducing computational complexity.",
         )
-        self.assertEqual(semantic_phrases[0]["line_indices"], [0, 1])
+
+    def test_semantic_phrase_extraction_respects_distinct_phrase_boxes_on_same_line(self):
+        from ocr_server import _build_semantic_phrases_for_block
+
+        block = {
+            "id": "b4",
+            "bbox": [80, 80, 560, 140],
+            "source": "ocr",
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [100, 100, 540, 118],
+                    "line_text": "First sentence ends here. Second sentence starts here.",
+                    "hard_break_before": True,
+                    "phrases": [
+                        {"bbox": [100, 100, 270, 118], "texte": "First sentence ends here.", "spans": []},
+                        {"bbox": [310, 100, 540, 118], "texte": "Second sentence starts here.", "spans": []},
+                    ],
+                }
+            ],
+        }
+
+        _build_semantic_phrases_for_block(block)
+        semantic_phrases = block.get("semantic_phrases", [])
+
+        self.assertEqual(len(semantic_phrases), 2)
+        self.assertEqual(
+            [phrase["text"] for phrase in semantic_phrases],
+            ["First sentence ends here.", "Second sentence starts here."],
+        )
+        self.assertEqual([phrase["fragment_count"] for phrase in semantic_phrases], [1, 1])
+
+    def test_apply_llm_corrections_can_split_single_line_into_multiple_semantic_phrases(self):
+        from ocr_server import _apply_llm_corrections
+
+        block = {
+            "id": "b4_llm_split",
+            "bbox": [80, 80, 560, 140],
+            "source": "ocr",
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [100, 100, 540, 118],
+                    "line_text": "Pooling reduces dimensions the next stage applies normalization",
+                    "phrases": [],
+                }
+            ],
+        }
+
+        _apply_llm_corrections(
+            block,
+            corrections=[],
+            sentence_boundaries=[
+                {
+                    "i": 0,
+                    "s": [
+                        "Pooling reduces dimensions",
+                        "the next stage applies normalization",
+                    ],
+                }
+            ],
+        )
+        semantic_phrases = block.get("semantic_phrases", [])
+
+        self.assertEqual(len(semantic_phrases), 2)
+        self.assertEqual(
+            [phrase["text"] for phrase in semantic_phrases],
+            ["Pooling reduces dimensions", "the next stage applies normalization"],
+        )
+        self.assertEqual([phrase["line_indices"] for phrase in semantic_phrases], [[0], [0]])
+        self.assertEqual(
+            [phrase["sentence_end_reason"] for phrase in semantic_phrases],
+            ["llm_sentence_boundary", "eof"],
+        )
+
+    def test_apply_llm_corrections_can_attach_line_prefix_to_previous_phrase(self):
+        from ocr_server import _apply_llm_corrections
+
+        block = {
+            "id": "b4_llm_carryover",
+            "bbox": [80, 80, 560, 170],
+            "source": "ocr",
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [100, 100, 540, 118],
+                    "line_text": "Depth is referred to as the color channel, where depth is 1 for grayscale images",
+                    "phrases": [],
+                },
+                {
+                    "line_index": 1,
+                    "bbox": [100, 124, 540, 142],
+                    "line_text": "and 3 for color images. In the later layers, the images still have depth",
+                    "phrases": [],
+                },
+            ],
+        }
+
+        _apply_llm_corrections(
+            block,
+            corrections=[],
+            sentence_boundaries=[
+                {
+                    "i": 1,
+                    "s": [
+                        "and 3 for color images.",
+                        "In the later layers, the images still have depth",
+                    ],
+                }
+            ],
+        )
+        semantic_phrases = block.get("semantic_phrases", [])
+
+        self.assertEqual(len(semantic_phrases), 2)
+        self.assertEqual(
+            [phrase["text"] for phrase in semantic_phrases],
+            [
+                "Depth is referred to as the color channel, where depth is 1 for grayscale images and 3 for color images.",
+                "In the later layers, the images still have depth",
+            ],
+        )
+        self.assertEqual([phrase["line_indices"] for phrase in semantic_phrases], [[0, 1], [1]])
+        self.assertEqual(
+            [phrase["sentence_end_reason"] for phrase in semantic_phrases],
+            ["llm_sentence_boundary", "eof"],
+        )
+
+    def test_apply_llm_corrections_can_force_interline_sentence_boundary_without_punctuation(self):
+        from ocr_server import _apply_llm_corrections
+
+        block = {
+            "id": "b4_llm_line_boundary",
+            "bbox": [80, 80, 560, 170],
+            "source": "ocr",
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [100, 100, 540, 118],
+                    "line_text": "The network learns hierarchical representations",
+                    "phrases": [],
+                },
+                {
+                    "line_index": 1,
+                    "bbox": [100, 124, 540, 142],
+                    "line_text": "Each later stage extracts more abstract features",
+                    "phrases": [],
+                },
+            ],
+        }
+
+        _apply_llm_corrections(
+            block,
+            corrections=[],
+            sentence_boundaries=[],
+            line_boundaries=[0],
+        )
+        semantic_phrases = block.get("semantic_phrases", [])
+
+        self.assertEqual(len(semantic_phrases), 2)
+        self.assertEqual(
+            [phrase["text"] for phrase in semantic_phrases],
+            [
+                "The network learns hierarchical representations",
+                "Each later stage extracts more abstract features",
+            ],
+        )
+        self.assertEqual(
+            [phrase["sentence_end_reason"] for phrase in semantic_phrases],
+            ["llm_line_boundary", "eof"],
+        )
+
+    def test_apply_llm_corrections_keeps_last_inline_segment_open_for_next_line(self):
+        from ocr_server import _apply_llm_corrections
+
+        block = {
+            "id": "b4_llm_open_tail",
+            "bbox": [80, 80, 560, 190],
+            "source": "ocr",
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [100, 100, 540, 118],
+                    "line_text": "The input data at each layer is an image. With each layer, we apply a new convolutional layer over a",
+                    "phrases": [],
+                },
+                {
+                    "line_index": 1,
+                    "bbox": [100, 124, 540, 142],
+                    "line_text": "new image.",
+                    "phrases": [],
+                },
+            ],
+        }
+
+        _apply_llm_corrections(
+            block,
+            corrections=[],
+            sentence_boundaries=[
+                {
+                    "i": 0,
+                    "s": [
+                        "The input data at each layer is an image.",
+                        "With each layer, we apply a new convolutional layer over a",
+                    ],
+                }
+            ],
+        )
+        semantic_phrases = block.get("semantic_phrases", [])
+
+        self.assertEqual(len(semantic_phrases), 2)
+        self.assertEqual(
+            [phrase["text"] for phrase in semantic_phrases],
+            [
+                "The input data at each layer is an image.",
+                "With each layer, we apply a new convolutional layer over a new image.",
+            ],
+        )
+        self.assertEqual(
+            [phrase["sentence_end_reason"] for phrase in semantic_phrases],
+            ["llm_sentence_boundary", "eof"],
+        )
+
+    def test_llm_semantic_phrase_quality_guard_rejects_edge_repetition(self):
+        from ocr_server import _llm_semantic_phrases_are_quality_regression
+
+        heuristic = [
+            {"text": "We just learned that YOLOv3 makes predictions across three different scales."},
+            {"text": "This becomes a lot clearer when you see the full architecture, shown in figure 7.30."},
+            {"text": "The network branches out and continues to downsample the image until it makes its first prediction at layer 82."},
+        ]
+        llm_regression = [
+            {"text": "We just learned that YOLOv3 makes predictions across three different scales. This"},
+            {"text": "This becomes a lot clearer when you see the full architecture, shown in figure 7.30."},
+            {"text": "The network branches out and"},
+            {"text": "The network branches out and continues to downsample the image until it makes its first prediction at layer 82."},
+        ]
+
+        self.assertTrue(
+            _llm_semantic_phrases_are_quality_regression(heuristic, llm_regression)
+        )
+
+    def test_llm_semantic_phrase_quality_guard_allows_clean_split(self):
+        from ocr_server import _llm_semantic_phrases_are_quality_regression
+
+        heuristic = [
+            {"text": "Pooling reduces dimensions the next stage applies normalization"},
+        ]
+        llm_improvement = [
+            {"text": "Pooling reduces dimensions"},
+            {"text": "the next stage applies normalization"},
+        ]
+
+        self.assertFalse(
+            _llm_semantic_phrases_are_quality_regression(heuristic, llm_improvement)
+        )
+
+    def test_translation_contracts_preserve_semantic_phrase_text_over_render_spans(self):
+        from ocr_server import _annotate_translation_contracts
+
+        block = {
+            "id": "semantic_fragment",
+            "source": "native",
+            "bbox": [0, 0, 500, 80],
+            "lines": [],
+            "semantic_phrases": [
+                {
+                    "text": "YOLOv3 incorporates all of these updates.",
+                    "texte": "YOLOv3 incorporates all of these updates.",
+                    "bbox": [120, 20, 320, 40],
+                    "spans": [
+                        {
+                            "texte": "pling. YOLOv3 incorporates all of these updates.",
+                            "bbox": [80, 20, 320, 40],
+                            "style": {},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        _annotate_translation_contracts([block])
+
+        self.assertEqual(
+            block["semantic_phrases"][0]["text"],
+            "YOLOv3 incorporates all of these updates.",
+        )
+
+    def test_line_phrase_text_keeps_skip_render_source_span(self):
+        from ocr_server import _line_phrase_text
+
+        line = {
+            "phrases": [
+                {
+                    "texte": "Next the feature map from layer 79 is upsampled",
+                    "spans": [
+                        {"texte": "Next the feature map from layer 79 is"},
+                        {"texte": "upsampled"},
+                        {"texte": "by 2x to dimensions 26 × 26 and", "skip_render": True},
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual(
+            _line_phrase_text(line),
+            "Next the feature map from layer 79 is upsampled by 2x to dimensions 26 × 26 and",
+        )
+
+    def test_translation_contracts_preserve_phrase_source_text_over_render_text(self):
+        from ocr_server import _annotate_translation_contracts
+
+        block = {
+            "id": "phrase_source",
+            "source": "native",
+            "bbox": [0, 0, 500, 80],
+            "lines": [
+                {
+                    "bbox": [20, 20, 480, 40],
+                    "line_text": "Next the feature map from layer 79 is upsampled by 2x to dimensions 26 × 26 and",
+                    "phrases": [
+                        {
+                            "texte": "Next the feature map from layer 79 is upsampled",
+                            "bbox": [20, 20, 480, 40],
+                            "spans": [
+                                {"texte": "Next the feature map from layer 79 is", "bbox": [20, 20, 260, 40], "style": {}},
+                                {"texte": "upsampled", "bbox": [260, 20, 320, 40], "style": {}},
+                                {"texte": "by 2x to dimensions 26 × 26 and", "bbox": [320, 20, 480, 40], "style": {}, "skip_render": True},
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "semantic_phrases": [],
+        }
+
+        _annotate_translation_contracts([block])
+
+        phrase = block["lines"][0]["phrases"][0]
+        self.assertEqual(
+            phrase["text"],
+            "Next the feature map from layer 79 is upsampled by 2x to dimensions 26 × 26 and",
+        )
+        self.assertEqual(
+            phrase["render_text"],
+            "Next the feature map from layer 79 is upsampled",
+        )
+
+    def test_translation_contracts_lock_code_phrase_but_keep_mixed_line_translatable(self):
+        from ocr_server import _annotate_translation_contracts
+
+        block = {
+            "id": "code_mix",
+            "role": "body",
+            "source": "ocr",
+            "bbox": [40, 40, 420, 120],
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [50, 60, 410, 80],
+                    "line_text": "model = Dense(10) This layer predicts the class probabilities.",
+                    "phrases": [
+                        {
+                            "bbox": [50, 60, 175, 80],
+                            "texte": "model = Dense(10)",
+                            "spans": [
+                                {
+                                    "bbox": [50, 60, 175, 80],
+                                    "texte": "model = Dense(10)",
+                                    "style": {"font": "Courier", "flags": {"monospace": True}},
+                                }
+                            ],
+                        },
+                        {
+                            "bbox": [190, 60, 410, 80],
+                            "texte": "This layer predicts the class probabilities.",
+                            "spans": [
+                                {
+                                    "bbox": [190, 60, 410, 80],
+                                    "texte": "This layer predicts the class probabilities.",
+                                    "style": {"font": "Times", "flags": {}},
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        _annotate_translation_contracts([block])
+        line = block["lines"][0]
+        code_phrase, prose_phrase = line["phrases"]
+
+        self.assertFalse(code_phrase["translatable"])
+        self.assertEqual(code_phrase["translation_strategy"], "exact_preserve")
+        self.assertEqual(code_phrase["unit_type"], "code_visible")
+        self.assertTrue(prose_phrase["translatable"])
+        self.assertEqual(line["translation_strategy"], "layout_constrained")
+        self.assertTrue(line["translatable"])
+
+    def test_translation_contracts_mark_background_only_phrase_and_line_as_non_translatable(self):
+        from ocr_server import _annotate_translation_contracts
+
+        block = {
+            "id": "bg_only",
+            "role": "diagram_label",
+            "source": "ocr",
+            "bbox": [40, 40, 240, 120],
+            "lines": [
+                {
+                    "line_index": 0,
+                    "bbox": [50, 60, 220, 80],
+                    "line_text": "Accuracy",
+                    "phrases": [
+                        {
+                            "bbox": [50, 60, 220, 80],
+                            "texte": "Accuracy",
+                            "render_mode": "background_only",
+                            "spans": [],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        _annotate_translation_contracts([block])
+        line = block["lines"][0]
+        phrase = line["phrases"][0]
+
+        self.assertFalse(phrase["translatable"])
+        self.assertEqual(phrase["translation_strategy"], "background_only")
+        self.assertEqual(phrase["render_policy"], "background_only")
+        self.assertFalse(line["translatable"])
+        self.assertEqual(line["translation_strategy"], "background_only")
 
     def test_span_characteristics_are_attached_for_expression_inspection(self):
         from ocr_server import _attach_textual_characteristics, _annotate_translation_contracts
@@ -4296,6 +4732,386 @@ class TranslationEnrichmentTests(unittest.TestCase):
         draw_ops = [op for op in ops if op.op_type == "draw_text_run"]
         self.assertGreaterEqual(len(draw_ops), 3)
 
+    def test_source_image_path_does_not_disable_whiteout_without_clean_background(self):
+        reconstructor = DocumentReconstructor()
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, "source.png")
+            Image.new("RGB", (100, 100), "white").save(src_path)
+            doc = fitz.open()
+            page = doc.new_page(width=120, height=120)
+            ctx = reconstructor._build_block_geometry_context(
+                page,
+                {"page_role": "body", "source_image_path": src_path},
+                {
+                    "id": "b_bg",
+                    "role": "body",
+                    "bbox": [10, 10, 80, 40],
+                    "translated_text": "Texte traduit",
+                    "text": "Source text",
+                },
+            )
+            doc.close()
+        self.assertEqual(ctx.background_strategy, "whiteout")
+
+    def test_phrase_units_apply_translation_ruleset_to_anchor_attached_label(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b_rules",
+            "role": "body",
+            "bbox": [20, 20, 220, 80],
+            "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+        }
+        phrase = {
+            "unit_id": "p_rules",
+            "text": "Label",
+            "translated_text": "Etiquette",
+            "bbox": [160, 20, 220, 40],
+            "line_indices": [0],
+            "layout_attributes": {},
+            "structural_context": {"block_unit_id": "b_rules", "phrase_unit_id": "p_rules"},
+            "editorial_semantics": {"reflowable": True},
+            "positioning_policy": {
+                "primary_position_reference": {"horizontal": "end", "vertical": "top", "confidence": 0.82},
+            },
+            "translation_ruleset": {
+                "rules": {
+                    "preserve_horizontal_anchor": "end",
+                    "preserve_vertical_anchor": "top",
+                    "translation_positioning_mode": "top_end_grow_to_start",
+                    "horizontal_growth": "grow_to_start",
+                    "vertical_growth": "grow_down",
+                    "semantic_role": "attached_label",
+                },
+                "constraints": {
+                    "allow_horizontal_reflow": False,
+                    "preserve_center_if_possible": False,
+                },
+            },
+        }
+        semantic_payload = {"semantic_phrases": [phrase], "semantic_runs": [], "semantic_spans": [], "semantic_groups": []}
+
+        units = reconstructor._phrase_units(block, semantic_payload, target_lang="fr")
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].anchor_horizontal, "end")
+        self.assertEqual(units[0].render_policy, "anchored_text")
+        self.assertFalse(units[0].reflowable)
+
+    def test_page_adaptive_profile_detects_academic_dense_layout(self):
+        reconstructor = DocumentReconstructor()
+
+        profile = reconstructor._page_adaptive_profile(
+            {
+                "page_role": "body",
+                "layout_type": "double_column",
+                "document_type": "scientific_paper",
+                "page_family": "body_text_two_column",
+                "style_profile": "academic_dense",
+            }
+        )
+
+        self.assertEqual(profile["page_profile"], "academic_dense")
+        self.assertFalse(profile["allow_aggressive_reflow"])
+        self.assertGreater(len(profile["fallback_scales"]), 5)
+
+    def test_block_adaptive_profile_prefers_bbox_anchor_for_visual_label_cluster(self):
+        reconstructor = DocumentReconstructor()
+        profile = reconstructor._block_adaptive_profile(
+            {
+                "id": "b_visual",
+                "role": "diagram_label",
+                "bbox": [20, 20, 120, 50],
+                "unit_type": "short_label",
+                "render_policy": "anchored_text",
+                "editorial_semantics": {"anchored_annotation": True, "flow_class": "anchored_annotation"},
+            },
+            page_data={
+                "page_role": "body",
+                "layout_type": "annotated_page",
+                "page_family": "illustrated_label_page",
+                "style_profile": "editorial_visual",
+            },
+        )
+
+        self.assertEqual(profile["block_profile"], "visual_label_cluster")
+        self.assertTrue(profile["prefer_bbox_anchor"])
+        self.assertFalse(profile["allow_aggressive_reflow"])
+
+    def test_positioning_preferences_apply_unit_adaptive_profile_for_short_visual_label(self):
+        reconstructor = DocumentReconstructor()
+        prefs = reconstructor._positioning_preferences_for_unit(
+            {
+                "unit_type": "short_label",
+                "bbox": [160, 20, 220, 40],
+                "editorial_semantics": {"flow_class": "anchored_annotation"},
+                "layout_attributes": {"horizontal_anchor": "end", "vertical_anchor": "top"},
+            },
+            text="GPU",
+            child_units=None,
+            block={
+                "id": "b_visual",
+                "role": "diagram_label",
+                "bbox": [20, 20, 220, 80],
+                "unit_type": "short_label",
+                "render_policy": "anchored_text",
+                "editorial_semantics": {"anchored_annotation": True, "flow_class": "anchored_annotation"},
+            },
+            page_data={
+                "page_role": "body",
+                "layout_type": "annotated_page",
+                "page_family": "illustrated_label_page",
+                "style_profile": "editorial_visual",
+            },
+        )
+
+        self.assertEqual(prefs["render_policy"], "anchored_text")
+        self.assertFalse(prefs["reflowable"])
+        self.assertEqual(prefs["metadata"]["adaptive_profile"]["unit_profile"], "anchored_label")
+
+    def test_block_reconstruction_plan_carries_adaptive_profile(self):
+        reconstructor = DocumentReconstructor()
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=300)
+        plan = reconstructor._build_block_reconstruction_plan(
+            page,
+            {
+                "page_role": "body",
+                "layout_type": "double_column",
+                "document_type": "scientific_paper",
+                "page_family": "body_text_two_column",
+                "style_profile": "academic_dense",
+            },
+            {
+                "id": "b_dense",
+                "role": "body",
+                "bbox": [20, 20, 180, 120],
+                "translated_text": "Texte traduit",
+                "text": "Source text",
+                "lines": [
+                    {"bbox": [20, 20, 180, 34], "line_text": "Source text", "translated_text": "Texte traduit", "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}}},
+                ],
+            },
+            "fr",
+        )
+        doc.close()
+
+        self.assertEqual(plan.adaptive_profile["page_profile"], "academic_dense")
+        self.assertIn("fallback_scales", plan.adaptive_profile)
+
+    def test_line_units_in_visual_block_receive_anchored_adaptive_profile(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b_line_visual",
+            "role": "diagram_label",
+            "bbox": [20, 20, 220, 90],
+            "unit_type": "short_label",
+            "render_policy": "anchored_text",
+            "editorial_semantics": {"anchored_annotation": True, "flow_class": "anchored_annotation"},
+            "lines": [
+                {
+                    "bbox": [160, 20, 220, 40],
+                    "line_text": "GPU",
+                    "translated_text": "GPU",
+                    "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+                    "layout_attributes": {"horizontal_anchor": "end", "vertical_anchor": "top"},
+                }
+            ],
+        }
+
+        units = reconstructor._line_units(
+            block,
+            "fr",
+            page_data={
+                "page_role": "body",
+                "layout_type": "annotated_page",
+                "page_family": "illustrated_label_page",
+                "style_profile": "editorial_visual",
+            },
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].render_policy, "anchored_text")
+        self.assertFalse(units[0].reflowable)
+        self.assertEqual(units[0].metadata["adaptive_profile"]["unit_profile"], "anchored_label")
+
+    def test_nested_span_units_formula_span_receive_protected_inline_profile(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b_span_formula",
+            "role": "body",
+            "bbox": [20, 20, 240, 90],
+            "render_policy": "anchored_text",
+            "lines": [
+                {
+                    "bbox": [20, 20, 240, 40],
+                    "translated_text": "L = Lcls + Lloc",
+                    "phrases": [
+                        {
+                            "translated_text": "L = Lcls + Lloc",
+                            "spans": [
+                                {
+                                    "bbox": [20, 20, 120, 40],
+                                    "text": "L = Lcls + Lloc",
+                                    "translated_text": "L = Lcls + Lloc",
+                                    "expression_semantics": {"inline_class": "formula", "protected_inline": True, "immutable_inline": True},
+                                    "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        units = reconstructor._nested_span_units(
+            block,
+            "fr",
+            page_data={
+                "page_role": "body",
+                "layout_type": "double_column",
+                "document_type": "scientific_paper",
+                "page_family": "body_text_two_column",
+                "style_profile": "academic_dense",
+            },
+        )
+
+        self.assertEqual(len(units), 1)
+        self.assertTrue(units[0].protected_inline)
+        self.assertTrue(units[0].immutable)
+        self.assertEqual(units[0].metadata["adaptive_profile"]["unit_profile"], "protected_inline")
+
+    def test_external_units_receive_adaptive_profile_metadata(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b_ext",
+            "role": "body",
+            "bbox": [20, 20, 220, 80],
+            "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+            "lines": [{"bbox": [20, 20, 220, 40], "line_text": "Source", "translated_text": "Source"}],
+        }
+        page_data = {
+            "page_role": "body",
+            "layout_type": "annotated_page",
+            "page_family": "illustrated_label_page",
+            "style_profile": "editorial_visual",
+            "__aux_translated_segments": [
+                {
+                    "unit_id": "aux:label:0",
+                    "text": "Label",
+                    "source_text": "Label",
+                    "bbox": [72.0, 11.52, 100.8, 19.2],
+                    "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+                    "segment_type": "label",
+                }
+            ],
+        }
+
+        units = reconstructor._external_units_for_block(block, page_data, "fr")
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].metadata["adaptive_profile"]["page_profile"], "visual_labels")
+
+    def test_technical_structured_block_is_classified_as_code(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b_tech",
+            "role": "body",
+            "bbox": [20, 20, 260, 180],
+            "lines": [
+                {"line_text": "# conv6 and conv7", "phrases": [{"texte": "# conv6 and conv7"}]},
+                {"line_text": "conv6 = Conv2D(1024, (3, 3), dilation_rate=(6, 6), activation='relu')", "phrases": [{"texte": "conv6 = Conv2D(1024, (3, 3), dilation_rate=(6, 6), activation='relu')"}]},
+                {"line_text": "padding='same'(pool5)", "phrases": [{"texte": "padding='same'(pool5)"}]},
+                {"line_text": "conv7 = Conv2D(1024, (1, 1), activation='relu', padding='same')(conv6)", "phrases": [{"texte": "conv7 = Conv2D(1024, (1, 1), activation='relu', padding='same')(conv6)"}]},
+            ],
+        }
+
+        self.assertTrue(reconstructor._block_looks_technical_structured(block))
+        self.assertEqual(reconstructor._classify_block_for_reconstruction(block, {}), "code")
+
+    def test_validated_block_presence_fallback_ops_rejects_overflowing_text(self):
+        reconstructor = DocumentReconstructor()
+        doc = fitz.open()
+        page = doc.new_page(width=160, height=160)
+        block = {
+            "id": "b_overflow",
+            "role": "body",
+            "bbox": [20, 20, 70, 44],
+            "translated_text": "Un texte extremement long qui ne peut pas tenir dans cette boite minuscule",
+            "text": "Source",
+            "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+        }
+
+        ops = reconstructor._validated_block_presence_fallback_ops(page, {"page_role": "body"}, block, "fr")
+        plan = reconstructor._build_block_reconstruction_plan(page, {"page_role": "body"}, block, "fr")
+        doc.close()
+
+        self.assertGreaterEqual(len([op for op in ops if op.op_type == "draw_text_run"]), 1)
+        self.assertEqual(reconstructor._validate_block_layout(plan, ops), [])
+
+    def test_prune_block_draw_ops_keeps_only_valid_non_overlapping_text(self):
+        reconstructor = DocumentReconstructor()
+        doc = fitz.open()
+        page = doc.new_page(width=220, height=180)
+        block = {
+            "id": "b_prune",
+            "role": "body",
+            "bbox": [20, 20, 140, 80],
+            "translated_text": "Texte traduit",
+            "text": "Source text",
+            "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+            "lines": [
+                {
+                    "bbox": [20, 20, 140, 36],
+                    "line_text": "Source line",
+                    "translated_text": "Ligne valide",
+                    "style": {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}},
+                }
+            ],
+        }
+        plan = reconstructor._build_block_reconstruction_plan(page, {"page_role": "body"}, block, "fr")
+        block_rect = fitz.Rect(plan.block_bbox)
+        style = {"font": "helv", "size": 12.0, "color": "#000000", "flags": {}}
+        ops = [
+            BlockRenderOp("erase_rect", plan.block_id, None, bbox=plan.block_bbox, z_index=0),
+            BlockRenderOp(
+                "draw_text_run",
+                plan.block_id,
+                "ok",
+                bbox=(block_rect.x0 + 4.0, block_rect.y0 + 4.0, block_rect.x0 + 18.0, block_rect.y0 + 10.0),
+                text="Valide",
+                style=style,
+                z_index=10,
+                metadata={"point": (block_rect.x0 + 4.0, block_rect.y0 + 9.0), "fontname": "helv", "builtin": True, "fontsize": 12.0, "rgb": (0, 0, 0)},
+            ),
+            BlockRenderOp(
+                "draw_text_run",
+                plan.block_id,
+                "overlap",
+                bbox=(block_rect.x0 + 5.0, block_rect.y0 + 4.0, block_rect.x0 + 20.0, block_rect.y0 + 10.0),
+                text="Collision",
+                style=style,
+                z_index=10,
+                metadata={"point": (block_rect.x0 + 5.0, block_rect.y0 + 9.0), "fontname": "helv", "builtin": True, "fontsize": 12.0, "rgb": (0, 0, 0)},
+            ),
+            BlockRenderOp(
+                "draw_text_run",
+                plan.block_id,
+                "overflow",
+                bbox=(block_rect.x0 - 4.0, block_rect.y0 - 2.0, block_rect.x1 + 8.0, block_rect.y0 + 6.0),
+                text="Debordement",
+                style=style,
+                z_index=10,
+                metadata={"point": (block_rect.x0 - 4.0, block_rect.y0 + 5.0), "fontname": "helv", "builtin": True, "fontsize": 12.0, "rgb": (0, 0, 0)},
+            ),
+        ]
+
+        pruned = reconstructor._prune_block_draw_ops(plan, ops)
+        doc.close()
+
+        kept_text_ops = [op for op in pruned if op.op_type == "draw_text_run"]
+        self.assertEqual([op.unit_id for op in kept_text_ops], ["ok"])
+        self.assertEqual(reconstructor._validate_block_layout(plan, pruned), [])
+
     def test_heading_caption_and_annotation_blocks_are_supported_by_hierarchical_engine(self):
         reconstructor = DocumentReconstructor()
         cases = [
@@ -4570,6 +5386,193 @@ class TranslationEnrichmentTests(unittest.TestCase):
     def test_parenthetical_editorial_word_is_not_equation_or_immutable_overlay(self):
         self.assertFalse(_is_equation_like_text("(weights)"))
         self.assertFalse(_is_immutable_inline_text("(weights)"))
+
+    def test_semantic_phrase_classifier_marks_formula_fragments_as_non_prose(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "d S ( y i )",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "formula")
+
+    def test_semantic_phrase_classifier_marks_bullet_labels_as_structural(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "• Images • Videos (image frames)",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "structural")
+
+    def test_semantic_phrase_classifier_keeps_regular_sentence_as_prose(self):
+        block = {"role": "body"}
+        phrase = {
+            "text": "Cross-entropy loss is another loss function mostly used in regression and classification problems.",
+            "sentence_end_reason": "terminal_punctuation",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "prose")
+
+    def test_semantic_phrase_classifier_marks_page_number_as_structural(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "374",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "structural")
+
+    def test_semantic_phrase_classifier_marks_numbered_heading_as_structural(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "3.4 Gradient Descent-Based Optimization Techniques",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "structural")
+
+    def test_semantic_phrase_classifier_marks_formula_lead_in_as_structural(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "Softmax function is given by",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "structural")
+
+    def test_semantic_phrase_classifier_keeps_real_prose_fragment_as_prose(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "First, we examine how",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "prose")
+
+    def test_semantic_phrase_classifier_marks_long_formula_lead_in_as_structural(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "Similarly, derivative of S ( y i ) w.r.t y k is given as",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "structural")
+
+    def test_semantic_phrase_classifier_marks_ocr_math_fragment_as_formula(self):
+        block = {"role": ""}
+        phrase = {
+            "text": "( e y i ) since n j 1 e y j S ( y i )",
+            "sentence_end_reason": "eof",
+        }
+        self.assertEqual(_classify_semantic_phrase_kind(block, phrase), "formula")
+
+    def test_source_layout_mode_marks_soft_wrapped_paragraph_as_reflow(self):
+        from ocr_server import _enrich_layout_markers
+
+        block = {
+            "id": "b1",
+            "role": "body",
+            "bbox": [10, 10, 210, 50],
+            "lines": [
+                {"bbox": [10, 10, 210, 22], "phrases": [{"texte": "This is a long sentence that"}]},
+                {"bbox": [10, 23, 210, 35], "phrases": [{"texte": "continues on the next visual line."}]},
+            ],
+        }
+        _enrich_layout_markers([block])
+        mode = block["source_layout_mode"]
+        self.assertEqual(mode["mode"], "continuous_paragraph")
+        self.assertEqual(mode["line_flow"], "inline_reflow")
+        self.assertFalse(mode["preserve_line_breaks"])
+        self.assertTrue(mode["can_reflow_within_paragraph"])
+
+    def test_source_layout_mode_marks_list_as_preserve_breaks(self):
+        from ocr_server import _enrich_layout_markers
+
+        block = {
+            "id": "b1",
+            "role": "body",
+            "bbox": [10, 10, 210, 70],
+            "lines": [
+                {"bbox": [10, 10, 210, 22], "phrases": [{"texte": "• First item"}]},
+                {"bbox": [10, 25, 210, 37], "phrases": [{"texte": "• Second item"}]},
+            ],
+        }
+        _enrich_layout_markers([block])
+        mode = block["source_layout_mode"]
+        self.assertEqual(mode["mode"], "list")
+        self.assertEqual(mode["line_flow"], "preserve_line_breaks")
+        self.assertTrue(mode["preserve_line_breaks"])
+
+    def test_reconstructor_applies_source_layout_mode_to_unit_relations(self):
+        recon = DocumentReconstructor.__new__(DocumentReconstructor)
+        block = {
+            "id": "b1",
+            "source_layout_mode": {
+                "mode": "continuous_paragraph",
+                "line_flow": "inline_reflow",
+                "render_contract": "reflow_block",
+                "can_reflow_within_paragraph": True,
+                "preserve_line_breaks": False,
+                "line_breaks": [
+                    {"line_index": 0, "after": "soft_wrap", "hard": False},
+                    {"line_index": 1, "after": "block_end", "hard": True},
+                ],
+            },
+        }
+        units = [
+            PlacableUnit("u0", "semantic_phrase", "semantic_phrase", None, "b1", "p0", [0], "a", "A", "body"),
+            PlacableUnit("u1", "semantic_phrase", "semantic_phrase", None, "b1", "p1", [1], "b", "B", "body"),
+        ]
+        updated = recon._apply_source_layout_mode_to_units(block, units)
+        self.assertEqual(updated[0].paragraph_id, updated[1].paragraph_id)
+        self.assertFalse(updated[1].hard_break_before)
+        self.assertTrue(updated[1].continuation_before)
+
+    def test_reconstructor_preserves_source_line_break_layout(self):
+        recon = DocumentReconstructor.__new__(DocumentReconstructor)
+        block = {
+            "id": "b1",
+            "source_layout_mode": {
+                "mode": "list",
+                "line_flow": "preserve_line_breaks",
+                "render_contract": "preserve_breaks",
+                "can_reflow_within_paragraph": True,
+                "preserve_line_breaks": True,
+                "line_breaks": [
+                    {"line_index": 0, "after": "list_item", "hard": True},
+                    {"line_index": 1, "after": "block_end", "hard": True},
+                ],
+            },
+        }
+        units = [
+            PlacableUnit("u0", "semantic_phrase", "semantic_phrase", None, "b1", "p0", [0], "a", "A", "body"),
+            PlacableUnit("u1", "semantic_phrase", "semantic_phrase", None, "b1", "p1", [1], "b", "B", "body"),
+        ]
+        updated = recon._apply_source_layout_mode_to_units(block, units)
+        self.assertNotEqual(updated[0].paragraph_id, updated[1].paragraph_id)
+        self.assertTrue(updated[1].hard_break_before)
+        self.assertFalse(updated[1].continuation_before)
+
+    def test_apply_llm_layout_mode_overrides_source_layout_contract(self):
+        from ocr_server import _apply_llm_layout_mode
+
+        block = {
+            "id": "b1",
+            "source_layout_mode": {
+                "mode": "continuous_paragraph",
+                "line_flow": "inline_reflow",
+                "render_contract": "reflow_block",
+                "preserve_line_breaks": False,
+                "line_breaks": [{"line_index": 0, "after": "soft_wrap", "hard": False}],
+            },
+        }
+        _apply_llm_layout_mode(
+            block,
+            {
+                "line_flow": "preserve_line_breaks",
+                "breaks": [{"i": 0, "after": "new_line"}, {"i": 1, "after": "block_end"}],
+            },
+        )
+
+        mode = block["source_layout_mode"]
+        self.assertEqual(mode["line_flow"], "preserve_line_breaks")
+        self.assertEqual(mode["render_contract"], "preserve_breaks")
+        self.assertTrue(mode["preserve_line_breaks"])
+        self.assertTrue(mode["llm_refined"])
+        self.assertEqual(mode["line_breaks"][0]["after"], "new_line")
 
 
 if __name__ == "__main__":

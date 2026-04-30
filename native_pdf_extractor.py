@@ -83,6 +83,83 @@ def _line_text_from_spans(spans):
     return "".join((sp.get("texte") or "") for sp in spans).strip()
 
 
+_NATIVE_SENT_END_RE = re.compile(r'[.!?…]+[\u201d\u2019"\')\]}\u00bb]*$')
+_NATIVE_ABBREV_TOKENS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "etc.", "e.g.", "i.e.", "cf.", "vs.",
+    "fig.", "eq.", "no.", "vol.", "p.", "pp.", "ch.", "sec.", "app.",
+    "ref.", "tab.", "alg.", "def.", "thm.", "lem.", "prop.", "cor.", "rem.",
+    "approx.", "est.", "repr.", "avg.", "max.", "min.", "std.", "var.",
+}
+
+
+# Conjonctions de discours signalant un d\u00e9but de phrase sans ponctuation explicite
+_DISCOURSE_CONJUNCTIONS = frozenset({
+    "however", "moreover", "furthermore", "therefore", "thus",
+    "consequently", "nevertheless", "nonetheless", "meanwhile",
+    "additionally", "finally", "subsequently", "accordingly",
+    "notably", "importantly", "similarly", "alternatively",
+})
+
+
+def _native_span_ends_sentence(span_text: str, next_span_text: str) -> bool:
+    """True when span_text closes a sentence and next_span_text opens a new one.
+
+    Cas 1 : ponctuation terminale + prochain span commence par une majuscule.
+    Cas 2 : pas de ponctuation, mais le prochain span commence par une
+            conjonction de discours capitalisee (However, Moreover...).
+    """
+    s = span_text.strip()
+    nxt = next_span_text.lstrip()
+    if not nxt:
+        return False
+
+    if _NATIVE_SENT_END_RE.search(s):
+        last = s.split()[-1] if s.split() else s
+        lc = re.sub(r'["\'\u201c\u201d\u2018\u2019)\]}]+$', "", last).lower()
+        if lc in _NATIVE_ABBREV_TOKENS:
+            return False
+        if re.fullmatch(r"(?:[a-z]\.){2,}", lc):
+            return False
+        return nxt[0].isupper()
+
+    # Frontiere implicite : conjonction de discours capitalisee sans ponctuation
+    nxt_first = nxt.split()[0] if nxt.split() else ""
+    if nxt_first and nxt_first[0].isupper():
+        nxt_lower = re.sub(r"[.,;:]+$", "", nxt_first).lower()
+        if nxt_lower in _DISCOURSE_CONJUNCTIONS:
+            return True
+
+    return False
+
+
+def _split_spans_at_sentence_boundaries(spans):
+    """
+    Partition a flat span list into sub-lists split at intra-line sentence
+    boundaries.  Returns [spans] unchanged when no boundary is found.
+    """
+    if not spans:
+        return []
+    groups: list = []
+    current: list = []
+    for i, span in enumerate(spans):
+        current.append(span)
+        txt = span.get("texte") or ""
+        if not txt.strip():
+            continue
+        next_txt = ""
+        for j in range(i + 1, len(spans)):
+            candidate = (spans[j].get("texte") or "").strip()
+            if candidate:
+                next_txt = candidate
+                break
+        if next_txt and _native_span_ends_sentence(txt, next_txt):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups if groups else [spans]
+
+
 class NativePDFExtractor:
     """
     Extract native (vector) text structure from a PDF page.
@@ -347,7 +424,6 @@ class NativePDFExtractor:
                 line_chars = self._extract_raw_chars(raw_line or {}, sx=sx, sy=sy)
 
                 current_spans = []
-                phrases = []
                 for span_idx, s in enumerate(l.get("spans", []) or []):
                     txt = s.get("text", "")
                     if not txt:
@@ -376,19 +452,26 @@ class NativePDFExtractor:
                 if not current_spans:
                     continue
 
-                phrase_text = _line_text_from_spans(current_spans)
-                phrase_payload = {
-                    "texte": phrase_text,
-                    "bbox": _merge_bbox_list([sp["bbox"] for sp in current_spans]),
-                    "bbox_pt": _merge_bbox_list([sp["bbox_pt"] for sp in current_spans]),
-                    "spans": current_spans,
-                    "style": self._representative_style(current_spans),
-                    "resolved_style": self._representative_style(current_spans),
-                    "source": "native",
-                    "source_kind": "native_phrase",
-                }
-                phrase_payload.update(self._translatability_contract(phrase_text))
-                phrases.append(phrase_payload)
+                # Full line text preserved for line_payload regardless of phrase splits
+                line_full_text = _line_text_from_spans(current_spans)
+
+                # C1 fix: split spans at intra-line sentence boundaries
+                span_groups = _split_spans_at_sentence_boundaries(current_spans)
+                phrases = []
+                for group in span_groups:
+                    phrase_text = _line_text_from_spans(group)
+                    phrase_payload = {
+                        "texte": phrase_text,
+                        "bbox": _merge_bbox_list([sp["bbox"] for sp in group]),
+                        "bbox_pt": _merge_bbox_list([sp["bbox_pt"] for sp in group]),
+                        "spans": group,
+                        "style": self._representative_style(group),
+                        "resolved_style": self._representative_style(group),
+                        "source": "native",
+                        "source_kind": "native_phrase",
+                    }
+                    phrase_payload.update(self._translatability_contract(phrase_text))
+                    phrases.append(phrase_payload)
 
                 line_payload = {
                     "bbox": line_bbox_px,
@@ -399,12 +482,12 @@ class NativePDFExtractor:
                     "source": "native",
                     "source_kind": "native_line",
                     "line_index_native": line_idx,
-                    "line_text": phrase_text,
-                    "raw_line_text": phrase_text,
+                    "line_text": line_full_text,
+                    "raw_line_text": line_full_text,
                     "chars": line_chars,
                     "char_metrics": self._chars_summary(line_chars),
                 }
-                line_payload.update(self._translatability_contract(phrase_text))
+                line_payload.update(self._translatability_contract(line_full_text))
                 lines.append(line_payload)
 
             if lines:

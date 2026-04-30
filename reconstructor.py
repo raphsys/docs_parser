@@ -166,6 +166,25 @@ class BlockReconstructionPlan:
     editorial_relations: dict[str, Any]
     constraints: dict[str, Any]
     source_block: dict[str, Any] = field(default_factory=dict)
+    semantic_profile: "BlockSemanticProfile | None" = field(default=None)
+
+
+@dataclass
+class BlockSemanticProfile:
+    block_id: str
+    content_class: str
+    render_strategy: str
+    font_normalization: str
+    allow_vertical_expansion: bool
+    text_flow_mode: str
+    unicode_safe_required: bool
+    source_is_translated: bool
+    estimated_text_expansion: float
+    dominant_fontsize: float
+    dominant_is_serif: bool
+    dominant_is_bold: bool
+    dominant_is_italic: bool
+    dominant_is_mono: bool
 
 
 class DocumentReconstructor:
@@ -179,6 +198,7 @@ class DocumentReconstructor:
         self.font_resolver = FontResolver()
         self._font_objects: dict[str, fitz.Font] = {}
         self._page_font_aliases: dict[tuple, str] = {}
+        self._font_truly_supports_cache: dict[tuple, bool] = {}
 
     # ------------------------------------------------------------------
     # Résolution de polices et mesure de texte (portées depuis le .bak)
@@ -698,6 +718,291 @@ class DocumentReconstructor:
         if role == "body" or flow_class == "editorial_body" or bool(editorial_semantics.get("reflowable", True)):
             return "editorial"
         return "mixed"
+
+    def compute_block_semantic_profile(self, block, page_data, translated_text=""):
+        if not isinstance(block, dict):
+            block = {}
+        block_id = str(block.get("id") or "")
+        # Etape A - recuperer les metadonnees IA existantes
+        role = str(block.get("role") or "").strip().lower()
+        editorial_semantics = dict(block.get("editorial_semantics") or {})
+        flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
+        render_policy = str(block.get("render_policy") or "").strip().lower()
+        target_lang = str((page_data or {}).get("target_lang") or "").strip().lower() if page_data else ""
+        # Etape B - analyser les patterns de bbox des lignes
+        lines = list(block.get("lines") or [])
+        line_count = len(lines)
+        block_bbox = block.get("bbox") or [0, 0, 0, 0]
+        try:
+            block_width = max(1.0, float(block_bbox[2]) - float(block_bbox[0]))
+            block_height = max(1.0, float(block_bbox[3]) - float(block_bbox[1]))
+        except Exception:
+            block_width = 1.0
+            block_height = 1.0
+        block_aspect_ratio = block_height / block_width
+        words_per_line = []
+        for line in lines:
+            line_text = self._clean_text_for_render(
+                (line or {}).get("translated_text") or (line or {}).get("line_text") or ""
+            )
+            words = [w for w in re.findall(r"\S+", line_text) if w]
+            words_per_line.append(len(words))
+        avg_words_per_line = float(sum(words_per_line)) / max(1, len(words_per_line)) if words_per_line else 0.0
+        short_line_ratio = float(sum(1 for w in words_per_line if w <= 5)) / max(1, len(words_per_line)) if words_per_line else 0.0
+        is_column_shape = block_aspect_ratio > 1.5 and block_width < 200.0
+        # Etape C - analyser le contenu textuel
+        all_text = self._clean_text_for_render(
+            self._translated_text_from_block(block) or self._source_text_from_block(block)
+        )
+        has_math_chars = bool(re.search(
+            r'[Ͱ-Ͽ∀-⟿°-¿]',
+            all_text
+        ))
+        has_code_pattern = bool(re.search(
+            r'(?:\([^)]*\(|\[[^\]]*\[|->|:=|\w\s*=\s*\w)',
+            all_text
+        ))
+        all_uppercase_lines = bool(lines) and all(
+            self._clean_text_for_render(
+                (line or {}).get("translated_text") or (line or {}).get("line_text") or ""
+            ).isupper() or not self._clean_text_for_render(
+                (line or {}).get("translated_text") or (line or {}).get("line_text") or ""
+            )
+            for line in lines
+        )
+        if len(words_per_line) >= 2 and avg_words_per_line <= 6:
+            avg_wpl = avg_words_per_line
+            repeated_structure = all(
+                abs(w - avg_wpl) <= avg_wpl * 0.2 for w in words_per_line if w > 0
+            ) and avg_wpl > 0
+        else:
+            repeated_structure = False
+        # Etape D - analyser le style dominant
+        fontsizes = []
+        style_flags_list = []
+        for line in lines:
+            for phrase in (line or {}).get("phrases") or []:
+                style = (phrase or {}).get("style") or {}
+                if isinstance(style, dict):
+                    try:
+                        fontsizes.append(float(style.get("size") or 0.0))
+                    except Exception:
+                        pass
+                    flags = style.get("flags") or {}
+                    if isinstance(flags, dict):
+                        style_flags_list.append(flags)
+        if not fontsizes:
+            block_style = self._style_from_block(block)
+            try:
+                fontsizes = [float(block_style.get("size") or 12.0)]
+            except Exception:
+                fontsizes = [12.0]
+            flags = block_style.get("flags") or {}
+            if isinstance(flags, dict):
+                style_flags_list = [flags]
+        sorted_fs = sorted(fontsizes)
+        dominant_fontsize = sorted_fs[len(sorted_fs) // 2] if sorted_fs else 12.0
+        dominant_flags = style_flags_list[len(style_flags_list) // 2] if style_flags_list else {}
+        dominant_is_serif = bool(dominant_flags.get("serif"))
+        dominant_is_bold = bool(dominant_flags.get("bold"))
+        dominant_is_italic = bool(dominant_flags.get("italic"))
+        dominant_is_mono = bool(dominant_flags.get("monospace"))
+        # Etape E - estimer l'expansion du texte traduit
+        source_text = self._clean_text_for_render(self._source_text_from_block(block))
+        translated_text_clean = self._clean_text_for_render(translated_text or "")
+        if translated_text_clean and source_text:
+            estimated_text_expansion = len(translated_text_clean) / max(1, len(source_text))
+        else:
+            estimated_text_expansion = 1.15
+        # Etape F - decider content_class et render_strategy
+        _code_checker = None
+        for _cls in type(self).__mro__:
+            if '_block_is_immutable_programming_code' in _cls.__dict__:
+                _code_checker = _cls.__dict__['_block_is_immutable_programming_code']
+                break
+        is_code_block = bool(_code_checker(self, block)) if _code_checker is not None else False
+        if role in {"code", "code_block"} or (has_code_pattern and render_policy == "fixed_preserve") or is_code_block:
+            content_class = "code"
+            render_strategy = "code_preserve"
+        elif has_math_chars and (role in {"formula", "equation"} or flow_class == "symbolic"):
+            content_class = "formula"
+            render_strategy = "bitmap_preserve"
+        elif role in {"heading", "title", "section_title", "chapter_title"}:
+            content_class = "heading"
+            render_strategy = "heading_reflow"
+        elif role in {"figure_caption", "table_caption", "caption"}:
+            content_class = "caption"
+            render_strategy = "prose_reflow"
+        elif is_column_shape or (short_line_ratio >= 0.8 and avg_words_per_line <= 4) or repeated_structure:
+            content_class = "label"
+            render_strategy = "label_stack"
+        elif role in {"body", "paragraph", "text", "list_item"} or flow_class in {"prose", "editorial"} or (line_count >= 2 and avg_words_per_line >= 6):
+            content_class = "prose"
+            render_strategy = "prose_reflow"
+        else:
+            content_class = "label"
+            render_strategy = "label_stack"
+        # Autres champs derives
+        if render_strategy == "prose_reflow":
+            font_normalization = "fit_to_bbox"
+        elif render_strategy == "label_stack":
+            font_normalization = "block_median"
+        else:
+            font_normalization = "span_original"
+        allow_vertical_expansion = (
+            render_strategy in {"prose_reflow", "heading_reflow"}
+            and estimated_text_expansion > 1.0
+        )
+        if render_strategy == "prose_reflow":
+            text_flow_mode = "continuous"
+        elif render_strategy == "label_stack":
+            text_flow_mode = "line_by_line"
+        else:
+            text_flow_mode = "atomic"
+        unicode_safe_required = (
+            any(ord(ch) > 127 for ch in (translated_text_clean or ""))
+            or target_lang in {"fr", "es", "de", "it", "pt"}
+        )
+        source_is_translated = self._has_translated_payload(block)
+        return BlockSemanticProfile(
+            block_id=block_id,
+            content_class=content_class,
+            render_strategy=render_strategy,
+            font_normalization=font_normalization,
+            allow_vertical_expansion=allow_vertical_expansion,
+            text_flow_mode=text_flow_mode,
+            unicode_safe_required=unicode_safe_required,
+            source_is_translated=source_is_translated,
+            estimated_text_expansion=estimated_text_expansion,
+            dominant_fontsize=dominant_fontsize,
+            dominant_is_serif=dominant_is_serif,
+            dominant_is_bold=dominant_is_bold,
+            dominant_is_italic=dominant_is_italic,
+            dominant_is_mono=dominant_is_mono,
+        )
+
+    # ------------------------------------------------------------------
+    # Securite des polices unicode + helpers systeme
+    # ------------------------------------------------------------------
+
+    _SYSTEM_FONT_MAP = {
+        # (serif, bold, italic, mono) -> ordered candidates
+        (False, False, False, True):  [
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ],
+        (False, True, False, True):   [
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        ],
+        (True, False, False, False):  [
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        ],
+        (True, True, False, False):   [
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        ],
+        (True, False, True, False):   [
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+        ],
+        (True, True, True, False):    [
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf",
+        ],
+        (False, False, False, False): [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+        (False, True, False, False):  [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+        (False, False, True, False):  [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Oblique.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        ],
+        (False, True, True, False):   [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        ],
+    }
+
+    def _get_system_unicode_font(self, is_serif=False, is_bold=False, is_italic=False, is_mono=False):
+        key = (bool(is_serif), bool(is_bold), bool(is_italic), bool(is_mono))
+        candidates = self._SYSTEM_FONT_MAP.get(key) or self._SYSTEM_FONT_MAP.get((False, False, False, False), [])
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        # Fallback absolu : parcourir tous les styles
+        for paths in self._SYSTEM_FONT_MAP.values():
+            for path in paths:
+                if os.path.isfile(path):
+                    return path
+        return None
+
+    def _font_truly_supports_text(self, fontfile, text):
+        if not fontfile or not text:
+            return True
+        probe_chars = list(set(ch for ch in text if ord(ch) > 127 and not ch.isspace()))
+        if not probe_chars:
+            return True
+        cache_key = (fontfile, "".join(sorted(probe_chars)))
+        cached = self._font_truly_supports_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            font = fitz.Font(fontfile=fontfile)
+            # Test 1 : has_glyph de base
+            for ch in probe_chars:
+                if not font.has_glyph(ord(ch)):
+                    self._font_truly_supports_cache[cache_key] = False
+                    return False
+            # Test 2 : rendu reel dans un doc temporaire pour detecter les faux positifs CFF
+            test_chars = probe_chars[:4]
+            test_text = "".join(test_chars)
+            try:
+                tmp_doc = fitz.open()
+                tmp_page = tmp_doc.new_page(width=200, height=50)
+                alias = f"TMPCHK{abs(hash(fontfile)) % 9999}"
+                tmp_page.insert_font(fontname=alias, fontfile=fontfile)
+                tmp_page.insert_text((10, 35), test_text, fontname=alias, fontsize=14)
+                rendered = tmp_page.get_text("text").strip()
+                tmp_doc.close()
+                ok = bool(rendered) and any(ch in rendered for ch in test_chars)
+            except Exception:
+                # Si le test de rendu echoue, se fier a has_glyph
+                ok = True
+            self._font_truly_supports_cache[cache_key] = ok
+            return ok
+        except Exception:
+            self._font_truly_supports_cache[cache_key] = False
+            return False
+
+    def _resolve_unicode_safe_font(self, page, plan, text):
+        profile = getattr(plan, "semantic_profile", None)
+        base_style = self._style_from_block(plan.source_block or {})
+        probe_chars = [ch for ch in (text or "") if ord(ch) > 127]
+        if not probe_chars:
+            _, fontfile, builtin, fontname = self._resolve_style_font(page, base_style, text=text)
+            return fontfile, fontname
+        # Tentative normale
+        _, fontfile, builtin, fontname = self._resolve_style_font(page, base_style, text=text)
+        # Verifier que la police supporte VRAIMENT les chars (anti faux-positif CFF)
+        if fontfile and self._font_truly_supports_text(fontfile, text):
+            return fontfile, fontname
+        # Fallback explicite vers police systeme unicode-safe par style dominant
+        is_serif = bool(profile.dominant_is_serif) if profile else bool((base_style.get("flags") or {}).get("serif"))
+        is_bold = bool(profile.dominant_is_bold) if profile else bool((base_style.get("flags") or {}).get("bold"))
+        is_italic = bool(profile.dominant_is_italic) if profile else bool((base_style.get("flags") or {}).get("italic"))
+        is_mono = bool(profile.dominant_is_mono) if profile else bool((base_style.get("flags") or {}).get("monospace"))
+        fallback_file = self._get_system_unicode_font(is_serif, is_bold, is_italic, is_mono)
+        if fallback_file:
+            fallback_name = self._resolve_page_fontname(page, fallback_file, None)
+            return fallback_file, fallback_name
+        # Dernier recours : helv (supporte Latin-1 dont tous les accents francais)
+        return None, "helv"
 
     def _build_page_reconstruction_context(self, page_data, target_lang):
         return {
@@ -2238,7 +2543,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         render_policy = str(unit.render_policy or "").strip().lower()
         unit_type = str(unit.unit_type or "").strip().lower()
         if unit_type == "translated_line":
-            text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
+            _tr = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+            _sr = self.reconstructor._clean_text_for_render(unit.text_source or "")
+            text = _tr if _tr else _sr
             if not text:
                 return []
             return [{"text": text, "style": dict(unit.style or {}), "unit": unit}]
@@ -2261,7 +2568,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                     segments.append({"text": token, "style": style, "unit": unit})
             if segments:
                 return segments
-        text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
+        _tr = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+        _sr = self.reconstructor._clean_text_for_render(unit.text_source or "")
+        text = _tr if _tr else _sr
         if not text:
             return []
         tokens = [text] if preserve_as_single or unit.group_class else self._tokenize_text(text)
@@ -2378,7 +2687,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             ops.append(BlockRenderOp("erase_rect", plan.block_id, None, bbox=plan.block_bbox, z_index=0))
         block_rect = fitz.Rect(plan.block_bbox)
         for unit in units:
-            text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
+            _tr = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+            _sr = self.reconstructor._clean_text_for_render(unit.text_source or "")
+            text = _tr if _tr else _sr
             if not text:
                 continue
             rect = fitz.Rect(unit.relative_bbox)
@@ -2441,7 +2752,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         ops = []
         block_rect = fitz.Rect(plan.block_bbox)
         for unit in units:
-            text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
+            _tr = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+            _sr = self.reconstructor._clean_text_for_render(unit.text_source or "")
+            text = _tr if _tr else _sr
             if not text:
                 continue
             rect = fitz.Rect(unit.relative_bbox)
@@ -2621,7 +2934,178 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             ops.extend(self._finalize_line(page, plan, current_template, current_segments, is_last_line=True))
         return ops
 
+    # ------------------------------------------------------------------
+    # Reflow prose : flux continu du texte traduit dans la bbox du bloc
+    # ------------------------------------------------------------------
+
+    def _collect_translated_text_stream(self, plan):
+        """Assemble le texte traduit de toutes les unites en flux continu."""
+        units = list(plan.units or [])
+        parts = []
+        for unit in units:
+            translated = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+            source = self.reconstructor._clean_text_for_render(unit.text_source or "")
+            text = translated if translated else source
+            if not text:
+                continue
+            if unit.hard_break_before and parts:
+                # Nouveau paragraphe : ajouter un saut de ligne
+                parts.append("\n")
+            elif parts:
+                prev = parts[-1]
+                if prev and prev[-1] == "-":
+                    # Coupure de mot en fin de ligne : coller sans espace
+                    parts[-1] = prev[:-1]
+                else:
+                    parts.append(" ")
+            parts.append(text)
+        return "".join(parts)
+
+    def _render_prose_reflow(self, page, plan):
+        """Reflow du texte traduit en flux continu dans la bbox du bloc."""
+        full_text = self._collect_translated_text_stream(plan)
+        if not full_text.strip():
+            return []
+        ops = []
+        if plan.background_strategy == "whiteout":
+            ops.append(BlockRenderOp("erase_rect", plan.block_id, None, bbox=plan.block_bbox, z_index=0))
+        block_rect = fitz.Rect(plan.block_bbox)
+        profile = getattr(plan, "semantic_profile", None)
+        # Police unicode-safe garantie
+        fontfile, fontname = self.reconstructor._resolve_unicode_safe_font(page, plan, full_text)
+        # Style de base (couleur, flags)
+        base_style = self.reconstructor._style_from_block(plan.source_block or {})
+        rgb = self.reconstructor._resolve_text_color(base_style, plan.source_block)
+        # Taille de police : partir de la taille dominante, reduire si debordement
+        fontsize = float(profile.dominant_fontsize) if (profile and profile.dominant_fontsize > 0) else float(base_style.get("size") or 11.0)
+        fontsize = max(7.0, min(fontsize, 36.0))
+        usable_w = max(8.0, block_rect.width - 4.0)
+        usable_h = max(8.0, block_rect.height - 4.0)
+        # Calcul word-wrap et ajustement de taille
+        style_for_wrap = {**base_style, "size": fontsize}
+        wrapped = self._wrap_text(page, style_for_wrap, full_text, usable_w)
+        line_h = fontsize * 1.18
+        allow_expand = bool(profile.allow_vertical_expansion) if profile else False
+        while fontsize > 7.0 and not allow_expand and len(wrapped) * line_h > usable_h:
+            fontsize -= 0.5
+            line_h = fontsize * 1.18
+            style_for_wrap = {**base_style, "size": fontsize}
+            wrapped = self._wrap_text(page, style_for_wrap, full_text, usable_w)
+        # Alignement
+        alignment = self.reconstructor._normalize_alignment(
+            plan.paragraph_alignment or plan.alignment or "left"
+        )
+        # Utiliser les templates si disponibles, sinon calculer les baselines
+        templates = list(plan.line_templates or [])
+        y = block_rect.y0 + fontsize * 0.82
+        for line_idx, line_text in enumerate(wrapped):
+            if templates and line_idx < len(templates):
+                baseline = templates[line_idx].baseline_y
+                left_x = templates[line_idx].left_x
+                right_x = templates[line_idx].right_x
+            else:
+                baseline = y
+                left_x = block_rect.x0 + 2.0
+                right_x = block_rect.x1 - 2.0
+            width = self.reconstructor._measure_text_width(line_text, fontsize, fontname, fontfile)
+            x = left_x
+            if alignment == "center":
+                x = max(left_x, left_x + max(0.0, (right_x - left_x - width) / 2.0))
+            elif alignment == "right":
+                x = max(left_x, right_x - width)
+            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(right_x, x + width), baseline + max(1.0, fontsize * 0.18))
+            ops.append(self._emit_text_run(
+                plan, line_text, text_rect, (x, baseline),
+                {**base_style, "size": fontsize}, fontname, fontfile, None, fontsize, rgb,
+                unit_id=f"{plan.block_id}:reflow:{line_idx}",
+            ))
+            y = baseline + line_h
+        return ops
+
+    def _render_label_stack(self, page, plan):
+        """Rendu ligne par ligne pour les blocs de labels/colonnes/listes atomiques."""
+        units = sorted(
+            [u for u in (plan.units or []) if u.relative_bbox],
+            key=lambda u: ((u.relative_bbox or (0, 0, 0, 0))[1], (u.relative_bbox or (0, 0, 0, 0))[0]),
+        )
+        if not units:
+            # Pas de relative_bbox : fallback sur les templates
+            units = list(plan.units or [])
+        ops = []
+        if plan.background_strategy == "whiteout":
+            ops.append(BlockRenderOp("erase_rect", plan.block_id, None, bbox=plan.block_bbox, z_index=0))
+        block_rect = fitz.Rect(plan.block_bbox)
+        templates = list(plan.line_templates or [])
+        for unit_idx, unit in enumerate(units):
+            translated = self.reconstructor._clean_text_for_render(unit.text_translated or "")
+            source = self.reconstructor._clean_text_for_render(unit.text_source or "")
+            text = translated if translated else source
+            if not text:
+                continue
+            # Bbox de l'unite ou fallback template
+            if unit.relative_bbox:
+                unit_rect = fitz.Rect(unit.relative_bbox)
+                unit_rect = fitz.Rect(
+                    max(block_rect.x0, unit_rect.x0),
+                    max(block_rect.y0, unit_rect.y0),
+                    min(block_rect.x1, unit_rect.x1),
+                    min(block_rect.y1, unit_rect.y1),
+                )
+            elif unit_idx < len(templates):
+                t = templates[unit_idx]
+                unit_rect = fitz.Rect(t.bbox)
+            else:
+                continue
+            if unit_rect.width <= 0 or unit_rect.height <= 0:
+                continue
+            fontfile, fontname = self.reconstructor._resolve_unicode_safe_font(page, plan, text)
+            style = dict(unit.style or {})
+            fontsize = min(float(style.get("size") or 11.0), max(6.0, unit_rect.height * 0.78))
+            # Reduire si le texte ne tient pas en largeur
+            available_w = max(4.0, unit_rect.width)
+            while fontsize > 6.0 and self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile) > available_w:
+                fontsize -= 0.5
+            rgb = self.reconstructor._resolve_text_color(style, plan.source_block)
+            alignment = self.reconstructor._normalize_alignment(
+                self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
+            )
+            width = self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile)
+            baseline = unit_rect.y1 - max(1.0, fontsize * 0.18)
+            x = unit_rect.x0
+            if alignment == "center":
+                x = max(unit_rect.x0, unit_rect.x0 + max(0.0, (unit_rect.width - width) / 2.0))
+            elif alignment == "right":
+                x = max(unit_rect.x0, unit_rect.x1 - width)
+            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(block_rect.x1, x + width), baseline + max(1.0, fontsize * 0.18))
+            ops.append(self._emit_text_run(
+                plan, text, text_rect, (x, baseline),
+                {**style, "size": fontsize}, fontname, fontfile, None, fontsize, rgb,
+                unit_id=unit.unit_id,
+            ))
+        return ops
+
     def render(self, page, plan):
+        _tr_parts = [
+            self.reconstructor._clean_text_for_render(u.text_translated or "")
+            for u in (plan.units or [])
+            if self.reconstructor._clean_text_for_render(u.text_translated or "")
+        ]
+        profile = self.reconstructor.compute_block_semantic_profile(
+            plan.source_block,
+            getattr(plan, "page_data", None),
+            translated_text=" ".join(_tr_parts),
+        )
+        if plan.semantic_profile is None:
+            plan = replace(plan, semantic_profile=profile)
+        # Dispatch base sur le profil semantique si le bloc est traduit
+        if profile is not None and profile.source_is_translated:
+            strategy = profile.render_strategy
+            if strategy in ("prose_reflow", "heading_reflow", "caption_reflow"):
+                return self._render_prose_reflow(page, plan)
+            if strategy == "label_stack":
+                return self._render_label_stack(page, plan)
+            # bitmap_preserve et code_preserve : paths existants
+        # Paths existants (blocs non traduits ou strategies speciales)
         if self._should_render_relative_slot_mode(plan):
             return self._render_relative_slots(page, plan)
         if self._should_render_bbox_anchored(plan):

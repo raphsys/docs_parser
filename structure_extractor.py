@@ -650,6 +650,7 @@ class LayoutV2Builder:
 
         self._inject_indent_levels(page_data, columns, margins)
         self._annotate_block_translation_profiles(page_data)
+        self._p3_annotate_layout_modes(page_data)
         return page_data
 
     def _looks_like_abbreviation_heading(self, text):
@@ -1195,6 +1196,80 @@ class LayoutV2Builder:
         if role in {"list_item", "list_marker"}:
             return "pedagogique", "didactique"
         return page_style, page_tone
+
+    def _p3_annotate_layout_modes(self, page_data: dict) -> None:
+        """Affinage optionnel du source_layout_mode via P3LayoutAgent.
+
+        Activé par PIPELINE_AGENT_P3_ENABLE=1. Pour chaque bloc dont le mode
+        de layout est ambigu, consulte l'agent et met à jour source_layout_mode
+        si l'agent est confiant (>= 0.70).
+
+        Variables d'environnement :
+          PIPELINE_AGENT_P3_ENABLE     "1" pour activer (défaut off)
+          PIPELINE_AGENT_P3_THRESHOLD  confiance minimale pour override (défaut 0.70)
+          PIPELINE_AGENT_P3_MAX_BLOCKS max blocs traités par page (défaut 10)
+        """
+        import os
+        import logging
+        log = logging.getLogger(__name__)
+
+        if os.environ.get("PIPELINE_AGENT_P3_ENABLE") != "1":
+            return
+        try:
+            from pipeline_agents import get_agent
+            from pipeline_agents.p3_layout import P3LayoutAgent
+        except ImportError:
+            return
+
+        try:
+            agent = get_agent("p3_layout")
+        except Exception:
+            return
+        if not agent.is_available():
+            return
+
+        conf_threshold = float(os.environ.get("PIPELINE_AGENT_P3_THRESHOLD", "0.70"))
+        max_blocks = max(0, int(os.environ.get("PIPELINE_AGENT_P3_MAX_BLOCKS", "10")))
+        page_w = float((page_data.get("dimensions") or {}).get("width") or
+                       (page_data.get("layout") or {}).get("page_width") or 600)
+
+        blocks = list(page_data.get("blocks") or [])
+        _skip_roles = {"formula", "code", "code_block", "image", "page_number", "separator"}
+
+        candidates = [
+            b for b in blocks
+            if str(b.get("role") or "body").lower() not in _skip_roles
+            and len(b.get("lines") or []) >= 1
+        ]
+        if max_blocks:
+            candidates = candidates[:max_blocks]
+
+        for block in candidates:
+            inp = P3LayoutAgent.build_input_from_block({**block, "_page_width": page_w})
+            result = agent.run(inp)
+            if not result:
+                continue
+            confidence = float(result.get("confidence") or 0.0)
+            if confidence < conf_threshold:
+                continue
+            ai_mode = str(result.get("layout_mode") or "")
+            if not ai_mode:
+                continue
+            # Mettre à jour source_layout_mode uniquement si absent ou différent
+            existing = block.get("source_layout_mode")
+            existing_flow = str((existing or {}).get("line_flow") or "") if isinstance(existing, dict) else ""
+            if existing_flow != ai_mode:
+                block["source_layout_mode"] = {
+                    "line_flow": ai_mode,
+                    "mode": ai_mode,
+                    "render_contract": ai_mode,
+                    "p3_confidence": confidence,
+                    "p3_reason": str(result.get("notes") or "")[:60],
+                }
+                log.debug(
+                    "P3LayoutAgent: bloc '%s' → %s (conf=%.2f)",
+                    block.get("id") or "?", ai_mode, confidence,
+                )
 
     def _annotate_block_translation_profiles(self, page_data):
         page_style = page_data.get("translation_style") or "professionnel"

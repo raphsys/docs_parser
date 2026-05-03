@@ -1061,3 +1061,266 @@ class TestP4IntegrationWithTranslator:
         b = self._block("Hello.", "Bonjour.")
         self._make_translator()._p4_validate_translations(self._structure(b), "fr")
         assert "p4_quality_score" not in b
+
+
+# ---------------------------------------------------------------------------
+# Tests intégration P3LayoutAgent ↔ structure_extractor._p3_annotate_layout_modes
+# ---------------------------------------------------------------------------
+
+class TestP3IntegrationWithStructureExtractor:
+    """Teste _p3_annotate_layout_modes dans structure_extractor.py via mock agent."""
+
+    def setup_method(self):
+        import importlib
+        import structure_extractor as se_mod
+        importlib.reload(se_mod)
+        self.se = se_mod
+        AgentRegistry.clear_instances()
+
+    def _builder(self):
+        return self.se.LayoutV2Builder()
+
+    def _page(self, *blocks):
+        return {
+            "blocks": list(blocks),
+            "dimensions": {"width": 595, "height": 842},
+        }
+
+    def _block(self, role="body", lines=None):
+        return {
+            "id": "b1",
+            "role": role,
+            "bbox": [50, 100, 500, 200],
+            "lines": lines or [{"line_index": 0, "line_text": "Some text here.", "bbox": [50, 100, 500, 115]}],
+        }
+
+    def _inject(self, response: dict, *, env: dict = None, monkeypatch=None):
+        """Injecte un agent P3 mock avec la réponse donnée."""
+        import json
+        class _MockP3(P3LayoutAgent):
+            def run(self, input_data, **kw):
+                return response
+        AgentRegistry._instances["p3_layout|phi35|auto"] = _MockP3(_MockRuntime(response))
+
+    def test_disabled_by_default(self):
+        """Sans PIPELINE_AGENT_P3_ENABLE, source_layout_mode n'est pas modifié."""
+        b = self._block()
+        self._inject({"layout_mode": "inline_reflow", "confidence": 0.95, "notes": ""})
+        builder = self._builder()
+        builder._p3_annotate_layout_modes(self._page(b))
+        assert "p3_confidence" not in (b.get("source_layout_mode") or {})
+
+    def test_updates_layout_mode_when_enabled(self, monkeypatch):
+        """Avec P3_ENABLE=1 et confiance suffisante, source_layout_mode est mis à jour."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        self._inject({"layout_mode": "preserve_line_breaks", "confidence": 0.90, "notes": "dense"})
+        b = self._block()
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        slm = b.get("source_layout_mode") or {}
+        assert slm.get("line_flow") == "preserve_line_breaks"
+        assert slm.get("mode") == "preserve_line_breaks"
+        assert pytest.approx(slm.get("p3_confidence"), abs=1e-6) == 0.90
+
+    def test_confidence_below_threshold_no_update(self, monkeypatch):
+        """Confiance sous le seuil → source_layout_mode inchangé."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P3_THRESHOLD", "0.80")
+        self._inject({"layout_mode": "fixed_lines", "confidence": 0.75, "notes": ""})
+        b = self._block()
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        assert "p3_confidence" not in (b.get("source_layout_mode") or {})
+
+    def test_skips_formula_role(self, monkeypatch):
+        """Les blocs formula ne doivent pas être soumis à l'agent."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        call_count = {"n": 0}
+        class CountingP3(P3LayoutAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {"layout_mode": "inline_reflow", "confidence": 0.95, "notes": ""}
+        AgentRegistry._instances["p3_layout|phi35|auto"] = CountingP3(_MockRuntime({}))
+        b = self._block(role="formula")
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        assert call_count["n"] == 0
+
+    def test_skips_image_role(self, monkeypatch):
+        """Les blocs image ne doivent pas être soumis à l'agent."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        call_count = {"n": 0}
+        class CountingP3(P3LayoutAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {"layout_mode": "inline_reflow", "confidence": 0.95, "notes": ""}
+        AgentRegistry._instances["p3_layout|phi35|auto"] = CountingP3(_MockRuntime({}))
+        b = self._block(role="image")
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        assert call_count["n"] == 0
+
+    def test_max_blocks_respected(self, monkeypatch):
+        """PIPELINE_AGENT_P3_MAX_BLOCKS limite le nombre de blocs traités."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P3_MAX_BLOCKS", "2")
+        call_count = {"n": 0}
+        class CountingP3(P3LayoutAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {"layout_mode": "inline_reflow", "confidence": 0.95, "notes": ""}
+        AgentRegistry._instances["p3_layout|phi35|auto"] = CountingP3(_MockRuntime({}))
+        blocks = [self._block() for _ in range(5)]
+        for i, b in enumerate(blocks):
+            b["id"] = f"b{i}"
+        self._builder()._p3_annotate_layout_modes(self._page(*blocks))
+        assert call_count["n"] == 2
+
+    def test_existing_mode_unchanged_if_same(self, monkeypatch):
+        """Si l'agent retourne le même mode qu'existant, le bloc n'est pas modifié."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        self._inject({"layout_mode": "inline_reflow", "confidence": 0.95, "notes": ""})
+        b = self._block()
+        b["source_layout_mode"] = {"line_flow": "inline_reflow", "mode": "inline_reflow", "render_contract": "inline_reflow"}
+        original_slm = dict(b["source_layout_mode"])
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        # mode identique → pas de p3_confidence injectée
+        assert "p3_confidence" not in b.get("source_layout_mode", {})
+        assert b["source_layout_mode"] == original_slm
+
+    def test_unavailable_agent_is_silent(self, monkeypatch):
+        """Si l'agent est indisponible, aucune exception n'est levée."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        AgentRegistry._instances["p3_layout|phi35|auto"] = P3LayoutAgent(_UnavailableRuntime())
+        b = self._block()
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        assert "p3_confidence" not in (b.get("source_layout_mode") or {})
+
+    def test_notes_truncated_to_60(self, monkeypatch):
+        """p3_reason est tronqué à 60 caractères."""
+        monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
+        long_note = "A" * 100
+        self._inject({"layout_mode": "column_layout", "confidence": 0.88, "notes": long_note})
+        b = self._block()
+        self._builder()._p3_annotate_layout_modes(self._page(b))
+        slm = b.get("source_layout_mode") or {}
+        assert len(slm.get("p3_reason", "")) <= 60
+
+
+# ---------------------------------------------------------------------------
+# Tests intégration P6BackgroundAgent ↔ ocr_server._p6_audit_background
+# ---------------------------------------------------------------------------
+
+class TestP6IntegrationWithOcrServer:
+    """Teste _p6_audit_background dans ocr_server.py via mock agent."""
+
+    def setup_method(self):
+        import importlib
+        import ocr_server as ocr_mod
+        importlib.reload(ocr_mod)
+        self.ocr = ocr_mod
+        AgentRegistry.clear_instances()
+
+    def _inject(self, response: dict):
+        class _MockP6(P6BackgroundAgent):
+            def run(self, input_data, **kw):
+                return response
+        AgentRegistry._instances["p6_background|phi35|auto"] = _MockP6(_MockRuntime(response))
+
+    def _call(self, blocks=None, inpaint_regions=None, text_removal_debug=None,
+              page_id="page_001", img_width=600, img_height=800):
+        return self.ocr._p6_audit_background(
+            blocks or [],
+            inpaint_regions or [],
+            text_removal_debug or {},
+            page_id=page_id,
+            img_width=img_width,
+            img_height=img_height,
+        )
+
+    def test_disabled_by_default(self):
+        """Sans PIPELINE_AGENT_P6_ENABLE, retourne {}."""
+        self._inject({"quality": 0.95, "artifacts": [], "reprocess": [], "ok": True})
+        result = self._call()
+        assert result == {}
+
+    def test_returns_audit_when_enabled(self, monkeypatch):
+        """Avec P6_ENABLE=1, retourne le résultat de l'agent."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        self._inject({"quality": 0.92, "artifacts": [], "reprocess": [], "ok": True})
+        result = self._call(blocks=[{"id": "b1"}, {"id": "b2"}], inpaint_regions=[[10, 20, 100, 80]])
+        assert result.get("quality") == 0.92
+        assert result.get("ok") is True
+
+    def test_coverage_ratio_computed(self, monkeypatch):
+        """L'input envoyé à l'agent contient le bon coverage_ratio."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        received = {}
+        class CapturingP6(P6BackgroundAgent):
+            def run(self, input_data, **kw):
+                received.update(input_data)
+                return {"quality": 0.9, "artifacts": [], "reprocess": [], "ok": True}
+        AgentRegistry._instances["p6_background|phi35|auto"] = CapturingP6(_MockRuntime({}))
+        blocks = [{"id": f"b{i}"} for i in range(4)]
+        inpaint_regions = [[0, 0, 10, 10], [20, 20, 30, 30]]  # 2 régions / 4 blocs = 0.5
+        self._call(blocks=blocks, inpaint_regions=inpaint_regions)
+        assert received.get("coverage_ratio") == pytest.approx(0.5, abs=1e-3)
+        assert received.get("blocks_removed") == 2
+
+    def test_avg_confidence_from_mask_nonzero(self, monkeypatch):
+        """avg_confidence est calculé depuis mask_nonzero / page_area."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        received = {}
+        class CapturingP6(P6BackgroundAgent):
+            def run(self, input_data, **kw):
+                received.update(input_data)
+                return {"quality": 0.9, "artifacts": [], "reprocess": [], "ok": True}
+        AgentRegistry._instances["p6_background|phi35|auto"] = CapturingP6(_MockRuntime({}))
+        # page 600×800=480000 pixels, mask_nonzero=48000 → ratio=0.1 → avg_conf=0.9
+        self._call(
+            text_removal_debug={"mask_nonzero": 48000},
+            img_width=600,
+            img_height=800,
+        )
+        assert received.get("avg_confidence") == pytest.approx(0.9, abs=1e-3)
+
+    def test_low_quality_returns_result(self, monkeypatch):
+        """Un fond de mauvaise qualité est quand même retourné (log warning émis)."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        self._inject({
+            "quality": 0.45,
+            "artifacts": [{"region": [0, 0, 100, 100], "type": "text_residue", "severity": "high"}],
+            "reprocess": [[0, 0, 100, 100]],
+            "ok": False,
+        })
+        result = self._call()
+        assert result.get("ok") is False
+        assert result.get("quality") == pytest.approx(0.45, abs=1e-3)
+
+    def test_empty_inpaint_regions_filtered(self, monkeypatch):
+        """Les régions incomplètes (< 4 éléments) sont filtrées avant envoi à l'agent."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        received = {}
+        class CapturingP6(P6BackgroundAgent):
+            def run(self, input_data, **kw):
+                received.update(input_data)
+                return {"quality": 0.9, "artifacts": [], "reprocess": [], "ok": True}
+        AgentRegistry._instances["p6_background|phi35|auto"] = CapturingP6(_MockRuntime({}))
+        bad_regions = [[10, 20], [30], [], [0, 0, 100, 200]]  # seule la dernière est valide
+        self._call(inpaint_regions=bad_regions)
+        assert len(received.get("inpaint_regions", [])) == 1
+
+    def test_unavailable_agent_returns_empty(self, monkeypatch):
+        """Si l'agent est indisponible, retourne {}."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        AgentRegistry._instances["p6_background|phi35|auto"] = P6BackgroundAgent(_UnavailableRuntime())
+        result = self._call()
+        assert result == {}
+
+    def test_agent_exception_returns_empty(self, monkeypatch):
+        """Si l'agent lève une exception dans run(), retourne {}."""
+        monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
+        class CrashingP6(P6BackgroundAgent):
+            def run(self, input_data, **kw):
+                raise RuntimeError("oops")
+            def is_available(self):
+                return True
+        AgentRegistry._instances["p6_background|phi35|auto"] = CrashingP6(_MockRuntime({}))
+        result = self._call()
+        assert result == {}

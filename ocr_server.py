@@ -2627,6 +2627,66 @@ def _postprocess_blocks_semantic(blocks: list) -> None:
         _llm_postprocess_blocks(blocks)
 
 
+def _p6_audit_background(
+    blocks: list,
+    inpaint_regions: list,
+    text_removal_debug: dict,
+    page_id: str,
+    img_width: int = 0,
+    img_height: int = 0,
+) -> dict:
+    """Audit qualité du background master via P6BackgroundAgent.
+
+    Activé par PIPELINE_AGENT_P6_ENABLE=1. Construit l'input depuis les
+    métadonnées d'inpainting disponibles et retourne le résultat d'audit
+    (quality, artifacts, reprocess, ok).
+
+    Retourne {} si l'agent est désactivé ou indisponible.
+    """
+    log = logging.getLogger(__name__)
+    if os.environ.get("PIPELINE_AGENT_P6_ENABLE") != "1":
+        return {}
+    try:
+        from pipeline_agents import get_agent
+        agent = get_agent("p6_background")
+    except Exception as exc:
+        log.debug("P6BackgroundAgent: chargement échoué: %s", exc)
+        return {}
+    if not agent.is_available():
+        log.debug("P6BackgroundAgent: modèle indisponible, skip")
+        return {}
+
+    total_blocks = len(blocks or [])
+    n_inpainted = len(inpaint_regions or [])
+    coverage = round(n_inpainted / max(1, total_blocks), 3)
+    # Proxy de confiance : ratio pixels masqués / surface totale de la page
+    mask_nonzero = int((text_removal_debug or {}).get("mask_nonzero") or 0)
+    page_area = max(1, int(img_width) * int(img_height))
+    avg_conf = round(1.0 - min(0.99, mask_nonzero / page_area), 3)
+
+    input_data = {
+        "page_id": str(page_id),
+        "blocks_removed": n_inpainted,
+        "inpaint_regions": [r for r in (inpaint_regions or []) if isinstance(r, (list, tuple)) and len(r) >= 4],
+        "coverage_ratio": coverage,
+        "avg_confidence": avg_conf,
+    }
+    try:
+        result = agent.run(input_data)
+    except Exception as exc:
+        log.debug("P6BackgroundAgent: run() échoué: %s", exc)
+        return {}
+    if result:
+        if not result.get("ok"):
+            log.warning(
+                "P6BackgroundAgent: fond suspect (qualité=%.2f, %d artéfacts, page=%s)",
+                result.get("quality") or 0.0,
+                len(result.get("artifacts") or []),
+                page_id,
+            )
+    return result or {}
+
+
 def _semantic_span_style_signature(span):
     style = span.get("style") if isinstance(span.get("style"), dict) else {}
     flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
@@ -4731,6 +4791,15 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     except Exception as e:
         print(f"Erreur génération fond maître chirurgical : {e}")
 
+    p6_bg_audit = _p6_audit_background(
+        final_blocks,
+        text_regions if "text_regions" in dir() else [],
+        text_removal_debug,
+        page_id=f"{filename}_{idx}",
+        img_width=img.width,
+        img_height=img.height,
+    )
+
     # 4. VISUALISATION (Bboxes colorées pour l aperçu)
     vis_fn = f"vis_{safe_filename}_{idx}.jpg"
     img_draw = img.copy()
@@ -4824,6 +4893,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "mask_master_path": mask_master_path,
         "immutable_overlays": immutable_overlays,
         "text_removal_debug": text_removal_debug,
+        "p6_bg_audit": p6_bg_audit,
         "non_text_zones": non_text_zones,
         "images": native_images,
         "drawings": native_drawings,

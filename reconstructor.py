@@ -201,6 +201,73 @@ class DocumentReconstructor:
         self._font_objects: dict[str, fitz.Font] = {}
         self._page_font_aliases: dict[tuple, str] = {}
         self._font_truly_supports_cache: dict[tuple, bool] = {}
+        self._render_agent: Any = None
+        self._render_agent_loaded: bool = False
+
+    # ------------------------------------------------------------------
+    # Agent P5 — sélection de stratégie de rendu assistée par LLM
+    # ------------------------------------------------------------------
+
+    def _get_render_agent(self) -> Any:
+        """Retourne l'agent P5 si activé et disponible, sinon None."""
+        if self._render_agent_loaded:
+            return self._render_agent
+        self._render_agent_loaded = True
+        if os.environ.get("PIPELINE_AGENT_RENDER_ENABLE", "0") != "1":
+            return None
+        try:
+            from pipeline_agents import get_agent
+            agent = get_agent("p5_render")
+            if agent.is_available():
+                self._render_agent = agent
+        except Exception:
+            pass
+        return self._render_agent
+
+    def _ai_refine_render_strategy(
+        self,
+        block: dict,
+        heuristic_strategy: str,
+        page_data: dict | None = None,
+    ) -> str:
+        """
+        Tente d'affiner la stratégie de rendu via l'agent P5.
+
+        Retourne la stratégie originale si l'agent est absent, indisponible,
+        peu confiant, ou si le bloc n'est pas ambigu.
+        """
+        agent = self._get_render_agent()
+        if agent is None:
+            return heuristic_strategy
+        try:
+            from pipeline_agents.p5_render import P5RenderAgent
+            ambiguity = P5RenderAgent.score_block(block)
+            if ambiguity < 0.4:
+                return heuristic_strategy
+            page_w = float((page_data or {}).get("page_width") or 600)
+            input_data = P5RenderAgent.build_input_from_block(
+                {**block, "_page_width": page_w}
+            )
+            result = agent.run(input_data)
+            ai_strategy = str(result.get("strategy") or "")
+            confidence = float(result.get("confidence") or 0.0)
+            # Mapping agent → reconstructor
+            _map = {
+                "prose_reflow": "prose_reflow",
+                "label_stack": "label_stack",
+                "heading_reflow": "heading_reflow",
+                "caption_reflow": "prose_reflow",
+                "bitmap_preserve": "bitmap_preserve",
+            }
+            mapped = _map.get(ai_strategy)
+            # N'override que prose_reflow ↔ label_stack (zone ambiguë)
+            # et seulement avec confiance suffisante
+            if mapped and mapped != heuristic_strategy and confidence >= 0.70:
+                if heuristic_strategy in {"prose_reflow", "label_stack"} and mapped in {"prose_reflow", "label_stack"}:
+                    return mapped
+        except Exception:
+            pass
+        return heuristic_strategy
 
     # ------------------------------------------------------------------
     # Résolution de polices et mesure de texte (portées depuis le .bak)
@@ -894,6 +961,12 @@ class DocumentReconstructor:
         else:
             content_class = "label"
             render_strategy = "label_stack"
+        # Etape G - affinage optionnel via agent P5 (zone prose_reflow / label_stack ambiguë)
+        if render_strategy in {"prose_reflow", "label_stack"}:
+            ai_strategy = self._ai_refine_render_strategy(block, render_strategy, page_data)
+            if ai_strategy != render_strategy:
+                render_strategy = ai_strategy
+                content_class = "prose" if render_strategy == "prose_reflow" else "label"
         # Autres champs derives
         if render_strategy == "prose_reflow":
             font_normalization = "fit_to_bbox"

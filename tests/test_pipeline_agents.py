@@ -616,3 +616,161 @@ class TestAgentRegistry:
         agent = P5RenderAgent(_UnavailableRuntime())
         result = agent.run({"role": "body"})
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests intégration P5RenderAgent ↔ DocumentReconstructor
+# ---------------------------------------------------------------------------
+
+class TestP5IntegrationWithReconstructor:
+    """
+    Teste l'étape G de compute_block_semantic_profile :
+    affinage de la stratégie via P5RenderAgent (mock).
+    """
+
+    def setup_method(self):
+        import importlib
+        import reconstructor as rec_mod
+        importlib.reload(rec_mod)
+        self.rec_mod = rec_mod
+        AgentRegistry.clear_instances()
+
+    def _make_reconstructor(self):
+        return self.rec_mod.DocumentReconstructor()
+
+    def _block_ambiguous(self) -> dict:
+        """Bloc body 3 lignes, 3 mots chacune → zone ambiguë prose/label."""
+        return {
+            "role": "body",
+            "bbox": [10, 10, 150, 80],
+            "lines": [
+                {"line_text": "Step A here", "bbox": [10, 10, 140, 25]},
+                {"line_text": "Step B there", "bbox": [10, 30, 140, 45]},
+                {"line_text": "Step C done", "bbox": [10, 50, 140, 65]},
+            ],
+        }
+
+    def _inject_mock_agent(self, reconstructor, ai_strategy: str, confidence: float = 0.85):
+        """Injecte un agent mock dans l'instance de reconstructeur."""
+        agent = P5RenderAgent(_MockRuntime({
+            "strategy": ai_strategy,
+            "confidence": confidence,
+            "params": {},
+            "reason": "test",
+        }))
+        reconstructor._render_agent = agent
+        reconstructor._render_agent_loaded = True
+
+    def test_agent_disabled_by_default(self):
+        """Sans PIPELINE_AGENT_RENDER_ENABLE=1, l'agent ne doit pas être chargé."""
+        env_before = os.environ.get("PIPELINE_AGENT_RENDER_ENABLE")
+        os.environ.pop("PIPELINE_AGENT_RENDER_ENABLE", None)
+        try:
+            rec = self._make_reconstructor()
+            assert rec._get_render_agent() is None
+        finally:
+            if env_before is not None:
+                os.environ["PIPELINE_AGENT_RENDER_ENABLE"] = env_before
+
+    def test_heuristic_preserved_when_agent_disabled(self):
+        """Le résultat heuristique ne doit pas changer quand l'agent est absent."""
+        rec = self._make_reconstructor()
+        # Pas d'agent injecté → _render_agent reste None
+        rec._render_agent_loaded = True  # évite la tentative de chargement
+        block = self._block_ambiguous()
+        strategy = rec._ai_refine_render_strategy(block, "prose_reflow")
+        assert strategy == "prose_reflow"
+
+    def test_agent_overrides_prose_to_label_with_high_confidence(self):
+        """Quand l'agent est confiant (≥ 0.70) et le bloc est ambigu, override."""
+        rec = self._make_reconstructor()
+        self._inject_mock_agent(rec, "label_stack", confidence=0.88)
+        block = self._block_ambiguous()
+        strategy = rec._ai_refine_render_strategy(block, "prose_reflow")
+        assert strategy == "label_stack"
+
+    def test_agent_overrides_label_to_prose_with_high_confidence(self):
+        """Override inverse : label_stack → prose_reflow."""
+        rec = self._make_reconstructor()
+        self._inject_mock_agent(rec, "prose_reflow", confidence=0.91)
+        block = {
+            "role": "body",
+            "bbox": [10, 10, 150, 80],
+            "lines": [
+                {"line_text": "val A", "bbox": [10, 10, 80, 25]},
+                {"line_text": "val B", "bbox": [10, 30, 80, 45]},
+                {"line_text": "val C", "bbox": [10, 50, 80, 65]},
+            ],
+        }
+        strategy = rec._ai_refine_render_strategy(block, "label_stack")
+        assert strategy == "prose_reflow"
+
+    def test_low_confidence_keeps_heuristic(self):
+        """Confiance < 0.70 → pas d'override."""
+        rec = self._make_reconstructor()
+        self._inject_mock_agent(rec, "label_stack", confidence=0.60)
+        block = self._block_ambiguous()
+        strategy = rec._ai_refine_render_strategy(block, "prose_reflow")
+        assert strategy == "prose_reflow"
+
+    def test_non_ambiguous_block_skips_agent(self):
+        """Bloc non ambigu (score_block < 0.4) → pas d'appel agent."""
+        rec = self._make_reconstructor()
+        call_count = {"n": 0}
+
+        class CountingAgent(P5RenderAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {"strategy": "label_stack", "confidence": 0.9, "params": {}, "reason": ""}
+
+        rec._render_agent = CountingAgent(_MockRuntime({}))
+        rec._render_agent_loaded = True
+
+        # Bloc très long → score faible
+        block = {
+            "role": "body",
+            "bbox": [10, 10, 600, 100],
+            "lines": [
+                {"line_text": "This is a very long prose paragraph with many words on this line."},
+                {"line_text": "Another equally long sentence that clearly belongs to body prose."},
+                {"line_text": "A third line confirming this is continuous flowing text content."},
+            ],
+        }
+        rec._ai_refine_render_strategy(block, "prose_reflow")
+        assert call_count["n"] == 0
+
+    def test_agent_cannot_override_non_ambiguous_strategies(self):
+        """L'étape G ne peut changer que prose_reflow ↔ label_stack, pas heading/bitmap."""
+        rec = self._make_reconstructor()
+        self._inject_mock_agent(rec, "prose_reflow", confidence=0.95)
+        # heading_reflow n'est pas dans la zone ambiguë → pas de changement
+        block = self._block_ambiguous()
+        strategy = rec._ai_refine_render_strategy(block, "heading_reflow")
+        assert strategy == "heading_reflow"
+
+    def test_compute_block_semantic_profile_ai_refinement_applied(self):
+        """compute_block_semantic_profile intègre l'override IA sur bloc ambigu."""
+        rec = self._make_reconstructor()
+        self._inject_mock_agent(rec, "label_stack", confidence=0.85)
+        block = self._block_ambiguous()
+        profile = rec.compute_block_semantic_profile(block, page_data=None)
+        assert profile is not None
+        assert profile.render_strategy == "label_stack"
+        assert profile.content_class == "label"
+
+    def test_compute_block_semantic_profile_no_ai_when_disabled(self):
+        """Sans agent, compute_block_semantic_profile retourne la stratégie heuristique."""
+        rec = self._make_reconstructor()
+        rec._render_agent_loaded = True  # simulate: not enabled
+        block = {
+            "role": "body",
+            "bbox": [10, 10, 600, 200],
+            "lines": [
+                {"line_text": "Neural networks learn hierarchical feature representations from data."},
+                {"line_text": "They use gradient descent to minimize the cross-entropy loss function."},
+                {"line_text": "The optimizer updates weights via backpropagation through all layers."},
+            ],
+        }
+        profile = rec.compute_block_semantic_profile(block, page_data=None)
+        assert profile is not None
+        assert profile.render_strategy == "prose_reflow"

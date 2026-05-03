@@ -906,3 +906,158 @@ class TestP1IntegrationWithOcrServer:
         block = self._simple_block()
         # Ne doit pas lever d'exception
         self.ocr._p1_agent_postprocess_blocks([block])
+
+
+# ---------------------------------------------------------------------------
+# Tests intégration P4TranslationAgent ↔ translator._p4_validate_translations
+# ---------------------------------------------------------------------------
+
+class TestP4IntegrationWithTranslator:
+    """Teste _p4_validate_translations dans translator.py via mock agent."""
+
+    def setup_method(self):
+        import importlib
+        import translator as tr_mod
+        importlib.reload(tr_mod)
+        self.tr = tr_mod
+        AgentRegistry.clear_instances()
+
+    def _make_translator(self):
+        return self.tr.DocumentTranslator()
+
+    def _block(self, src: str, translation: str, role: str = "body") -> dict:
+        return {
+            "id": "b0",
+            "role": role,
+            "bbox": [10, 10, 400, 50],
+            "lines": [{"line_text": src, "translated_text": translation}],
+            "translated_text": translation,
+        }
+
+    def _inject(self, ai_response: dict):
+        agent = P4TranslationAgent(_MockRuntime(ai_response))
+        AgentRegistry._instances["p4_translation|phi35|auto"] = agent
+        return agent
+
+    def _structure(self, block: dict) -> dict:
+        return {"blocks": [block], "source_lang": "en"}
+
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("PIPELINE_AGENT_P4_ENABLE", raising=False)
+        self._inject({"score": 0.1, "issues": [], "post_edit": "Fixed.", "untranslated": []})
+        b = self._block("Hello.", "Hello.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert "p4_quality_score" not in b
+
+    def test_stores_quality_score(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        self._inject({"score": 0.88, "issues": [], "post_edit": None, "untranslated": []})
+        b = self._block("Networks learn.", "Les réseaux apprennent.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert b.get("p4_quality_score") == pytest.approx(0.88)
+
+    def test_post_edit_applied_below_threshold(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P4_POST_EDIT_THRESHOLD", "0.6")
+        self._inject({
+            "score": 0.35,
+            "issues": [{"type": "omission", "desc": "untranslated", "severity": "critical"}],
+            "post_edit": "Les réseaux neuronaux apprennent.",
+            "untranslated": [],
+        })
+        b = self._block("Neural networks learn.", "Neural networks learn.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert b.get("p4_post_edited") is True
+        assert b.get("translated_text") == "Les réseaux neuronaux apprennent."
+        assert "p4_original_translation" in b
+
+    def test_post_edit_not_applied_above_threshold(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P4_POST_EDIT_THRESHOLD", "0.6")
+        self._inject({"score": 0.75, "issues": [], "post_edit": "Do not use.", "untranslated": []})
+        original = "Les réseaux apprennent."
+        b = self._block("Networks learn.", original)
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert b.get("translated_text") == original
+        assert "p4_post_edited" not in b
+
+    def test_untranslated_segments_flagged(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P4_UNTRANSLATED_THRESHOLD", "0.35")
+        self._inject({
+            "score": 0.2,
+            "issues": [{"type": "omission", "desc": "not translated", "severity": "critical"}],
+            "post_edit": None,
+            "untranslated": ["Neural networks learn."],
+        })
+        b = self._block("Neural networks learn.", "Neural networks learn.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert b.get("p4_likely_untranslated") is True
+        assert len(b.get("p4_untranslated_segments", [])) == 1
+
+    def test_untranslated_not_flagged_above_threshold(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P4_UNTRANSLATED_THRESHOLD", "0.3")
+        self._inject({"score": 0.85, "issues": [], "post_edit": None, "untranslated": ["some segment"]})
+        b = self._block("Hello.", "Bonjour.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert "p4_likely_untranslated" not in b
+
+    def test_formula_block_skipped(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        call_count = {"n": 0}
+        class CountingAgent(P4TranslationAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {}
+        AgentRegistry._instances["p4_translation|phi35|auto"] = CountingAgent(_MockRuntime({}))
+        b = self._block("x=f(w)", "x=f(w)", role="formula")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert call_count["n"] == 0
+
+    def test_block_without_translation_skipped(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        call_count = {"n": 0}
+        class CountingAgent(P4TranslationAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {}
+        AgentRegistry._instances["p4_translation|phi35|auto"] = CountingAgent(_MockRuntime({}))
+        b = {"id": "b1", "role": "body", "bbox": [0, 0, 100, 20], "lines": [], "translated_text": ""}
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert call_count["n"] == 0
+
+    def test_max_blocks_respected(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P4_MAX_BLOCKS", "2")
+        call_count = {"n": 0}
+        class CountingAgent(P4TranslationAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {"score": 0.9, "issues": [], "post_edit": None, "untranslated": []}
+        AgentRegistry._instances["p4_translation|phi35|auto"] = CountingAgent(_MockRuntime({}))
+        blocks = [self._block(f"S {i}.", f"P {i}.") for i in range(5)]
+        for i, b in enumerate(blocks):
+            b["id"] = f"b{i}"
+        self._make_translator()._p4_validate_translations({"blocks": blocks, "source_lang": "en"}, "fr")
+        assert call_count["n"] == 2
+
+    def test_issues_stored_on_block(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        self._inject({
+            "score": 0.65,
+            "issues": [{"type": "fluency", "desc": "awkward", "severity": "minor"}],
+            "post_edit": None,
+            "untranslated": [],
+        })
+        b = self._block("Networks learn.", "Les réseaux apprend.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert len(b.get("p4_issues", [])) == 1
+        assert b["p4_issues"][0]["type"] == "fluency"
+
+    def test_unavailable_agent_is_silent(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
+        AgentRegistry._instances["p4_translation|phi35|auto"] = P4TranslationAgent(_UnavailableRuntime())
+        b = self._block("Hello.", "Bonjour.")
+        self._make_translator()._p4_validate_translations(self._structure(b), "fr")
+        assert "p4_quality_score" not in b

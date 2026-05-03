@@ -2170,6 +2170,7 @@ class DocumentTranslator:
 
         self._enrich_leaf_translations_from_aux_segments(structure)
         self._post_dedupe_translated_blocks(structure)
+        self._p4_validate_translations(structure, tgt_code)
         return structure
 
     def translate_text(self, text, target_lang="fr", block_role="body", strategy="semantic_reflow", translatable=True, style=None, tone=None):
@@ -5370,6 +5371,103 @@ class DocumentTranslator:
             if not is_dup:
                 kept.append(b)
         structure["blocks"] = kept
+
+    def _p4_validate_translations(self, structure: dict, tgt_code: str = "fr") -> None:
+        """Post-validation et post-édition via P4TranslationAgent.
+
+        Activé par PIPELINE_AGENT_P4_ENABLE=1. Pour chaque bloc traduit :
+        - Marque les segments non traduits (``p4_likely_untranslated``)
+        - Applique le post-edit proposé si le score est sous le seuil
+        - Stocke le score qualité dans ``p4_quality_score``
+
+        Variables d'environnement :
+          PIPELINE_AGENT_P4_ENABLE              "1" pour activer (défaut off)
+          PIPELINE_AGENT_P4_MAX_BLOCKS          max blocs traités par page (défaut 8)
+          PIPELINE_AGENT_P4_POST_EDIT_THRESHOLD score sous lequel appliquer post-edit (défaut 0.5)
+          PIPELINE_AGENT_P4_UNTRANSLATED_THRESHOLD score sous lequel marquer non-traduit (défaut 0.3)
+        """
+        import os
+        import logging
+        log = logging.getLogger(__name__)
+
+        if os.environ.get("PIPELINE_AGENT_P4_ENABLE") != "1":
+            return
+        try:
+            from pipeline_agents import get_agent
+            from pipeline_agents.p4_translation import P4TranslationAgent
+        except ImportError:
+            log.debug("P4TranslationAgent indisponible — pipeline_agents non installé")
+            return
+
+        try:
+            agent = get_agent("p4_translation")
+        except Exception as exc:
+            log.debug("P4TranslationAgent: chargement agent échoué: %s", exc)
+            return
+
+        if not agent.is_available():
+            log.debug("P4TranslationAgent: modèle indisponible, skip")
+            return
+
+        src_lang = str(
+            structure.get("source_lang")
+            or structure.get("lang")
+            or structure.get("source_language")
+            or "en"
+        )
+        max_blocks = max(0, int(os.environ.get("PIPELINE_AGENT_P4_MAX_BLOCKS", "8")))
+        post_edit_threshold = float(os.environ.get("PIPELINE_AGENT_P4_POST_EDIT_THRESHOLD", "0.5"))
+        untranslated_threshold = float(os.environ.get("PIPELINE_AGENT_P4_UNTRANSLATED_THRESHOLD", "0.3"))
+
+        _skip_roles = {"formula", "code", "code_block", "image", "page_number", "separator"}
+
+        blocks = list(structure.get("blocks") or [])
+        candidates = [
+            b for b in blocks
+            if P4TranslationAgent.needs_validation(b)
+            and str(b.get("role") or "body").lower() not in _skip_roles
+        ]
+        if max_blocks:
+            candidates = candidates[:max_blocks]
+
+        if not candidates:
+            return
+
+        log.info("P4TranslationAgent: validation de %d/%d blocs", len(candidates), len(blocks))
+
+        for block in candidates:
+            input_data = P4TranslationAgent.build_input_from_block(
+                block, source_lang=src_lang, target_lang=tgt_code
+            )
+            if not input_data.get("source") or not input_data.get("translation"):
+                continue
+
+            result = agent.run(input_data)
+            if not result:
+                continue
+
+            score = float(result.get("score") or 0.8)
+            post_edit = result.get("post_edit")
+            untranslated = list(result.get("untranslated") or [])
+            issues = list(result.get("issues") or [])
+
+            block["p4_quality_score"] = score
+            if issues:
+                block["p4_issues"] = issues
+
+            if untranslated and score <= untranslated_threshold:
+                block["p4_likely_untranslated"] = True
+                block["p4_untranslated_segments"] = untranslated
+
+            if score < post_edit_threshold and post_edit:
+                original = input_data.get("translation") or ""
+                block["p4_original_translation"] = original
+                block["translated_text"] = self._normalize_spaces(post_edit)
+                block["p4_post_edited"] = True
+                log.debug(
+                    "P4TranslationAgent: post-edit appliqué (score=%.2f) bloc '%s'",
+                    score, block.get("id") or "?",
+                )
 
     def _normalize_span_style(self, span, role="body"):
         st = span.get("style")

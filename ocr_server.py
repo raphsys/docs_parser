@@ -2506,6 +2506,127 @@ def _llm_postprocess_blocks(blocks: list) -> None:
             _apply_hyphen_joins(block, hyphen_joins)
 
 
+def _p1_agent_postprocess_blocks(blocks: list) -> None:
+    """Post-traitement des blocs via P1ExtractionAgent (pipeline_agents).
+
+    Alternative provider-agnostique à _llm_postprocess_blocks(). Activé par
+    PIPELINE_AGENT_P1_ENABLE=1. Utilise le même jeu de fonctions d'application
+    (_apply_llm_corrections, _apply_llm_layout_mode, _apply_hyphen_joins).
+    """
+    log = logging.getLogger(__name__)
+    try:
+        from pipeline_agents import get_agent
+        from pipeline_agents.p1_extraction import P1ExtractionAgent
+    except ImportError:
+        log.debug("P1ExtractionAgent indisponible — pipeline_agents non installé")
+        return
+
+    threshold = float(os.environ.get("PIPELINE_AGENT_P1_THRESHOLD", "0.25"))
+    max_blocks = max(0, int(os.environ.get("PIPELINE_AGENT_P1_MAX_BLOCKS", "5")))
+
+    try:
+        agent = get_agent("p1_extraction")
+    except Exception as exc:
+        log.debug("P1ExtractionAgent: impossible de charger l'agent: %s", exc)
+        return
+
+    if not agent.is_available():
+        log.debug("P1ExtractionAgent: modèle indisponible, skip")
+        return
+
+    scored = [
+        (P1ExtractionAgent.score_block(b), b)
+        for b in (blocks or [])
+    ]
+    ambiguous = [
+        (score, block) for score, block in scored
+        if score >= threshold
+    ]
+    if not ambiguous:
+        log.debug(
+            "P1ExtractionAgent: 0/%d blocs atteignent le seuil %.2f",
+            len(blocks or []), threshold,
+        )
+        return
+    if max_blocks:
+        ambiguous = sorted(ambiguous, key=lambda item: item[0], reverse=True)[:max_blocks]
+
+    log.info("P1ExtractionAgent: %d/%d blocs ambigus", len(ambiguous), len(blocks or []))
+    for _score, block in ambiguous:
+        lines = block.get("lines") or []
+        input_data = {
+            "role": str(block.get("role") or "body"),
+            "lines": [
+                {
+                    "i": int(ln.get("line_index", idx) or idx),
+                    "t": str(ln.get("line_text") or ln.get("text") or "").strip()[:80],
+                    "bb": list(ln.get("bbox") or [0, 0, 0, 0]),
+                }
+                for idx, ln in enumerate(lines[:12])
+                if isinstance(ln, dict)
+            ],
+        }
+        hs = [
+            {
+                "li": [int(x) for x in (sp.get("line_indices") or [])[:4]],
+                "t": str(sp.get("text") or sp.get("texte") or "")[:90],
+                "r": str(sp.get("sentence_end_reason") or ""),
+            }
+            for sp in (block.get("semantic_phrases") or [])[:8]
+            if isinstance(sp, dict) and str(sp.get("text") or sp.get("texte") or "").strip()
+        ]
+        if hs:
+            input_data["hs"] = hs
+
+        result = agent.run(input_data)
+        if not result:
+            continue
+
+        corrections = result.get("c") or []
+        sentence_boundaries = result.get("sb") or []
+        line_boundaries = result.get("lb") or []
+        layout_mode = result.get("lm") if isinstance(result.get("lm"), dict) else None
+        hyphen_joins = result.get("hj") or []
+
+        if not any([corrections, sentence_boundaries, line_boundaries, layout_mode, hyphen_joins]):
+            log.debug(
+                "P1ExtractionAgent: bloc '%s' → corrections vides",
+                block.get("id") or block.get("unit_id") or "?",
+            )
+            continue
+
+        if layout_mode:
+            _apply_llm_layout_mode(block, layout_mode)
+        if corrections or sentence_boundaries or line_boundaries:
+            heuristic_phrases = copy.deepcopy(block.get("semantic_phrases") or [])
+            _apply_llm_corrections(
+                block,
+                corrections,
+                sentence_boundaries=sentence_boundaries,
+                line_boundaries=line_boundaries,
+            )
+            corrected_phrases = block.get("semantic_phrases") or []
+            if _llm_semantic_phrases_are_quality_regression(heuristic_phrases, corrected_phrases):
+                block["semantic_phrases"] = heuristic_phrases
+                block["semantic_phrase_count"] = len(heuristic_phrases)
+                block.pop("llm_corrected", None)
+                block["llm_correction_rejected"] = "semantic_phrase_quality_regression"
+        if hyphen_joins:
+            _apply_hyphen_joins(block, hyphen_joins)
+
+
+def _postprocess_blocks_semantic(blocks: list) -> None:
+    """Dispatche vers P1ExtractionAgent ou llm_semantic_corrector selon l'environnement.
+
+    Utiliser PIPELINE_AGENT_P1_ENABLE=1 pour activer l'agent open-source.
+    Par défaut, utilise llm_semantic_corrector (comportement existant).
+    """
+    if os.environ.get("PIPELINE_AGENT_P1_ENABLE") == "1":
+        _p1_agent_postprocess_blocks(blocks)
+    else:
+        _llm_postprocess_blocks(blocks)
+
+
 def _semantic_span_style_signature(span):
     style = span.get("style") if isinstance(span.get("style"), dict) else {}
     flags = style.get("flags") if isinstance(style.get("flags"), dict) else {}
@@ -4562,7 +4683,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     final_blocks = _postprocess_blocks(final_blocks, img.width, img.height)
     _enrich_layout_markers(final_blocks)
     _build_semantic_phrases_for_blocks(final_blocks)
-    _llm_postprocess_blocks(final_blocks)
+    _postprocess_blocks_semantic(final_blocks)
     _annotate_translation_contracts(final_blocks)
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
@@ -4584,7 +4705,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     # Ensure layout markers and semantic phrases remain present after style profiling transforms.
     _enrich_layout_markers(final_blocks)
     _build_semantic_phrases_for_blocks(final_blocks)
-    _llm_postprocess_blocks(final_blocks)
+    _postprocess_blocks_semantic(final_blocks)
     _annotate_translation_contracts(final_blocks)
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
@@ -4737,7 +4858,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         page_structure["extraction_postprocess"] = postprocess_info
         _enrich_layout_markers(page_structure.get("blocks", []))
         _build_semantic_phrases_for_blocks(page_structure.get("blocks", []))
-        _llm_postprocess_blocks(page_structure.get("blocks", []))
+        _postprocess_blocks_semantic(page_structure.get("blocks", []))
         _annotate_translation_contracts(page_structure.get("blocks", []), page_context=page_structure)
         _build_semantic_spans_for_blocks(page_structure.get("blocks", []))
         _build_semantic_runs_for_blocks(page_structure.get("blocks", []))
@@ -4895,7 +5016,7 @@ async def perform_ocr(file: UploadFile = File(...), force_ai: bool = False, font
             blocks = structure.get("blocks", []) or []
             _enrich_layout_markers(blocks)
             _build_semantic_phrases_for_blocks(blocks)
-            _llm_postprocess_blocks(blocks)
+            _postprocess_blocks_semantic(blocks)
             _annotate_translation_contracts(blocks, page_context=structure)
             _build_semantic_spans_for_blocks(blocks)
             _build_semantic_runs_for_blocks(blocks)

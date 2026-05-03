@@ -774,3 +774,135 @@ class TestP5IntegrationWithReconstructor:
         profile = rec.compute_block_semantic_profile(block, page_data=None)
         assert profile is not None
         assert profile.render_strategy == "prose_reflow"
+
+
+# ---------------------------------------------------------------------------
+# Tests intégration P1ExtractionAgent ↔ ocr_server._postprocess_blocks_semantic
+# ---------------------------------------------------------------------------
+
+class TestP1IntegrationWithOcrServer:
+    """
+    Teste _postprocess_blocks_semantic et _p1_agent_postprocess_blocks
+    dans ocr_server.py via mock agent.
+    """
+
+    def setup_method(self):
+        import importlib
+        import ocr_server as ocr_mod
+        importlib.reload(ocr_mod)
+        self.ocr = ocr_mod
+        AgentRegistry.clear_instances()
+
+    def _simple_block(self, role: str = "body", lines: list | None = None) -> dict:
+        if lines is None:
+            lines = [
+                {"line_index": 0, "line_text": "The algorithm is guaran-", "bbox": [10, 10, 200, 25]},
+                {"line_index": 1, "line_text": "teed to converge eventually.", "bbox": [10, 30, 200, 45]},
+            ]
+        return {
+            "id": "b0",
+            "role": role,
+            "bbox": [10, 10, 200, 50],
+            "lines": lines,
+            "semantic_phrases": [{"text": "The algorithm is guaranteed to converge eventually.", "sentence_end_reason": "eof"}],
+        }
+
+    def _inject_p1_agent(self, ai_response: dict):
+        """Injecte un agent P1 mock dans le registre."""
+        agent = P1ExtractionAgent(_MockRuntime(ai_response))
+        AgentRegistry._instances["p1_extraction|phi35|auto"] = agent
+        return agent
+
+    def test_dispatcher_uses_llm_corrector_by_default(self, monkeypatch):
+        """Sans PIPELINE_AGENT_P1_ENABLE, le dispatcher appelle _llm_postprocess_blocks."""
+        called = {"llm": 0, "p1": 0}
+        monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
+        monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
+        monkeypatch.delenv("PIPELINE_AGENT_P1_ENABLE", raising=False)
+        self.ocr._postprocess_blocks_semantic([])
+        assert called["llm"] == 1
+        assert called["p1"] == 0
+
+    def test_dispatcher_uses_p1_agent_when_enabled(self, monkeypatch):
+        """Avec PIPELINE_AGENT_P1_ENABLE=1, le dispatcher appelle _p1_agent_postprocess_blocks."""
+        called = {"llm": 0, "p1": 0}
+        monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
+        monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
+        monkeypatch.setenv("PIPELINE_AGENT_P1_ENABLE", "1")
+        self.ocr._postprocess_blocks_semantic([])
+        assert called["llm"] == 0
+        assert called["p1"] == 1
+
+    def test_p1_agent_applies_heading_correction(self, monkeypatch):
+        """Un agent P1 qui retourne heading doit modifier semantic_phrases du bloc."""
+        monkeypatch.setenv("PIPELINE_AGENT_P1_ENABLE", "1")
+        monkeypatch.setenv("PIPELINE_AGENT_P1_THRESHOLD", "0.0")  # seuil=0 → tous les blocs
+        self._inject_p1_agent({
+            "c": [{"li": [0], "a": "heading"}],
+            "sb": [], "lb": [], "lm": None, "hj": []
+        })
+        block = self._simple_block()
+        # Pré-condition : semantic_phrases existantes sans heading_line
+        assert not any(
+            sp.get("sentence_end_reason") == "heading_line"
+            for sp in block.get("semantic_phrases", [])
+        )
+        self.ocr._p1_agent_postprocess_blocks([block])
+        reasons = {sp.get("sentence_end_reason") for sp in block.get("semantic_phrases", [])}
+        assert "heading_line" in reasons
+
+    def test_p1_agent_applies_hyphen_join(self, monkeypatch):
+        """Un agent P1 qui retourne hj doit corriger le tiret de césure dans les lignes."""
+        monkeypatch.setenv("PIPELINE_AGENT_P1_THRESHOLD", "0.0")
+        self._inject_p1_agent({
+            "c": [], "sb": [], "lb": [], "lm": None,
+            "hj": [{"i": 0, "w": "guaranteed"}]
+        })
+        block = self._simple_block()
+        self.ocr._p1_agent_postprocess_blocks([block])
+        # La ligne 0 doit avoir le mot complet dans line_text (guaran- → guaranteed)
+        line_0 = next(
+            ln for ln in block.get("lines", [])
+            if int(ln.get("line_index", -1)) == 0
+        )
+        assert "guaranteed" in line_0.get("line_text", "")
+        assert "guaran-" not in line_0.get("line_text", "")
+
+    def test_p1_agent_skips_block_below_threshold(self, monkeypatch):
+        """Un bloc dont le score est sous le seuil ne doit pas être traité."""
+        monkeypatch.setenv("PIPELINE_AGENT_P1_THRESHOLD", "0.99")  # seuil très élevé
+        call_count = {"n": 0}
+
+        class CountingAgent(P1ExtractionAgent):
+            def run(self, input_data, **kw):
+                call_count["n"] += 1
+                return {}
+
+        AgentRegistry._instances["p1_extraction|phi35|auto"] = CountingAgent(_MockRuntime({}))
+        block = self._simple_block()
+        # bloc normal sans signal fort → score faible → doit être skipé
+        block["lines"] = [{"line_index": 0, "line_text": "This is normal long text prose.", "bbox": [10, 10, 200, 25]}]
+        block["semantic_phrases"] = [{"text": "This is normal long text prose.", "sentence_end_reason": "eof"}]
+        self.ocr._p1_agent_postprocess_blocks([block])
+        assert call_count["n"] == 0
+
+    def test_p1_agent_rejects_regression(self, monkeypatch):
+        """Si les corrections régressent la qualité, les phrases heuristiques sont restaurées."""
+        monkeypatch.setenv("PIPELINE_AGENT_P1_THRESHOLD", "0.0")
+        # Agent qui marque toutes les lignes comme "skip" → résultat vide → régression
+        self._inject_p1_agent({
+            "c": [],  # rejeté par parse (all-skip) → pas de corrections
+            "sb": [], "lb": [], "lm": None, "hj": []
+        })
+        block = self._simple_block()
+        original_phrases = list(block.get("semantic_phrases", []))
+        self.ocr._p1_agent_postprocess_blocks([block])
+        # Sans corrections, les phrases originales doivent être conservées
+        assert block.get("semantic_phrases") == original_phrases
+
+    def test_p1_agent_unavailable_is_silent(self, monkeypatch):
+        """Si l'agent est indisponible, _p1_agent_postprocess_blocks ne lève pas."""
+        AgentRegistry._instances["p1_extraction|phi35|auto"] = P1ExtractionAgent(_UnavailableRuntime())
+        block = self._simple_block()
+        # Ne doit pas lever d'exception
+        self.ocr._p1_agent_postprocess_blocks([block])

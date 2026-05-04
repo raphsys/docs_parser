@@ -3925,7 +3925,13 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         )
         if profile is not None and profile.source_is_translated and not _units_have_mixed_style_fragments:
             strategy = profile.render_strategy
+            # Pour les blocs positionnels (anchored_text / fixed_preserve), on ne reflow jamais :
+            # le texte traduit doit rester à la position exacte du source (TOC, étiquettes, etc.)
+            _src_rp = str((plan.source_block or {}).get("render_policy") or "").strip().lower()
+            _is_anchored = _src_rp in {"anchored_text", "fixed_preserve"}
             if strategy in ("prose_reflow", "heading_reflow", "caption_reflow"):
+                if _is_anchored:
+                    return self._render_label_stack(page, plan)
                 return self._render_prose_reflow(page, plan)
             if strategy == "label_stack":
                 return self._render_label_stack(page, plan)

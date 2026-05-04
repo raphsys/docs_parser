@@ -7,17 +7,21 @@ Cet agent analyse les blocs de texte extraits par OCR et détermine :
 - Le mode de mise en page (inline_reflow, preserve_line_breaks, …)
 - Les jointures de mots coupés par césure (hj)
 
-Il délègue au corrector existant (llm_semantic_corrector) pour la compatibilité
-ascendante, mais peut aussi être utilisé directement.
+Backends : PIPELINE_AGENT_P1_BACKEND=heuristic (défaut) | llm
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from typing import Any
 
 from .base import ModelRuntime, PipelineAgent, _extract_json
+from .heuristics import P1HeuristicEstimator
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,9 @@ class P1ExtractionAgent(PipelineAgent):
     """
     Agent P1 : classification structurelle des blocs OCR.
 
+    Par défaut utilise P1HeuristicEstimator (sans modèle, < 1 ms/bloc).
+    Passer PIPELINE_AGENT_P1_BACKEND=llm pour le chemin LLM (phi35).
+
     Entrée (``input_data``) :
     ```json
     {
@@ -101,6 +108,25 @@ class P1ExtractionAgent(PipelineAgent):
     stage = "p1_extraction"
     prompt_version = "v1"
     default_max_new_tokens = 200
+
+    def __init__(self, runtime: ModelRuntime) -> None:
+        super().__init__(runtime)
+        self._heuristic = P1HeuristicEstimator()
+        self._backend = os.environ.get("PIPELINE_AGENT_P1_BACKEND", "heuristic").lower()
+
+    def is_available(self) -> bool:
+        if self._backend == "llm":
+            return self.runtime.is_available()
+        return True
+
+    def run(self, input_data: dict, *, use_cache: bool = True) -> dict:
+        if self._backend == "llm":
+            return super().run(input_data, use_cache=use_cache)
+        try:
+            return self._heuristic.estimate(input_data)
+        except Exception as exc:
+            logger.debug("[p1_extraction/heuristic] échec: %s", exc)
+            return {"c": [], "sb": [], "lb": [], "lm": None, "hj": []}
 
     def build_messages(self, input_data: dict) -> list[dict]:
         block_json = json.dumps(input_data, ensure_ascii=False, separators=(",", ":"))

@@ -12,8 +12,13 @@ Détermine pour chaque bloc le mode de mise en page optimal :
 from __future__ import annotations
 
 import json
+import logging
+import os
 
 from .base import ModelRuntime, PipelineAgent, _extract_json
+from .heuristics import P3HeuristicEstimator
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """\
@@ -88,6 +93,25 @@ class P3LayoutAgent(PipelineAgent):
         "fixed_lines",
         "column_layout",
     }
+
+    def __init__(self, runtime: ModelRuntime) -> None:
+        super().__init__(runtime)
+        self._heuristic = P3HeuristicEstimator()
+        self._backend = os.environ.get("PIPELINE_AGENT_P3_BACKEND", "heuristic").lower()
+
+    def is_available(self) -> bool:
+        if self._backend == "llm":
+            return self.runtime.is_available()
+        return True
+
+    def run(self, input_data: dict, *, use_cache: bool = True) -> dict:
+        if self._backend == "llm":
+            return super().run(input_data, use_cache=use_cache)
+        try:
+            return self._heuristic.estimate(input_data)
+        except Exception as exc:
+            logger.debug("[p3_layout/heuristic] échec: %s", exc)
+            return {"layout_mode": "inline_reflow", "confidence": 0.3, "notes": "default"}
 
     def build_messages(self, input_data: dict) -> list[dict]:
         block_json = json.dumps(input_data, ensure_ascii=False, separators=(",", ":"))

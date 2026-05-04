@@ -15,9 +15,14 @@ C'est l'agent le plus impactant du pipeline : il pilote `reconstructor.py`.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from typing import Any
 
 from .base import ModelRuntime, PipelineAgent, _extract_json
+from .heuristics import P5HeuristicEstimator
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """\
@@ -108,6 +113,25 @@ class P5RenderAgent(PipelineAgent):
     stage = "p5_render"
     prompt_version = "v1"
     default_max_new_tokens = 120
+
+    def __init__(self, runtime: ModelRuntime) -> None:
+        super().__init__(runtime)
+        self._heuristic = P5HeuristicEstimator()
+        self._backend = os.environ.get("PIPELINE_AGENT_P5_BACKEND", "heuristic").lower()
+
+    def is_available(self) -> bool:
+        if self._backend == "llm":
+            return self.runtime.is_available()
+        return True
+
+    def run(self, input_data: dict, *, use_cache: bool = True) -> dict:
+        if self._backend == "llm":
+            return super().run(input_data, use_cache=use_cache)
+        try:
+            return self._heuristic.estimate(input_data)
+        except Exception as exc:
+            logger.debug("[p5_render/heuristic] échec: %s", exc)
+            return {"strategy": "prose_reflow", "confidence": 0.4, "params": {}, "reason": "default"}
 
     def build_messages(self, input_data: dict) -> list[dict]:
         block_json = json.dumps(input_data, ensure_ascii=False, separators=(",", ":"))

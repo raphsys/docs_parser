@@ -142,7 +142,9 @@ class TestModelRuntime:
 
 class TestP1ExtractionAgent:
     def _agent(self, response: dict) -> P1ExtractionAgent:
-        return P1ExtractionAgent(_MockRuntime(response))
+        agent = P1ExtractionAgent(_MockRuntime(response))
+        agent._backend = "llm"
+        return agent
 
     def test_parse_heading(self):
         agent = self._agent({
@@ -221,6 +223,7 @@ class TestP1ExtractionAgent:
 
     def test_unavailable_runtime_returns_empty(self):
         agent = P1ExtractionAgent(_UnavailableRuntime())
+        agent._backend = "llm"
         result = agent.run({"role": "body", "lines": []})
         assert result == {}
 
@@ -309,7 +312,9 @@ class TestP2StructureAgent:
 
 class TestP3LayoutAgent:
     def _agent(self, response: dict) -> P3LayoutAgent:
-        return P3LayoutAgent(_MockRuntime(response))
+        agent = P3LayoutAgent(_MockRuntime(response))
+        agent._backend = "llm"
+        return agent
 
     def test_parse_inline_reflow(self):
         agent = self._agent({"layout_mode": "inline_reflow", "confidence": 0.92, "notes": "prose"})
@@ -431,7 +436,9 @@ class TestP4TranslationAgent:
 
 class TestP5RenderAgent:
     def _agent(self, response: dict) -> P5RenderAgent:
-        return P5RenderAgent(_MockRuntime(response))
+        agent = P5RenderAgent(_MockRuntime(response))
+        agent._backend = "llm"
+        return agent
 
     def test_parse_prose_reflow(self):
         agent = self._agent({
@@ -513,7 +520,9 @@ class TestP5RenderAgent:
 
 class TestP6BackgroundAgent:
     def _agent(self, response: dict) -> P6BackgroundAgent:
-        return P6BackgroundAgent(_MockRuntime(response))
+        agent = P6BackgroundAgent(_MockRuntime(response))
+        agent._backend = "llm"
+        return agent
 
     def test_parse_clean_background(self):
         agent = self._agent({"quality": 0.95, "artifacts": [], "reprocess": [], "ok": True})
@@ -617,6 +626,7 @@ class TestAgentRegistry:
 
     def test_unavailable_agent_run_returns_empty(self):
         agent = P5RenderAgent(_UnavailableRuntime())
+        agent._backend = "llm"
         result = agent.run({"role": "body"})
         assert result == {}
 
@@ -661,6 +671,7 @@ class TestP5IntegrationWithReconstructor:
             "params": {},
             "reason": "test",
         }))
+        agent._backend = "llm"
         reconstructor._render_agent = agent
         reconstructor._render_agent_loaded = True
 
@@ -813,6 +824,7 @@ class TestP1IntegrationWithOcrServer:
     def _inject_p1_agent(self, ai_response: dict):
         """Injecte un agent P1 mock dans le registre."""
         agent = P1ExtractionAgent(_MockRuntime(ai_response))
+        agent._backend = "llm"
         AgentRegistry._instances["p1_extraction|phi35|auto"] = agent
         return agent
 
@@ -905,7 +917,9 @@ class TestP1IntegrationWithOcrServer:
 
     def test_p1_agent_unavailable_is_silent(self, monkeypatch):
         """Si l'agent est indisponible, _p1_agent_postprocess_blocks ne lève pas."""
-        AgentRegistry._instances["p1_extraction|phi35|auto"] = P1ExtractionAgent(_UnavailableRuntime())
+        agent = P1ExtractionAgent(_UnavailableRuntime())
+        agent._backend = "llm"
+        AgentRegistry._instances["p1_extraction|phi35|auto"] = agent
         block = self._simple_block()
         # Ne doit pas lever d'exception
         self.ocr._p1_agent_postprocess_blocks([block])
@@ -1191,9 +1205,11 @@ class TestP3IntegrationWithStructureExtractor:
         assert b["source_layout_mode"] == original_slm
 
     def test_unavailable_agent_is_silent(self, monkeypatch):
-        """Si l'agent est indisponible, aucune exception n'est levée."""
+        """Si l'agent est indisponible (backend LLM), aucune exception n'est levée."""
         monkeypatch.setenv("PIPELINE_AGENT_P3_ENABLE", "1")
-        AgentRegistry._instances["p3_layout|phi35|auto"] = P3LayoutAgent(_UnavailableRuntime())
+        agent = P3LayoutAgent(_UnavailableRuntime())
+        agent._backend = "llm"
+        AgentRegistry._instances["p3_layout|phi35|auto"] = agent
         b = self._block()
         self._builder()._p3_annotate_layout_modes(self._page(b))
         assert "p3_confidence" not in (b.get("source_layout_mode") or {})
@@ -1313,9 +1329,11 @@ class TestP6IntegrationWithOcrServer:
         assert len(received.get("inpaint_regions", [])) == 1
 
     def test_unavailable_agent_returns_empty(self, monkeypatch):
-        """Si l'agent est indisponible, retourne {}."""
+        """Si l'agent est indisponible (backend LLM), retourne {}."""
         monkeypatch.setenv("PIPELINE_AGENT_P6_ENABLE", "1")
-        AgentRegistry._instances["p6_background|phi35|auto"] = P6BackgroundAgent(_UnavailableRuntime())
+        agent = P6BackgroundAgent(_UnavailableRuntime())
+        agent._backend = "llm"
+        AgentRegistry._instances["p6_background|phi35|auto"] = agent
         result = self._call()
         assert result == {}
 
@@ -1524,3 +1542,263 @@ class TestP4TranslationAgentHeuristic:
         result = agent.run({})
         # LLM path : retourne la réponse du mock
         assert result.get("score") == pytest.approx(0.9)
+
+
+# ---------------------------------------------------------------------------
+# Tests heuristics.py — P1, P3, P5, P6
+# ---------------------------------------------------------------------------
+
+from pipeline_agents.heuristics import (
+    P1HeuristicEstimator,
+    P3HeuristicEstimator,
+    P5HeuristicEstimator,
+    P6HeuristicEstimator,
+)
+
+
+class TestP1HeuristicEstimator:
+    def setup_method(self):
+        self.est = P1HeuristicEstimator()
+
+    def _est(self, role="body", lines=None):
+        texts = lines or []
+        return self.est.estimate({
+            "role": role,
+            "lines": [{"t": t} for t in texts],
+        })
+
+    def test_empty_lines_returns_empty(self):
+        r = self._est(lines=[])
+        assert r == {"c": [], "sb": [], "lb": [], "lm": None, "hj": []}
+
+    def test_always_available(self):
+        assert self.est.is_available() is True
+
+    def test_heading_chapter_detected(self):
+        r = self._est(lines=["Chapter 3 Neural Networks"])
+        headings = [c for c in r["c"] if c["a"] == "heading"]
+        assert headings
+
+    def test_section_number_detected(self):
+        r = self._est(lines=["3.2 Gradient Descent"])
+        headings = [c for c in r["c"] if c["a"] == "heading"]
+        assert headings
+
+    def test_page_number_skipped(self):
+        r = self._est(lines=["42"])
+        skips = [c for c in r["c"] if c["a"] == "skip"]
+        assert skips
+
+    def test_figure_caption_atomic(self):
+        r = self._est(lines=["Figure 3.1", "Comparison of CNN architectures"])
+        atomics = [c for c in r["c"] if c["a"] == "atomic"]
+        assert atomics
+        assert len(atomics[0]["li"]) == 2
+
+    def test_table_caption_atomic(self):
+        r = self._est(lines=["Table 2", "Results on benchmark dataset", "showing accuracy"])
+        atomics = [c for c in r["c"] if c["a"] == "atomic"]
+        assert atomics
+
+    def test_hyphen_break_detected(self):
+        r = self._est(lines=["The algorithm is guaran-", "teed to converge."])
+        assert any("guaran" in h["w"] for h in r["hj"])
+
+    def test_no_hyphen_break_for_compound_word(self):
+        # Ligne qui finit par un mot complet (pas de césure)
+        r = self._est(lines=["Well-designed systems", "perform reliably."])
+        assert r["hj"] == []
+
+    def test_list_lines_get_preserve_breaks(self):
+        r = self._est(lines=["1. Load data", "2. Preprocess", "3. Train model"])
+        if r["lm"]:
+            assert r["lm"]["line_flow"] in {"preserve_line_breaks", "inline_reflow"}
+
+    def test_prose_lines_get_inline_reflow(self):
+        r = self._est(lines=[
+            "Neural networks learn hierarchical",
+            "feature representations from raw data.",
+        ])
+        if r["lm"]:
+            assert r["lm"]["line_flow"] in {"inline_reflow", "preserve_line_breaks"}
+
+    def test_schema_always_complete(self):
+        r = self._est(lines=["Some text here."])
+        for key in ("c", "sb", "lb", "lm", "hj"):
+            assert key in r
+
+    def test_all_digits_classified_as_skip(self):
+        # Les lignes purement numériques courtes sont légitimement classifiées "skip"
+        r = self._est(lines=["1", "2", "3"])
+        assert all(c["a"] == "skip" for c in r["c"])
+
+
+class TestP3HeuristicEstimator:
+    def setup_method(self):
+        self.est = P3HeuristicEstimator()
+
+    def _est(self, role="body", avg_words=5.0, has_indent=False, lines=None):
+        return self.est.estimate({
+            "role": role,
+            "avg_words_per_line": avg_words,
+            "has_indent": has_indent,
+            "lines": lines or [],
+        })
+
+    def test_always_available(self):
+        assert self.est.is_available() is True
+
+    def test_formula_role_fixed_lines(self):
+        r = self._est(role="formula")
+        assert r["layout_mode"] == "fixed_lines"
+        assert r["confidence"] >= 0.90
+
+    def test_high_avg_words_inline_reflow(self):
+        r = self._est(avg_words=9.0)
+        assert r["layout_mode"] == "inline_reflow"
+        assert r["confidence"] >= 0.70
+
+    def test_low_avg_words_preserve_breaks(self):
+        r = self._est(avg_words=2.0)
+        assert r["layout_mode"] == "preserve_line_breaks"
+        assert r["confidence"] >= 0.80
+
+    def test_list_lines_preserve_breaks(self):
+        r = self._est(lines=["1. Step one", "2. Step two", "3. Step three"])
+        assert r["layout_mode"] == "preserve_line_breaks"
+
+    def test_code_lines_fixed(self):
+        r = self._est(lines=["x = 2.5", "y = x + 1", "z = y * 2"])
+        assert r["layout_mode"] == "fixed_lines"
+
+    def test_indent_paragraphs(self):
+        r = self._est(avg_words=5.0, has_indent=True)
+        assert r["layout_mode"] in {"preserve_paragraphs", "inline_reflow"}
+
+    def test_schema_complete(self):
+        r = self._est()
+        for key in ("layout_mode", "confidence", "notes"):
+            assert key in r
+        assert 0.0 <= r["confidence"] <= 1.0
+        assert r["layout_mode"] in P3LayoutAgent._VALID_MODES
+
+
+class TestP5HeuristicEstimator:
+    def setup_method(self):
+        self.est = P5HeuristicEstimator()
+
+    def _est(self, role="body", line_count=3, avg_words=6.0, is_column=False):
+        return self.est.estimate({
+            "role": role,
+            "line_count": line_count,
+            "avg_words_per_line": avg_words,
+            "is_column_shape": is_column,
+        })
+
+    def test_always_available(self):
+        assert self.est.is_available() is True
+
+    def test_formula_bitmap_preserve(self):
+        r = self._est(role="formula")
+        assert r["strategy"] == "bitmap_preserve"
+        assert r["confidence"] >= 0.95
+
+    def test_page_number_fixed_preserve(self):
+        r = self._est(role="page_number")
+        assert r["strategy"] == "fixed_preserve"
+
+    def test_heading_heading_reflow(self):
+        r = self._est(role="heading", line_count=1, avg_words=4.0)
+        assert r["strategy"] == "heading_reflow"
+
+    def test_caption_caption_reflow(self):
+        r = self._est(role="caption")
+        assert r["strategy"] == "caption_reflow"
+
+    def test_prose_body_prose_reflow(self):
+        r = self._est(role="body", line_count=5, avg_words=8.0)
+        assert r["strategy"] == "prose_reflow"
+
+    def test_short_lines_label_stack(self):
+        r = self._est(role="body", line_count=4, avg_words=2.5)
+        assert r["strategy"] == "label_stack"
+
+    def test_column_shape_label_stack(self):
+        r = self._est(role="body", avg_words=6.0, is_column=True)
+        assert r["strategy"] == "label_stack"
+
+    def test_justify_true_for_long_blocks(self):
+        r = self._est(role="body", line_count=4, avg_words=7.0)
+        assert r["strategy"] == "prose_reflow"
+        assert r["params"].get("justify") is True
+
+    def test_schema_complete(self):
+        r = self._est()
+        for key in ("strategy", "confidence", "params", "reason"):
+            assert key in r
+        assert 0.0 <= r["confidence"] <= 1.0
+        assert isinstance(r["params"], dict)
+
+
+class TestP6HeuristicEstimator:
+    def setup_method(self):
+        self.est = P6HeuristicEstimator()
+
+    def _est(self, avg_conf=0.90, coverage=0.3, blocks_removed=3, regions=None):
+        return self.est.estimate({
+            "avg_confidence": avg_conf,
+            "coverage_ratio": coverage,
+            "blocks_removed": blocks_removed,
+            "inpaint_regions": regions or [],
+        })
+
+    def test_always_available(self):
+        assert self.est.is_available() is True
+
+    def test_high_confidence_ok(self):
+        r = self._est(avg_conf=0.92)
+        assert r["quality"] >= 0.85
+        assert r["ok"] is True
+        assert r["artifacts"] == []
+
+    def test_low_confidence_not_ok(self):
+        r = self._est(avg_conf=0.40, regions=[[10, 20, 100, 40]])
+        assert r["quality"] < 0.60
+        assert r["ok"] is False
+        assert len(r["artifacts"]) > 0
+
+    def test_high_severity_below_threshold(self):
+        r = self._est(avg_conf=0.40, regions=[[10, 20, 100, 40]])
+        assert any(a["severity"] == "high" for a in r["artifacts"])
+
+    def test_medium_severity_between_thresholds(self):
+        r = self._est(avg_conf=0.55, regions=[[10, 20, 100, 40]])
+        assert any(a["severity"] == "medium" for a in r["artifacts"])
+
+    def test_many_blocks_low_conf_penalized(self):
+        r_few = self._est(avg_conf=0.65, blocks_removed=3)
+        r_many = self._est(avg_conf=0.65, blocks_removed=10)
+        assert r_many["quality"] <= r_few["quality"]
+
+    def test_high_coverage_slight_penalty(self):
+        r_normal = self._est(avg_conf=0.90, coverage=0.40)
+        r_high = self._est(avg_conf=0.90, coverage=0.90)
+        assert r_high["quality"] <= r_normal["quality"]
+
+    def test_reprocess_matches_artifact_regions(self):
+        r = self._est(avg_conf=0.40, regions=[[10, 20, 100, 40], [50, 60, 200, 80]])
+        assert len(r["reprocess"]) == len(r["artifacts"])
+
+    def test_schema_complete(self):
+        r = self._est()
+        for key in ("quality", "artifacts", "reprocess", "ok"):
+            assert key in r
+        assert 0.0 <= r["quality"] <= 1.0
+        assert isinstance(r["artifacts"], list)
+        assert isinstance(r["reprocess"], list)
+        assert isinstance(r["ok"], bool)
+
+    def test_quality_always_in_range(self):
+        for conf in [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]:
+            r = self._est(avg_conf=conf)
+            assert 0.0 <= r["quality"] <= 1.0

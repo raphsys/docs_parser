@@ -288,7 +288,7 @@ class ModelRuntime:
         tok = pipe["tokenizer"]
 
         # Rendu du prompt
-        max_in = int(os.environ.get("PIPELINE_AGENT_MAX_INPUT_TOKENS", "512"))
+        max_in = int(os.environ.get("PIPELINE_AGENT_MAX_INPUT_TOKENS", "1024"))
         if hasattr(tok, "apply_chat_template"):
             if backend == "ct2":
                 input_ids = tok.apply_chat_template(

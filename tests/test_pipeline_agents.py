@@ -20,6 +20,7 @@ from pipeline_agents.p1_extraction import P1ExtractionAgent
 from pipeline_agents.p2_structure import P2StructureAgent
 from pipeline_agents.p3_layout import P3LayoutAgent
 from pipeline_agents.p4_translation import P4TranslationAgent
+from pipeline_agents.p4_qe_estimator import HeuristicQEEstimator
 from pipeline_agents.p5_render import P5RenderAgent
 from pipeline_agents.p6_background import P6BackgroundAgent
 from pipeline_agents.registry import AgentRegistry, get_agent, list_agents
@@ -358,7 +359,9 @@ class TestP3LayoutAgent:
 
 class TestP4TranslationAgent:
     def _agent(self, response: dict) -> P4TranslationAgent:
-        return P4TranslationAgent(_MockRuntime(response))
+        agent = P4TranslationAgent(_MockRuntime(response))
+        agent._backend = "llm"  # force LLM path pour tester le parser LLM
+        return agent
 
     def test_parse_good_translation(self):
         agent = self._agent({"score": 0.95, "issues": [], "post_edit": None, "untranslated": []})
@@ -936,6 +939,7 @@ class TestP4IntegrationWithTranslator:
 
     def _inject(self, ai_response: dict):
         agent = P4TranslationAgent(_MockRuntime(ai_response))
+        agent._backend = "llm"  # force LLM path pour tester la logique du translator
         AgentRegistry._instances["p4_translation|phi35|auto"] = agent
         return agent
 
@@ -1057,7 +1061,9 @@ class TestP4IntegrationWithTranslator:
 
     def test_unavailable_agent_is_silent(self, monkeypatch):
         monkeypatch.setenv("PIPELINE_AGENT_P4_ENABLE", "1")
-        AgentRegistry._instances["p4_translation|phi35|auto"] = P4TranslationAgent(_UnavailableRuntime())
+        agent = P4TranslationAgent(_UnavailableRuntime())
+        agent._backend = "llm"  # force LLM path : UnavailableRuntime → is_available()=False
+        AgentRegistry._instances["p4_translation|phi35|auto"] = agent
         b = self._block("Hello.", "Bonjour.")
         self._make_translator()._p4_validate_translations(self._structure(b), "fr")
         assert "p4_quality_score" not in b
@@ -1324,3 +1330,197 @@ class TestP6IntegrationWithOcrServer:
         AgentRegistry._instances["p6_background|phi35|auto"] = CrashingP6(_MockRuntime({}))
         result = self._call()
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Tests HeuristicQEEstimator
+# ---------------------------------------------------------------------------
+
+class TestHeuristicQEEstimator:
+    """Tests unitaires de l'estimateur heuristique de qualité de traduction."""
+
+    def setup_method(self):
+        self.qe = HeuristicQEEstimator()
+
+    def _score(self, src, tr, src_lang="en", tgt_lang="fr"):
+        return self.qe.score(src, tr, src_lang, tgt_lang)
+
+    # Cas nominaux
+    def test_perfect_translation_high_score(self):
+        r = self._score(
+            "The gradient descent algorithm minimizes the loss function.",
+            "L'algorithme de descente de gradient minimise la fonction de perte.",
+        )
+        assert r["score"] >= 0.85
+        assert r["issues"] == []
+        assert r["post_edit"] is None
+
+    def test_empty_translation_zero_score(self):
+        r = self._score("The network learns features.", "")
+        assert r["score"] == 0.0
+        assert any(i["severity"] == "critical" for i in r["issues"])
+        assert r["untranslated"] == ["The network learns features."]
+
+    def test_empty_source_returns_perfect(self):
+        r = self._score("", "Quelque chose.")
+        assert r["score"] == 1.0
+        assert r["issues"] == []
+
+    # Identité source == traduction
+    def test_identical_source_and_translation(self):
+        r = self._score(
+            "Backpropagation computes gradients efficiently.",
+            "Backpropagation computes gradients efficiently.",
+        )
+        assert r["score"] <= 0.20
+        assert any(i["type"] == "omission" for i in r["issues"])
+        assert "Backpropagation computes gradients efficiently." in r["untranslated"]
+
+    # Ratio de longueur
+    def test_very_short_translation_penalized(self):
+        r = self._score("The network learns hierarchical representations.", "Apprend.")
+        assert r["score"] <= 0.80
+        assert any(i["type"] == "omission" for i in r["issues"])
+
+    def test_excessive_length_penalized(self):
+        long_trans = "Le réseau apprend " * 25
+        r = self._score("Networks learn.", long_trans)
+        assert r["score"] <= 0.80
+        assert any(i["type"] == "addition" for i in r["issues"])
+
+    # Détection de segments non traduits
+    def test_untranslated_stopwords_detected(self):
+        src = "The quick brown fox jumps over the lazy dog."
+        # Traduction qui laisse le texte source intact
+        r = self._score(src, src, "en", "fr")
+        assert r["score"] <= 0.20
+
+    def test_partial_translation_penalized(self):
+        src = "The network learns features and this is a test of the system."
+        # Quelques mots FR mais majorité EN stopwords préservés
+        tr = "Le network learns features and this is test système."
+        r = self._score(src, tr)
+        assert r["score"] <= 0.85  # pénalité partielle
+
+    # Détection de mauvaise langue cible
+    def test_english_output_for_french_target_penalized(self):
+        src = "Der Algorithmus lernt Merkmale."
+        # Source: DE, target: FR, mais traduction en EN
+        tr = "The algorithm learns features."
+        r = self._score(src, tr, "de", "fr")
+        assert r["score"] < 0.75
+
+    def test_correct_language_target_not_penalized(self):
+        r = self._score(
+            "The algorithm learns features.",
+            "L'algorithme apprend des caractéristiques.",
+            "en", "fr",
+        )
+        assert r["score"] >= 0.85
+
+    # Cross-lingual terms
+    def test_technical_terms_not_penalized(self):
+        # Termes techniques : learning_rate, GPU, API restent en anglais → OK
+        r = self._score(
+            "Use learning_rate=0.001 and a GPU for training.",
+            "Utilisez learning_rate=0.001 et un GPU pour l'entraînement.",
+        )
+        assert r["score"] >= 0.80
+
+    # Schéma de sortie
+    def test_output_schema_always_complete(self):
+        r = self._score("Hello world.", "Bonjour le monde.")
+        assert "score" in r
+        assert "issues" in r
+        assert "post_edit" in r
+        assert "untranslated" in r
+        assert r["post_edit"] is None
+        assert isinstance(r["issues"], list)
+        assert isinstance(r["untranslated"], list)
+
+    def test_score_always_in_range(self):
+        cases = [
+            ("", ""),
+            ("Hello.", ""),
+            ("Hello.", "Hello."),
+            ("The quick brown fox.", "Le rapide renard brun."),
+            ("x" * 500, "y" * 10),
+        ]
+        for src, tr in cases:
+            r = self._score(src, tr)
+            assert 0.0 <= r["score"] <= 1.0, f"Score hors [0,1] pour src={src!r:.30}, tr={tr!r:.30}"
+
+    # is_available
+    def test_is_always_available(self):
+        assert self.qe.is_available() is True
+
+
+# ---------------------------------------------------------------------------
+# Tests P4TranslationAgent — backend heuristique (défaut)
+# ---------------------------------------------------------------------------
+
+class TestP4TranslationAgentHeuristic:
+    """Teste P4TranslationAgent en mode heuristique (sans modèle LLM)."""
+
+    def _agent(self) -> P4TranslationAgent:
+        agent = P4TranslationAgent(_MockRuntime({}))
+        agent._backend = "heuristic"
+        return agent
+
+    def test_is_always_available(self):
+        agent = self._agent()
+        assert agent.is_available() is True
+
+    def test_heuristic_good_translation(self):
+        agent = self._agent()
+        result = agent.run({
+            "source_lang": "en", "target_lang": "fr",
+            "source": "The gradient descent algorithm minimizes the loss function.",
+            "translation": "L'algorithme de descente de gradient minimise la fonction de perte.",
+        })
+        assert result["score"] >= 0.85
+        assert result["post_edit"] is None
+
+    def test_heuristic_untranslated_detected(self):
+        agent = self._agent()
+        src = "The network learns hierarchical features."
+        result = agent.run({
+            "source_lang": "en", "target_lang": "fr",
+            "source": src,
+            "translation": src,  # identique → non traduit
+        })
+        assert result["score"] <= 0.20
+        assert len(result["untranslated"]) > 0
+
+    def test_heuristic_empty_translation(self):
+        agent = self._agent()
+        result = agent.run({
+            "source_lang": "en", "target_lang": "fr",
+            "source": "The network learns features.",
+            "translation": "",
+        })
+        assert result["score"] == 0.0
+
+    def test_heuristic_does_not_use_runtime(self):
+        """En mode heuristique, runtime.generate() ne doit jamais être appelé."""
+        call_count = {"n": 0}
+        class TrackingRuntime(_MockRuntime):
+            def generate(self, messages, **kw):
+                call_count["n"] += 1
+                return json.dumps({})
+        agent = P4TranslationAgent(TrackingRuntime({}))
+        agent._backend = "heuristic"
+        agent.run({"source": "Hello.", "translation": "Bonjour.", "source_lang": "en", "target_lang": "fr"})
+        assert call_count["n"] == 0
+
+    def test_default_backend_is_heuristic(self, monkeypatch):
+        monkeypatch.delenv("PIPELINE_AGENT_P4_BACKEND", raising=False)
+        agent = P4TranslationAgent(_MockRuntime({}))
+        assert agent._backend == "heuristic"
+
+    def test_llm_backend_via_env(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_AGENT_P4_BACKEND", "llm")
+        agent = P4TranslationAgent(_MockRuntime({"score": 0.9, "issues": [], "post_edit": None, "untranslated": []}))
+        result = agent.run({})
+        # LLM path : retourne la réponse du mock
+        assert result.get("score") == pytest.approx(0.9)

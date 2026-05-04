@@ -6,13 +6,22 @@ Analyse la qualité d'un bloc traduit et propose :
 - Les problèmes détectés (terminologie, cohérence, sens)
 - Une version corrigée si nécessaire (post-édition légère)
 - Le marquage des segments non traduits
+
+Backends disponibles (variable PIPELINE_AGENT_P4_BACKEND) :
+  "heuristic" (défaut) — HeuristicQEEstimator, sans modèle, < 1 ms/bloc
+  "llm"                — phi35 / qwen via ModelRuntime (lent, ~2-5 s/bloc)
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 
 from .base import ModelRuntime, PipelineAgent, _extract_json
+from .p4_qe_estimator import HeuristicQEEstimator
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """\
@@ -55,6 +64,9 @@ class P4TranslationAgent(PipelineAgent):
     """
     Agent P4 : validation qualité et post-édition de traduction.
 
+    Par défaut utilise HeuristicQEEstimator (sans modèle, < 1 ms/bloc).
+    Passer PIPELINE_AGENT_P4_BACKEND=llm pour activer le backend LLM.
+
     Entrée (``input_data``) :
     ```json
     {
@@ -82,6 +94,38 @@ class P4TranslationAgent(PipelineAgent):
 
     _VALID_ISSUE_TYPES = {"terminology", "fluency", "accuracy", "omission", "addition"}
     _VALID_SEVERITIES = {"minor", "major", "critical"}
+
+    def __init__(self, runtime: ModelRuntime) -> None:
+        super().__init__(runtime)
+        self._heuristic_qe = HeuristicQEEstimator()
+        self._backend = os.environ.get("PIPELINE_AGENT_P4_BACKEND", "heuristic").lower()
+
+    # ------------------------------------------------------------------
+    # Surcharge du chemin principal
+
+    def is_available(self) -> bool:
+        if self._backend == "llm":
+            return self.runtime.is_available()
+        return True  # heuristique toujours disponible
+
+    def run(self, input_data: dict, *, use_cache: bool = True) -> dict:
+        if self._backend == "llm":
+            return super().run(input_data, use_cache=use_cache)
+        return self._run_heuristic(input_data)
+
+    def _run_heuristic(self, input_data: dict) -> dict:
+        source = str(input_data.get("source") or "").strip()
+        translation = str(input_data.get("translation") or "").strip()
+        source_lang = str(input_data.get("source_lang") or "en").lower()
+        target_lang = str(input_data.get("target_lang") or "fr").lower()
+        try:
+            return self._heuristic_qe.score(source, translation, source_lang, target_lang)
+        except Exception as exc:
+            logger.debug("[p4_translation/heuristic] échec: %s", exc)
+            return {"score": 0.8, "issues": [], "post_edit": None, "untranslated": []}
+
+    # ------------------------------------------------------------------
+    # Chemin LLM (activé via PIPELINE_AGENT_P4_BACKEND=llm)
 
     def build_messages(self, input_data: dict) -> list[dict]:
         block_json = json.dumps(input_data, ensure_ascii=False, separators=(",", ":"))

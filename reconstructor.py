@@ -5515,6 +5515,24 @@ class DocumentReconstructor:
         except Exception:
             return False
 
+    def _page_requires_text_layer(self, page_data, target_lang):
+        for block in self._iter_renderable_blocks(page_data):
+            text = self._clean_text_for_render(self._translated_text_from_block(block) or self._source_text_from_block(block))
+            if text:
+                return True
+            try:
+                if self._expected_block_text_units(block, target_lang, page_data=page_data) > 0:
+                    return True
+            except Exception:
+                pass
+        toc_rows = list(((page_data or {}).get("toc") or {}).get("toc_rows") or [])
+        if not toc_rows and self._looks_like_toc_page(page_data):
+            toc_rows = self._synthesized_toc_rows_from_blocks(page_data)
+        for row in toc_rows:
+            if self._clean_text_for_render((row or {}).get("label") or (row or {}).get("title") or (row or {}).get("page") or ""):
+                return True
+        return False
+
     def _render_page_text_rescue(self, page, page_data, target_lang):
         blocks = list(self._iter_renderable_blocks(page_data))
         if not blocks:
@@ -5532,7 +5550,7 @@ class DocumentReconstructor:
             try:
                 _, fontfile, builtin, fontname = self._resolve_style_font(page, style, text=text)
             except Exception:
-                fontfile, builtin, fontname = None, "helv", "helv"
+                fontfile, builtin, fontname = None, True, "helv"
             source_fontsize = float(style.get("size") or 11.0)
             fontsize = min(source_fontsize, max(4.5, rect.height * 0.78))
             wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
@@ -5559,50 +5577,24 @@ class DocumentReconstructor:
                     baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
-                    self._emit_text_run(
-                        BlockReconstructionPlan(
-                            block_id=str((block or {}).get("id") or "rescue"),
-                            page_index=int(getattr(page, "number", 0)),
-                            block_type=str((block or {}).get("object_type") or "rescue"),
-                            block_role=str((block or {}).get("role") or "body"),
-                            block_bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                            block_bbox_pt=(rect.x0, rect.y0, rect.x1, rect.y1),
-                            container_bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                            writing_direction="left_to_right",
-                            block_progression="top_to_bottom",
-                            alignment=align,
-                            paragraph_alignment=align,
-                            padding_left=0.0,
-                            padding_right=0.0,
-                            padding_top=0.0,
-                            padding_bottom=0.0,
-                            protected_regions=[],
-                            background_strategy="preserve",
-                            background_color=None,
-                            line_templates=[],
-                            units=[],
-                            graph_edges=[],
-                            positioning_policy={},
-                            relative_geometry={},
-                            editorial_semantics={},
-                            editorial_relations={},
-                            source_layout_mode={},
-                            adaptive_profile={},
-                            constraints={},
-                            page_data=dict(page_data or {}),
-                            source_block=dict(block or {}),
-                            semantic_profile=None,
-                        ),
-                        line_text,
-                        text_rect,
-                        (x, baseline),
-                        {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 0.85},
-                        fontname,
-                        fontfile,
-                        builtin,
-                        fontsize,
-                        rgb,
+                    BlockRenderOp(
+                        op_type="draw_text_run",
+                        block_id=str((block or {}).get("id") or "rescue"),
                         unit_id=f"{(block or {}).get('id') or 'rescue'}:{line_idx}",
+                        bbox=(text_rect.x0, text_rect.y0, text_rect.x1, text_rect.y1),
+                        text=line_text,
+                        style={**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 0.85},
+                        z_index=100,
+                        metadata={
+                            "point": (x, baseline),
+                            "fontname": fontname,
+                            "fontfile": fontfile,
+                            "builtin": builtin,
+                            "fontsize": fontsize,
+                            "source_fontsize": source_fontsize,
+                            "min_font_ratio": 0.85,
+                            "rgb": rgb,
+                        },
                     )
                 )
         if not ops:
@@ -6164,6 +6156,13 @@ class DocumentReconstructor:
                                     self._insert_immutable_overlays(page, final_page_data)
                                 except Exception:
                                     pass
+                            if self._page_requires_text_layer(toc_page_data, target_lang) and not self._page_has_text_layer(page):
+                                try:
+                                    self._render_page_text_rescue(page, toc_page_data, target_lang)
+                                except Exception:
+                                    pass
+                            if self._page_requires_text_layer(toc_page_data, target_lang) and not self._page_has_text_layer(page):
+                                raise RuntimeError(f"reconstruction produced image-only page with expected text: page={page_index + 1}")
                             self._render_page_debug_image(page, output_path, page_index + 1)
                             continue
                     except Exception:
@@ -6259,11 +6258,14 @@ class DocumentReconstructor:
                         self._insert_immutable_overlays(page, final_page_data)
                     except Exception:
                         pass
-                if not self._page_has_text_layer(page):
+                requires_text_layer = self._page_requires_text_layer(page_data, target_lang)
+                if requires_text_layer and not self._page_has_text_layer(page):
                     try:
                         self._render_page_text_rescue(page, page_data, target_lang)
                     except Exception:
                         pass
+                if requires_text_layer and not self._page_has_text_layer(page):
+                    raise RuntimeError(f"reconstruction produced image-only page with expected text: page={page_index + 1}")
                 self._render_page_debug_image(page, output_path, page_index + 1)
             doc.save(str(output_path))
         finally:

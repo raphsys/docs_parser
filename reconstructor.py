@@ -561,6 +561,38 @@ class DocumentReconstructor:
             "allow_expansion": False,
             "strict_non_reflow": True,
         },
+        "table_cell_micro": {
+            "render_mode": "cell_locked",
+            "font_size_policy": "micro_label_preserve",
+            "style_policy": "preserve_visible_style",
+            "shrink_max_pt": 0.2,
+            "min_font_ratio": 0.98,
+            "allow_expansion": False,
+            "strict_non_reflow": True,
+            "preserve_if_translation_overflows": True,
+        },
+        "table_cell_symbolic": {
+            "render_mode": "cell_locked",
+            "font_size_policy": "micro_label_preserve",
+            "style_policy": "preserve_visible_style",
+            "shrink_max_pt": 0.0,
+            "min_font_ratio": 1.0,
+            "allow_expansion": False,
+            "strict_non_reflow": True,
+            "translation_policy": "preserve",
+            "preserve_if_translation_overflows": True,
+        },
+        "table_cell_numeric": {
+            "render_mode": "cell_locked",
+            "font_size_policy": "micro_label_preserve",
+            "style_policy": "preserve_visible_style",
+            "shrink_max_pt": 0.0,
+            "min_font_ratio": 1.0,
+            "allow_expansion": False,
+            "strict_non_reflow": True,
+            "translation_policy": "preserve",
+            "preserve_if_translation_overflows": True,
+        },
         "code_block": {
             "render_mode": "line_preserve",
             "font_size_policy": "micro_label_preserve",
@@ -682,7 +714,13 @@ class DocumentReconstructor:
             return "toc_entry"
         if object_type in {"reference_link", "url", "web_url", "email_address", "doi_reference", "arxiv_reference"} or re.search(r"(https?://|www\.|doi:|\b10\.\d{4,9}/)", text, flags=re.IGNORECASE):
             return "url_reference"
-        if object_type in {"table_block", "table_cell", "table_row", "table_cell_micro", "table_cell_text", "table_cell_numeric", "table_cell_symbolic"} or object_class == "tabular":
+        if object_type in {"table_cell_micro", "micro_table_cell"} or object_subtype in {"table_cell_micro", "micro_cell"}:
+            return "table_cell_micro"
+        if object_type in {"table_cell_numeric", "numeric_cell"} or object_subtype in {"table_cell_numeric", "numeric_cell"}:
+            return "table_cell_numeric"
+        if object_type in {"table_cell_symbolic", "symbolic_cell"} or object_subtype in {"table_cell_symbolic", "symbolic_cell"}:
+            return "table_cell_symbolic"
+        if object_type in {"table_block", "table_cell", "table_row", "table_cell_text"} or object_class == "tabular":
             return "table_cell"
         if object_type in {"figure_region", "image_region", "drawing_region", "chart_region", "dense_diagram_region", "complex_vector_region", "clipping_region", "mask_region", "overlay_stack_region"} or object_class == "visual":
             return "figure_region"
@@ -750,6 +788,8 @@ class DocumentReconstructor:
     def _clean_text_for_render(self, text):
         text = str(text or "")
         text = text.replace("\u00a0", " ")
+        text = text.replace("\ufffd", "")
+        text = text.replace("\u25a0", "")
         text = re.sub(r"\s*'\s*", "'", text)
         text = re.sub(r"\s*’\s*", "’", text)
         text = re.sub(r"\s+([,.;!?])", r"\1", text)
@@ -819,6 +859,13 @@ class DocumentReconstructor:
             text = re.sub(r'^(?:partie|part)\s+', '', text, flags=re.IGNORECASE)
             text = text.upper()
         return text
+
+    def _extract_leading_marker(self, label):
+        text = self._clean_text_for_render(label or "")
+        match = re.match(r"^([•■·\-\u2022])\s*(.*)$", text)
+        if match:
+            return match.group(1), self._clean_text_for_render(match.group(2))
+        return "", text
 
     def _merge_styles(self, preferred, fallback):
         pref = preferred if isinstance(preferred, dict) else {}
@@ -1922,8 +1969,8 @@ class DocumentReconstructor:
         width_px = float(dims.get("width") or dims.get("page_width") or 0.0)
         height_px = float(dims.get("height") or dims.get("page_height") or 0.0)
         if width_px > 0 and height_px > 0:
-            return fitz.Rect(0.0, 0.0, width_px, height_px)
-        return fitz.Rect(0.0, 0.0, 1240.0, 1754.0)
+            return fitz.Rect(0.0, 0.0, width_px * self.pixel_to_point, height_px * self.pixel_to_point)
+        return fitz.Rect(0.0, 0.0, 1240.0 * self.pixel_to_point, 1754.0 * self.pixel_to_point)
 
     def _bbox_overlap_ratio_xy(self, lhs, rhs):
         left = self._fitz_rect_from_bbox_like(lhs)
@@ -1956,6 +2003,9 @@ class DocumentReconstructor:
         if contract_key in {
             "toc_entry",
             "table_cell",
+            "table_cell_micro",
+            "table_cell_symbolic",
+            "table_cell_numeric",
             "table_row",
             "table_block",
             "code_block",
@@ -2034,9 +2084,81 @@ class DocumentReconstructor:
             if horizontal_overlap < 0.20:
                 continue
             if other_rect.y0 >= rect.y1:
+                if self._rebalance_block_can_move(other):
+                    continue
                 safe_bottom = min(safe_bottom, float(other_rect.y0) - 2.0)
                 break
         return max(float(rect.y1), safe_bottom)
+
+    def _rebalance_block_can_move(self, block):
+        if not isinstance(block, dict):
+            return False
+        contract_key = self._reconstruction_contract_key_for_block(block)
+        if contract_key in {
+            "table_cell",
+            "table_cell_micro",
+            "table_cell_symbolic",
+            "table_cell_numeric",
+            "code_block",
+            "formula_block",
+            "inline_formula",
+            "figure_region",
+            "url_reference",
+            "toc_entry",
+        }:
+            return False
+        block_type = str(self._classify_block_for_reconstruction(block, {}) or "").strip().lower()
+        return block_type in {"editorial", "heading", "caption", "mixed"}
+
+    def _set_rebalanced_bbox_pt(self, block, rect):
+        bbox = (
+            float(rect.x0 / self.pixel_to_point),
+            float(rect.y0 / self.pixel_to_point),
+            float(rect.x1 / self.pixel_to_point),
+            float(rect.y1 / self.pixel_to_point),
+        )
+        block["rebalanced_bbox"] = bbox
+        layout_attrs = block.get("layout_attributes")
+        if isinstance(layout_attrs, dict):
+            layout_attrs["rebalanced_bbox"] = bbox
+        else:
+            block["layout_attributes"] = {"rebalanced_bbox": bbox}
+        return bbox
+
+    def _rebalance_resolve_vertical_collisions(self, ordered_blocks, page_bounds):
+        pushed = []
+        sorted_blocks = sorted(
+            [block for block in ordered_blocks if isinstance(block, dict)],
+            key=lambda block: (
+                (self._fitz_rect_from_bbox_like(self._rebalance_effective_bbox(block)) or fitz.Rect()).y0,
+                (self._fitz_rect_from_bbox_like(self._rebalance_effective_bbox(block)) or fitz.Rect()).x0,
+                str(block.get("id") or ""),
+            ),
+        )
+        for idx, block in enumerate(sorted_blocks):
+            rect = self._fitz_rect_from_bbox_like(self._rebalance_effective_bbox(block))
+            if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+                continue
+            for other in sorted_blocks[idx + 1:]:
+                other_rect = self._fitz_rect_from_bbox_like(self._rebalance_effective_bbox(other))
+                if not isinstance(other_rect, fitz.Rect) or other_rect.get_area() <= 0:
+                    continue
+                if self._bbox_horizontal_overlap_ratio(rect, other_rect) < 0.20:
+                    continue
+                required_y0 = rect.y1 + 2.0
+                if other_rect.y0 >= required_y0:
+                    break
+                if not self._rebalance_block_can_move(other):
+                    continue
+                delta = required_y0 - other_rect.y0
+                if other_rect.y1 + delta > page_bounds.y1:
+                    delta = max(0.0, page_bounds.y1 - other_rect.y1)
+                if delta <= 0.1:
+                    continue
+                moved = fitz.Rect(other_rect.x0, other_rect.y0 + delta, other_rect.x1, other_rect.y1 + delta)
+                self._set_rebalanced_bbox_pt(other, moved)
+                pushed.append({"block_id": str(other.get("id") or ""), "delta_y_pt": float(delta)})
+        return pushed
 
     def _rebalance_effective_bbox(self, block):
         if not isinstance(block, dict):
@@ -2078,17 +2200,7 @@ class DocumentReconstructor:
             if abs(new_x1 - current.x1) < 1.0 and abs(new_y1 - current.y1) < 1.0:
                 continue
             bbox_pt = fitz.Rect(float(new_x0), float(new_y0), float(new_x1), float(new_y1))
-            bbox = (
-                float(bbox_pt.x0 / self.pixel_to_point),
-                float(bbox_pt.y0 / self.pixel_to_point),
-                float(bbox_pt.x1 / self.pixel_to_point),
-                float(bbox_pt.y1 / self.pixel_to_point),
-            )
-            block["rebalanced_bbox"] = bbox
-            if isinstance(block.get("layout_attributes"), dict):
-                block["layout_attributes"]["rebalanced_bbox"] = bbox
-            else:
-                block["layout_attributes"] = {"rebalanced_bbox": bbox}
+            bbox = self._set_rebalanced_bbox_pt(block, bbox_pt)
             applied.append(
                 {
                     "block_id": str(block.get("id") or ""),
@@ -2098,9 +2210,11 @@ class DocumentReconstructor:
                     "block_type": self._classify_block_for_reconstruction(block, rebased),
                 }
             )
+        pushed_blocks = self._rebalance_resolve_vertical_collisions(ordered_blocks, page_bounds)
         rebased["_page_rebalanced"] = {
             "applied": bool(applied),
             "applied_blocks": applied,
+            "pushed_blocks": pushed_blocks,
             "block_count": len(ordered_blocks),
             "target_lang": target_lang,
         }
@@ -5515,6 +5629,234 @@ class DocumentReconstructor:
         except Exception:
             return False
 
+    def _presence_signature(self, text):
+        text = self._clean_text_for_render(text or "").casefold()
+        if not text:
+            return ""
+        return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+    def _visible_text_in_rect(self, page, rect):
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return self._clean_text_for_render(page.get_text("text") or "")
+        query_rect = fitz.Rect(rect)
+        query_rect.x0 = max(float(page.rect.x0), query_rect.x0 - 1.5)
+        query_rect.y0 = max(float(page.rect.y0), query_rect.y0 - 1.5)
+        query_rect.x1 = min(float(page.rect.x1), query_rect.x1 + 1.5)
+        query_rect.y1 = min(float(page.rect.y1), query_rect.y1 + 1.5)
+        try:
+            text = self._clean_text_for_render(page.get_textbox(query_rect) or "")
+            if text:
+                return text
+        except Exception:
+            pass
+        words = []
+        try:
+            for word in page.get_text("words") or []:
+                if len(word) < 5:
+                    continue
+                word_rect = fitz.Rect(word[:4])
+                center = ((word_rect.x0 + word_rect.x1) / 2.0, (word_rect.y0 + word_rect.y1) / 2.0)
+                if (word_rect & query_rect).get_area() > 0.1 or query_rect.contains(center):
+                    words.append(str(word[4] or ""))
+        except Exception:
+            return ""
+        return self._clean_text_for_render(" ".join(words))
+
+    def _entry_text_present(self, page, expected_text, rect):
+        expected = self._clean_text_for_render(expected_text or "")
+        if not expected:
+            return True
+        region_text = self._visible_text_in_rect(page, rect)
+        expected_sig = self._presence_signature(expected)
+        region_sig = self._presence_signature(region_text)
+        if expected_sig and expected_sig in region_sig:
+            return True
+        expected_fold = expected.casefold()
+        region_fold = region_text.casefold()
+        if expected_fold and expected_fold in region_fold:
+            return True
+        tokens = [self._presence_signature(token) for token in re.findall(r"\w+", expected_fold, flags=re.UNICODE)]
+        tokens = [token for token in tokens if len(token) >= 3]
+        if tokens:
+            required = tokens if len(tokens) <= 4 else tokens[:2] + tokens[-2:]
+            return all(token in region_sig for token in required)
+        compact_expected = re.sub(r"\s+", "", expected_fold)
+        compact_region = re.sub(r"\s+", "", region_fold)
+        return bool(compact_expected and compact_expected in compact_region)
+
+    def _entry_text_present_on_page(self, page, expected_text):
+        expected = self._clean_text_for_render(expected_text or "")
+        if not expected:
+            return True
+        page_text = self._clean_text_for_render(page.get_text("text") or "")
+        expected_sig = self._presence_signature(expected)
+        page_sig = self._presence_signature(page_text)
+        if expected_sig and expected_sig in page_sig:
+            return True
+        tokens = [self._presence_signature(token) for token in re.findall(r"\w+", expected.casefold(), flags=re.UNICODE)]
+        tokens = [token for token in tokens if len(token) >= 3]
+        if tokens:
+            required = tokens if len(tokens) <= 4 else tokens[:2] + tokens[-2:]
+            return all(token in page_sig for token in required)
+        return bool(re.sub(r"\s+", "", expected.casefold()) in re.sub(r"\s+", "", page_text.casefold()))
+
+    def _entry_rect_for_block(self, block, entry):
+        block_rect = self._fitz_rect_from_bbox_like((block or {}).get("rebalanced_bbox") or (block or {}).get("bbox"))
+        bbox = (entry or {}).get("bbox")
+        rect = self._fitz_rect_from_bbox_like(bbox)
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            rect = block_rect
+        if isinstance(rect, fitz.Rect) and isinstance(block_rect, fitz.Rect) and block_rect.get_area() > 0:
+            intersection = rect & block_rect
+            # Minimum usable area to render text (~5pt × 6pt); smaller intersections fall back to block rect
+            if intersection.get_area() >= 30.0:
+                rect = intersection
+            elif rect.get_area() <= 0:
+                rect = block_rect
+            else:
+                rect = block_rect
+        return rect
+
+    def _contract_entry_render_text(self, page, block, entry, rect, target_lang):
+        text = self._clean_text_for_render((entry or {}).get("text") or "")
+        source_text = self._clean_text_for_render((entry or {}).get("source_text") or "")
+        contract = self._reconstruction_contract_for_block(block, page_data=None)
+        key = str(contract.get("contract_key") or "").strip().lower()
+        style = self._merge_styles((entry or {}).get("style") or {}, self._style_from_block(block))
+        try:
+            _, fontfile, _, fontname = self._resolve_style_font(page, style, text=text or source_text)
+        except Exception:
+            fontfile, fontname = None, "helv"
+        fontsize = float(style.get("size") or 12.0)
+        strict = bool(contract.get("strict_non_reflow")) or key in {"table_cell_micro", "table_cell_symbolic", "table_cell_numeric", "url_reference", "formula_block", "inline_formula"}
+        preserve_on_overflow = bool(contract.get("preserve_if_translation_overflows") or contract.get("translation_policy") == "preserve")
+        if strict and source_text:
+            translated_width = self._measure_text_width(text, fontsize, fontname, fontfile) if text else 0.0
+            source_width = self._measure_text_width(source_text, fontsize, fontname, fontfile)
+            if preserve_on_overflow or (translated_width > max(4.0, rect.width * 1.02) and source_width <= max(translated_width, rect.width * 1.08)):
+                text = source_text
+        return text or source_text
+
+    def _direct_text_ops_for_entry(self, page, page_data, block, entry, target_lang):
+        rect = self._entry_rect_for_block(block, entry)
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return []
+        contract = self._reconstruction_contract_for_block(block, page_data=page_data)
+        contract_key = str(contract.get("contract_key") or "").strip().lower()
+        text = self._contract_entry_render_text(page, block, entry, rect, target_lang)
+        text = self._clean_text_for_render(text)
+        if not text:
+            return []
+        style = self._merge_styles((entry or {}).get("style") or {}, self._style_from_block(block))
+        source_fontsize = float(style.get("size") or 12.0)
+        min_ratio = float(contract.get("min_font_ratio") or 0.90)
+        min_fontsize = max(4.0, source_fontsize * min_ratio)
+        fontsize = min(source_fontsize, max(min_fontsize, rect.height * 0.86))
+        try:
+            _, fontfile, builtin, fontname = self._resolve_style_font(page, style, text=text)
+        except Exception:
+            fontfile, builtin, fontname = None, True, "helv"
+        rgb = self._resolve_text_color(style, block)
+        strict_single_line = bool(contract.get("strict_non_reflow")) or contract_key in {"toc_entry", "table_cell_micro", "table_cell_symbolic", "table_cell_numeric", "url_reference", "formula_block", "inline_formula", "figure_label"}
+        lines = [text] if strict_single_line else self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(6.0, rect.width))
+        if not lines:
+            lines = [text]
+        while fontsize > min_fontsize and lines:
+            too_wide = any(self._measure_text_width(line, fontsize, fontname, fontfile) > max(5.0, rect.width * 0.98) for line in lines)
+            too_tall = len(lines) * max(4.5, fontsize * 1.05) > max(rect.height, fontsize * 1.1)
+            if not too_wide and not too_tall:
+                break
+            fontsize -= 0.35
+            if not strict_single_line:
+                lines = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(6.0, rect.width)) or [text]
+        line_h = max(4.5, min(rect.height / max(1, len(lines)), fontsize * 1.06))
+        align = self._normalize_alignment((entry or {}).get("alignment") or (block or {}).get("alignment") or "left")
+        ops = []
+        for line_idx, line_text in enumerate(lines):
+            line_text = self._clean_text_for_render(line_text)
+            if not line_text:
+                continue
+            width = self._measure_text_width(line_text, fontsize, fontname, fontfile)
+            x = rect.x0
+            if align == "center":
+                x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
+            elif align == "right":
+                x = max(rect.x0, rect.x1 - width)
+            baseline = min(rect.y1 - 0.8, rect.y0 + min(rect.height - 0.8, (line_idx + 1) * line_h * 0.82))
+            text_rect = fitz.Rect(
+                max(rect.x0, x),
+                baseline - max(1.0, fontsize * 0.82),
+                min(rect.x1, max(rect.x0, x) + max(1.0, min(width, rect.width))),
+                baseline + max(1.0, fontsize * 0.18),
+            )
+            ops.append(
+                BlockRenderOp(
+                    op_type="draw_text_run",
+                    block_id=str((block or {}).get("id") or "coverage"),
+                    unit_id=f"{(entry or {}).get('unit_id') or 'coverage'}:direct:{line_idx}",
+                    bbox=(text_rect.x0, text_rect.y0, text_rect.x1, text_rect.y1),
+                    text=line_text,
+                    style={**style, "size": fontsize},
+                    z_index=120,
+                    metadata={
+                        "point": (max(rect.x0, x), baseline),
+                        "fontname": fontname,
+                        "fontfile": fontfile,
+                        "builtin": builtin,
+                        "fontsize": fontsize,
+                        "source_fontsize": source_fontsize,
+                        "min_font_ratio": min_ratio,
+                        "rgb": rgb,
+                    },
+                )
+            )
+        return ops
+
+    def _enforce_page_block_text_coverage(self, page, page_data, target_lang):
+        missing_after_rescue = []
+        rescue_ops = []
+        for block in self._iter_renderable_blocks(page_data):
+            entries = self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data)
+            if not entries:
+                continue
+            for entry in entries:
+                expected = self._clean_text_for_render((entry or {}).get("text") or (entry or {}).get("source_text") or "")
+                if not expected:
+                    continue
+                rect = self._entry_rect_for_block(block, entry)
+                if self._entry_text_present(page, expected, rect):
+                    continue
+                if self._entry_text_present_on_page(page, expected):
+                    continue
+                rescue_ops.extend(self._direct_text_ops_for_entry(page, page_data, block, entry, target_lang))
+        if rescue_ops:
+            self._commit_block_draw_ops(page, rescue_ops)
+        for block in self._iter_renderable_blocks(page_data):
+            for entry in self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data):
+                expected = self._clean_text_for_render((entry or {}).get("text") or (entry or {}).get("source_text") or "")
+                if not expected:
+                    continue
+                rect = self._entry_rect_for_block(block, entry)
+                if not self._entry_text_present(page, expected, rect):
+                    if self._entry_text_present_on_page(page, expected):
+                        continue
+                    missing_after_rescue.append(
+                        {
+                            "block_id": str((block or {}).get("id") or ""),
+                            "unit_id": str((entry or {}).get("unit_id") or ""),
+                            "text": expected[:120],
+                        }
+                    )
+        if missing_after_rescue:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "block coverage incomplete after rescue: page=%s missing=%d entries=%s",
+                int(getattr(page, "number", 0)) + 1,
+                len(missing_after_rescue),
+                [m.get("text", "")[:40] for m in missing_after_rescue[:3]],
+            )
+        return bool(rescue_ops)
+
     def _page_requires_text_layer(self, page_data, target_lang):
         for block in self._iter_renderable_blocks(page_data):
             text = self._clean_text_for_render(self._translated_text_from_block(block) or self._source_text_from_block(block))
@@ -5873,15 +6215,34 @@ class DocumentReconstructor:
         if entries:
             return entries
 
+        block_text = self._clean_text_for_render((block or {}).get("translated_text") or "")
+        block_source_text = self._source_text_from_block(block) or block_text
+        contract = self._reconstruction_contract_for_block(block, page_data=page_data)
+        if block_text and not bool(contract.get("strict_non_reflow")):
+            return [
+                {
+                    "unit_id": f"{(block or {}).get('id') or 'block'}:coverage:block",
+                    "text": block_text,
+                    "source_text": block_source_text,
+                    "bbox": (block or {}).get("rebalanced_bbox") or (block or {}).get("bbox"),
+                    "style": self._style_from_block(block),
+                    "unit_type": "block",
+                    "line_indices": [],
+                    "render_policy": str((block or {}).get("render_policy") or ""),
+                }
+            ]
+
         line_entries = []
         for idx, line in enumerate((block or {}).get("lines") or []):
             text = self._line_translated_text(line)
             if not text:
                 continue
+            source_text = self._line_source_text(line) or text
             line_entries.append(
                 {
                     "unit_id": f"{(block or {}).get('id') or 'block'}:coverage:{idx}",
                     "text": text,
+                    "source_text": source_text,
                     "bbox": (line or {}).get("bbox"),
                     "style": self._merge_styles((line or {}).get("style") or {}, self._style_from_block(block)),
                     "unit_type": "line",
@@ -5892,12 +6253,12 @@ class DocumentReconstructor:
         if line_entries:
             return line_entries
 
-        block_text = self._clean_text_for_render((block or {}).get("translated_text") or "")
         if block_text:
             return [
                 {
                     "unit_id": f"{(block or {}).get('id') or 'block'}:coverage:block",
                     "text": block_text,
+                    "source_text": block_source_text,
                     "bbox": (block or {}).get("bbox"),
                     "style": self._style_from_block(block),
                     "unit_type": "block",
@@ -5923,10 +6284,13 @@ class DocumentReconstructor:
         return len(text_units)
 
     def _render_block_presence_fallback_ops(self, page, page_data, block, target_lang, font_scale=1.0):
-        block_rect = self._fitz_rect_from_bbox_like((block or {}).get("bbox"))
+        block_rect = self._fitz_rect_from_bbox_like((block or {}).get("rebalanced_bbox") or (block or {}).get("bbox"))
         if not isinstance(block_rect, fitz.Rect) or block_rect.get_area() <= 0:
             return []
         adaptive_profile = self._block_adaptive_profile(block, page_data=page_data)
+        contract = self._reconstruction_contract_for_block(block, page_data=page_data)
+        contract_key = str(contract.get("contract_key") or "").strip().lower()
+        min_font_ratio = float(contract.get("min_font_ratio") or 0.90)
         object_type = str((block or {}).get("object_type") or "").strip().lower()
         block_role = str((block or {}).get("role") or "").strip().lower()
         block_text = self._clean_text_for_render((block or {}).get("translated_text") or "")
@@ -6011,6 +6375,8 @@ class DocumentReconstructor:
         slot_h = max(6.0, (bottom - top) / max(1, len(entries)))
         for idx, entry in enumerate(entries):
             text = self._clean_text_for_render(entry.get("text") or "")
+            if contract.get("translation_policy") == "preserve" and self._clean_text_for_render(entry.get("source_text") or ""):
+                text = self._clean_text_for_render(entry.get("source_text") or "")
             if not text:
                 continue
             bbox = entry.get("bbox")
@@ -6036,9 +6402,18 @@ class DocumentReconstructor:
             _, fontfile, builtin, fontname = self._resolve_style_font( page, style, text=text)
             source_fontsize = float(style.get("size") or 12.0)
             target_fontsize = source_fontsize * max(0.4, float(font_scale))
+            if contract_key in {"table_cell_micro", "table_cell_symbolic", "table_cell_numeric", "figure_label", "url_reference", "formula_block", "inline_formula"}:
+                source_text = self._clean_text_for_render(entry.get("source_text") or "")
+                translated_width = self._measure_text_width(text, source_fontsize, fontname, fontfile)
+                source_width = self._measure_text_width(source_text, source_fontsize, fontname, fontfile) if source_text else translated_width
+                if source_text and (contract.get("preserve_if_translation_overflows") or translated_width > max(4.0, rect.width * 1.02)) and source_width <= max(translated_width, rect.width * 1.08):
+                    text = source_text
             rect = self._expand_text_rect_within_block(rect, block_rect, target_fontsize, line_count=1, line_height_factor=1.12)
             fontsize = min(target_fontsize, max(4.5, rect.height * 0.90))
-            wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+            if bool(contract.get("strict_non_reflow")):
+                wrapped = [text]
+            else:
+                wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             if wrapped:
                 rect = self._expand_text_rect_within_block(
                     rect,
@@ -6047,15 +6422,19 @@ class DocumentReconstructor:
                     line_count=len(wrapped),
                     line_height_factor=1.08 * max(0.84, min(1.05, float(adaptive_profile.get("line_spacing_factor") or 1.0))),
                 )
-            while fontsize > 4.5 and wrapped and (len(wrapped) * max(4.8, fontsize * 1.05)) > max(rect.height, fontsize * 1.15):
+            minimum_fontsize = max(4.5, source_fontsize * min_font_ratio)
+            while fontsize > minimum_fontsize and wrapped and (len(wrapped) * max(4.8, fontsize * 1.05)) > max(rect.height, fontsize * 1.15):
                 fontsize -= 0.5
-                wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+                if bool(contract.get("strict_non_reflow")):
+                    wrapped = [text]
+                else:
+                    wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             spacing_factor = max(0.84, min(1.05, float(adaptive_profile.get("line_spacing_factor") or 1.0)))
             line_h = max(4.8, min(rect.height / max(1, len(wrapped)), fontsize * 1.08 * spacing_factor))
             rgb = self._resolve_text_color( style, block)
             for line_idx, line_text in enumerate(wrapped):
                 cur_size = fontsize
-                while cur_size > 4.5:
+                while cur_size > minimum_fontsize:
                     width = self._measure_text_width( line_text, cur_size, fontname, fontfile)
                     if width <= max(8.0, rect.width):
                         break
@@ -6085,7 +6464,7 @@ class DocumentReconstructor:
                             "builtin": builtin,
                             "fontsize": cur_size,
                             "source_fontsize": source_fontsize,
-                            "min_font_ratio": 0.90,
+                            "min_font_ratio": min_font_ratio,
                             "rgb": rgb,
                         },
                     )
@@ -6161,6 +6540,8 @@ class DocumentReconstructor:
                                     self._render_page_text_rescue(page, toc_page_data, target_lang)
                                 except Exception:
                                     pass
+                            if self._page_requires_text_layer(toc_page_data, target_lang):
+                                self._enforce_page_block_text_coverage(page, toc_page_data, target_lang)
                             if self._page_requires_text_layer(toc_page_data, target_lang) and not self._page_has_text_layer(page):
                                 raise RuntimeError(f"reconstruction produced image-only page with expected text: page={page_index + 1}")
                             self._render_page_debug_image(page, output_path, page_index + 1)
@@ -6264,6 +6645,8 @@ class DocumentReconstructor:
                         self._render_page_text_rescue(page, page_data, target_lang)
                     except Exception:
                         pass
+                if requires_text_layer:
+                    self._enforce_page_block_text_coverage(page, page_data, target_lang)
                 if requires_text_layer and not self._page_has_text_layer(page):
                     raise RuntimeError(f"reconstruction produced image-only page with expected text: page={page_index + 1}")
                 self._render_page_debug_image(page, output_path, page_index + 1)

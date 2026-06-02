@@ -256,6 +256,63 @@ class PageExtractionPostprocessorTests(unittest.TestCase):
         self.assertEqual((body_block.get("structure_hints") or {}).get("band_role_hint"), "text_band")
         self.assertEqual((body_block.get("structure_hints") or {}).get("layout_behavior_hint"), "flow_in_band")
 
+    def test_formula_region_detection_marks_whole_formula_as_atomic(self):
+        block = _line_block("eq1", "equation_inline", [100, 100, 260, 140], "Z k ∗ ( 1 − Z k )", font="MTSYN", size=10)
+        page = {
+            "dimensions": {"width": 700, "height": 1000},
+            "layout_type": "double_column",
+            "document_type": "book_page",
+            "page_family": "body_text_two_column",
+            "blocks": [block],
+        }
+
+        out, info = apply_page_extraction_postprocessors(page)
+
+        self.assertTrue(info["changed"])
+        self.assertIn("formula_region_detection", info["applied"])
+        self.assertEqual(len(out.get("formula_regions") or []), 1)
+        formula = out["formula_regions"][0]
+        self.assertEqual(formula["bbox"], [100, 100, 260, 140])
+        self.assertEqual(formula["render_policy"], "source_region_preserve")
+        out_block = out["blocks"][0]
+        self.assertEqual(out_block["object_class"], "formula")
+        self.assertEqual(out_block["object_type"], "formula_region")
+        self.assertEqual(out_block["render_policy"], "source_overlay")
+        self.assertEqual(out_block["lines"], [])
+        self.assertTrue(out_block.get("formula_source_lines"))
+        self.assertEqual((out_block.get("structure_hints") or {}).get("structural_role_hint"), "formula_block")
+
+    def test_formula_region_detection_merges_adjacent_formula_fragments(self):
+        page = {
+            "dimensions": {"width": 700, "height": 1000},
+            "layout_type": "double_column",
+            "document_type": "book_page",
+            "page_family": "body_text_two_column",
+            "blocks": [
+                _line_block("eq1", "equation_inline", [100, 100, 160, 130], "Z k", font="MTSYN", size=10),
+                _line_block("eq2", "equation_inline", [166, 101, 230, 130], "∗ ( 1", font="MTSYN", size=10),
+                _line_block("eq3", "equation_inline", [112, 132, 214, 160], "− Z k )", font="MTSYN", size=10),
+                _line_block("body", "body", [100, 210, 500, 240], "This normal sentence must stay text.", size=11),
+            ],
+        }
+
+        out, info = apply_page_extraction_postprocessors(page)
+
+        self.assertTrue(info["changed"])
+        self.assertIn("formula_region_detection", info["applied"])
+        self.assertEqual(len(out.get("formula_regions") or []), 1)
+        formula = out["formula_regions"][0]
+        self.assertEqual(formula["bbox"], [100, 100, 230, 160])
+        self.assertEqual(formula["block_ids"], ["eq1", "eq2", "eq3"])
+        for block_id in ("eq1", "eq2", "eq3"):
+            block = next(blk for blk in out["blocks"] if blk.get("id") == block_id)
+            self.assertEqual(block.get("formula_region_id"), formula["id"])
+            self.assertEqual(block.get("lines"), [])
+            self.assertTrue(block.get("formula_source_lines"))
+        body = next(blk for blk in out["blocks"] if blk.get("id") == "body")
+        self.assertNotIn("formula_region_id", body)
+        self.assertEqual(body.get("text"), "This normal sentence must stay text.")
+
 
 if __name__ == "__main__":
     unittest.main()

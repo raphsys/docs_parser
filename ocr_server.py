@@ -7,6 +7,7 @@ import subprocess
 import json
 import copy
 import logging
+import time
 import xml.etree.ElementTree as ET
 import uvicorn
 import fitz
@@ -2619,11 +2620,12 @@ def _postprocess_blocks_semantic(blocks: list) -> None:
     """Dispatche vers P1ExtractionAgent ou llm_semantic_corrector selon l'environnement.
 
     Utiliser PIPELINE_AGENT_P1_ENABLE=1 pour activer l'agent open-source.
-    Par défaut, utilise llm_semantic_corrector (comportement existant).
+    Utiliser DOCS_PARSER_ENABLE_SEMANTIC_LLM=1 pour activer le correcteur LLM.
+    Par defaut, les heuristiques deterministes deja appliquees sont conservees.
     """
     if os.environ.get("PIPELINE_AGENT_P1_ENABLE") == "1":
         _p1_agent_postprocess_blocks(blocks)
-    else:
+    elif os.environ.get("DOCS_PARSER_ENABLE_SEMANTIC_LLM") == "1":
         _llm_postprocess_blocks(blocks)
 
 
@@ -4685,6 +4687,17 @@ def _write_layout_xml(blocks, filename, page_idx, img_w, img_h):
 
 
 def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default", include_debug_layers=False):
+    trace_process = os.environ.get("DOCS_PARSER_PROCESS_PAGE_TRACE", "0") == "1"
+    trace_last = time.perf_counter()
+
+    def _trace_step(label):
+        nonlocal trace_last
+        if not trace_process:
+            return
+        now = time.perf_counter()
+        print(f"PROCESS_PAGE_TRACE {idx}:{label}: {now - trace_last:.2f}s", flush=True)
+        trace_last = now
+
     safe_filename = _safe_runtime_stem(filename)
     source_fn = f"src_{uuid.uuid4().hex}_{idx + 1}.png"
     source_path = os.path.join(RESULTS_DIR, source_fn)
@@ -4707,9 +4720,18 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         non_text_zones = native.get("non_text_zones", [])
         native_images = native.get("images", [])
         native_drawings = native.get("drawings", [])
+    _trace_step("native_extract")
 
-    # 2. OCR pour le reste
-    result, _ = engine_ocr(np.array(img))
+    # 2. OCR pour le reste. En validation ciblee des PDF natifs, l'OCR
+    # complementaire peut dominer le temps sans apporter de nouveaux blocs.
+    skip_ocr_when_native = (
+        os.environ.get("DOCS_PARSER_SKIP_OCR_WHEN_NATIVE", "0") == "1"
+        and pdf_page is not None
+        and not force_ai
+        and bool(native_blocks)
+    )
+    result, _ = ([], None) if skip_ocr_when_native else engine_ocr(np.array(img))
+    _trace_step("ocr")
     raw_ocr = []
     if result:
         for res in result:
@@ -4726,6 +4748,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     ocr_structure = parser.parse(raw_ocr, img) if raw_ocr else []
     if ocr_structure:
         ocr_structure = _prune_weak_ocr_lines(ocr_structure)
+    _trace_step("ocr_parse")
     font_ai_summary = {
         "enabled": False,
         "ready": False,
@@ -4739,6 +4762,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     if EXTRACTION_AI_ENABLED and ocr_structure:
         font_ai_summary = apply_ai_font_matching(ocr_structure, img, enable_audit=font_ai_audit)
     final_blocks = _dedupe_final_blocks(native_blocks, ocr_structure)
+    _trace_step("dedupe")
     merged_blocks_pre_postprocess = copy.deepcopy(final_blocks)
     final_blocks = _postprocess_blocks(final_blocks, img.width, img.height)
     _enrich_layout_markers(final_blocks)
@@ -4748,8 +4772,10 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
     _build_semantic_groups_for_blocks(final_blocks)
+    _trace_step("semantic_pre_style")
     merged_blocks_postprocess = copy.deepcopy(final_blocks)
     immutable_overlays = _extract_immutable_overlays(final_blocks, img, filename, idx)
+    _trace_step("immutable_overlays")
 
     layout_meta = _annotate_layout(final_blocks, img.width, img.height)
     visual_style_profile = {}
@@ -4762,6 +4788,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         )
     except Exception as e:
         print(f"Erreur style profiler : {e}")
+    _trace_step("style_profile")
     # Ensure layout markers and semantic phrases remain present after style profiling transforms.
     _enrich_layout_markers(final_blocks)
     _build_semantic_phrases_for_blocks(final_blocks)
@@ -4770,6 +4797,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
     _build_semantic_groups_for_blocks(final_blocks)
+    _trace_step("semantic_post_style")
 
     # 3. GÉNERATION DU FOND MAÎTRE NETTOYÉ (Workflow Inpainting IA)
     bg_master_path = ""
@@ -4790,6 +4818,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         cv2.imwrite(mask_master_path, mask)
     except Exception as e:
         print(f"Erreur génération fond maître chirurgical : {e}")
+    _trace_step("text_removal")
 
     p6_bg_audit = _p6_audit_background(
         final_blocks,
@@ -4799,6 +4828,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         img_width=img.width,
         img_height=img.height,
     )
+    _trace_step("p6_audit")
 
     # 4. VISUALISATION (Bboxes colorées pour l aperçu)
     vis_fn = f"vis_{safe_filename}_{idx}.jpg"
@@ -4812,6 +4842,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
              for p in line["phrases"]: 
                 draw.rectangle(p["bbox"], outline="red", width=1)
     img_draw.save(os.path.join(RESULTS_DIR, vis_fn))
+    _trace_step("visualization")
 
     # 5. CONSTRUCTION DU CONTENU DÉTAILLÉ (Pour l affichage Flutter)
     display_text = f"DOC: {img.width}x{img.height} | DPI: {TARGET_DPI}\n"
@@ -4879,6 +4910,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         layout_xml_path = _write_layout_xml(final_blocks, filename, idx, img.width, img.height)
     except Exception as e:
         print(f"Erreur écriture layout XML: {e}")
+    _trace_step("display_text_layout_xml")
 
     if hierarchical_extraction.get("phrases"):
         display_text += "\n[PHRASES_RECONSTITUEES]\n"
@@ -4889,6 +4921,8 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "blocks": final_blocks,
         "background_path": bg_master_path,
         "source_image_path": source_path,
+        "source_pdf_path": str(getattr(getattr(pdf_page, "parent", None), "name", "") or "") if pdf_page is not None else "",
+        "source_page_index": int(idx or 0),
         "source_image_url": f"/results/{source_fn}" if source_path else "",
         "mask_master_path": mask_master_path,
         "immutable_overlays": immutable_overlays,
@@ -4937,6 +4971,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         fidelity_layout = _build_fidelity_layout_export(page_structure.get("blocks", []) or [])
     except Exception as e:
         print(f"Erreur LayoutV2Builder: {e}")
+    _trace_step("layout_v2_postprocess")
 
     return {
         "page": idx + 1, 

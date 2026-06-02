@@ -13,7 +13,6 @@ import {
   View,
   useWindowDimensions,
 } from "react-native";
-import { LinearGradient } from "expo-linear-gradient";
 import { StatusBar } from "expo-status-bar";
 
 import { pickDocument, type PickedDocument } from "./lib/filePicker";
@@ -56,10 +55,10 @@ type RelationOverlay = {
   color: string;
 };
 
-const API_FALLBACK = Platform.select({
+const API_FALLBACK: string = Platform.select({
   web: "http://127.0.0.1:8001",
   default: "http://10.0.2.2:8001",
-});
+} as any) as string;
 
 const TARGET_LANGS: TargetLang[] = ["fr", "en", "de", "es"];
 const STYLES: StyleOption[] = ["professionnel", "technique", "scientifique"];
@@ -1464,7 +1463,7 @@ export default function App() {
   const isWide = width >= 1080;
 
   const [currentPage, setCurrentPage] = useState<AppPage>("translate");
-  const [apiBaseUrl, setApiBaseUrl] = useState(API_FALLBACK ?? "http://127.0.0.1:8001");
+  const [apiBaseUrl, setApiBaseUrl] = useState<string>(API_FALLBACK || "http://127.0.0.1:8001");
   const [connectionState, setConnectionState] = useState<ConnectionState>("detecting");
   const [connectionNote, setConnectionNote] = useState("Recherche automatique du backend...");
   const [targetLang, setTargetLang] = useState<TargetLang>("fr");
@@ -1644,10 +1643,8 @@ export default function App() {
       : "Charge un document, lance l'OCR et inspecte les blocs, lignes, phrases et expressions.";
 
   return (
-    <LinearGradient colors={["#fdfcf7", "#f4fbf8", "#eef6ff"]} style={styles.screen}>
+    <View style={styles.screen}>
       <StatusBar style="dark" />
-      <View style={styles.bgCircleTop} />
-      <View style={styles.bgCircleBottom} />
 
       <ScrollView contentContainerStyle={styles.container}>
         <View style={styles.shell}>
@@ -1820,50 +1817,32 @@ export default function App() {
           )}
         </View>
       </ScrollView>
-    </LinearGradient>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: "#f7faf8",
-  },
-  bgCircleTop: {
-    position: "absolute",
-    top: -120,
-    left: -80,
-    width: 300,
-    height: 300,
-    borderRadius: 999,
-    backgroundColor: "rgba(122, 190, 164, 0.18)",
-  },
-  bgCircleBottom: {
-    position: "absolute",
-    right: -110,
-    bottom: -150,
-    width: 360,
-    height: 360,
-    borderRadius: 999,
-    backgroundColor: "rgba(234, 191, 92, 0.16)",
+    backgroundColor: "#f4f7f5",
   },
   container: {
     paddingHorizontal: 16,
-    paddingVertical: 18,
+    paddingVertical: 16,
   },
   shell: {
     width: "100%",
     maxWidth: 1380,
     alignSelf: "center",
-    gap: 14,
+    gap: 12,
   },
   topBar: {
-    backgroundColor: "rgba(255,255,255,0.9)",
-    borderRadius: 24,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(156, 188, 207, 0.22)",
-    padding: 20,
-    gap: 14,
+    padding: 16,
+    gap: 12,
   },
   topBarWide: {
     flexDirection: "row",
@@ -1883,8 +1862,8 @@ const styles = StyleSheet.create({
   },
   title: {
     color: "#18354d",
-    fontSize: 30,
-    lineHeight: 36,
+    fontSize: 28,
+    lineHeight: 34,
     fontWeight: "800",
     fontFamily: Platform.select({ ios: "Avenir Next", android: "serif", web: "Georgia, serif" }),
   },
@@ -1944,12 +1923,12 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   controlCard: {
-    backgroundColor: "rgba(255,255,255,0.92)",
-    borderRadius: 24,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(156, 188, 207, 0.22)",
-    padding: 18,
-    gap: 14,
+    padding: 16,
+    gap: 12,
   },
   controlTopRow: {
     gap: 12,
@@ -1961,7 +1940,7 @@ const styles = StyleSheet.create({
   documentMeta: {
     flex: 1.2,
     minWidth: 220,
-    borderRadius: 18,
+    borderRadius: 8,
     backgroundColor: "#f8fbfd",
     padding: 14,
     gap: 4,
@@ -1969,7 +1948,7 @@ const styles = StyleSheet.create({
   backendBox: {
     flex: 1,
     minWidth: 220,
-    borderRadius: 18,
+    borderRadius: 8,
     backgroundColor: "#f8fbfd",
     padding: 14,
     gap: 8,
@@ -1997,7 +1976,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(145, 179, 204, 0.35)",
     backgroundColor: "#ffffff",
     color: "#16324a",
-    borderRadius: 14,
+    borderRadius: 8,
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
@@ -2057,7 +2036,7 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    borderRadius: 16,
+    borderRadius: 8,
     backgroundColor: "#ffffff",
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.18)",
@@ -2070,7 +2049,7 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     backgroundColor: "#efc95d",
-    borderRadius: 18,
+    borderRadius: 8,
     paddingHorizontal: 18,
     paddingVertical: 14,
     alignItems: "center",
@@ -2083,7 +2062,7 @@ const styles = StyleSheet.create({
   },
   secondaryButton: {
     backgroundColor: "#e8f4ff",
-    borderRadius: 18,
+    borderRadius: 8,
     paddingHorizontal: 18,
     paddingVertical: 14,
     alignItems: "center",
@@ -2122,8 +2101,8 @@ const styles = StyleSheet.create({
   },
   previewCard: {
     flex: 1,
-    backgroundColor: "rgba(255,255,255,0.94)",
-    borderRadius: 24,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(156, 188, 207, 0.22)",
     padding: 16,
@@ -2174,7 +2153,7 @@ const styles = StyleSheet.create({
     minHeight: 760,
     flex: 1,
     backgroundColor: "#ffffff",
-    borderRadius: 20,
+    borderRadius: 8,
     overflow: "hidden",
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.22)",
@@ -2206,7 +2185,7 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   downloadButton: {
-    borderRadius: 16,
+    borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 11,
     backgroundColor: "#6ea98e",
@@ -2216,7 +2195,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   downloadButtonSecondary: {
-    borderRadius: 16,
+    borderRadius: 8,
     paddingHorizontal: 16,
     paddingVertical: 11,
     backgroundColor: "#eef5fb",
@@ -2226,8 +2205,8 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   inspectorCard: {
-    backgroundColor: "rgba(255,255,255,0.94)",
-    borderRadius: 24,
+    backgroundColor: "#ffffff",
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(156, 188, 207, 0.22)",
     padding: 16,
@@ -2292,7 +2271,7 @@ const styles = StyleSheet.create({
   inspectorCanvasViewport: {
     minHeight: 820,
     backgroundColor: "#ffffff",
-    borderRadius: 20,
+    borderRadius: 8,
     overflow: "hidden",
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.22)",
@@ -2323,7 +2302,7 @@ const styles = StyleSheet.create({
   },
   inspectorListCard: {
     backgroundColor: "#f8fbfd",
-    borderRadius: 18,
+    borderRadius: 8,
     padding: 12,
     gap: 10,
     maxHeight: 390,
@@ -2332,7 +2311,7 @@ const styles = StyleSheet.create({
   },
   inspectorDetailCard: {
     backgroundColor: "#f8fbfd",
-    borderRadius: 18,
+    borderRadius: 8,
     padding: 12,
     gap: 10,
     flex: 1,
@@ -2342,7 +2321,7 @@ const styles = StyleSheet.create({
   },
   phraseTableCard: {
     backgroundColor: "#f8fbfd",
-    borderRadius: 18,
+    borderRadius: 8,
     padding: 12,
     gap: 10,
     borderWidth: 1,
@@ -2357,7 +2336,7 @@ const styles = StyleSheet.create({
     flexGrow: 0,
   },
   inspectorListItem: {
-    borderRadius: 14,
+    borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 10,
     backgroundColor: "#ffffff",
@@ -2387,7 +2366,7 @@ const styles = StyleSheet.create({
   },
   auditTable: {
     minWidth: 1480,
-    borderRadius: 16,
+    borderRadius: 8,
     overflow: "hidden",
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.18)",
@@ -2460,7 +2439,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 21,
     backgroundColor: "#ffffff",
-    borderRadius: 12,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.18)",
     paddingHorizontal: 12,
@@ -2472,7 +2451,7 @@ const styles = StyleSheet.create({
   },
   attributeRow: {
     backgroundColor: "#ffffff",
-    borderRadius: 12,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: "rgba(145, 179, 204, 0.18)",
     paddingHorizontal: 12,
@@ -2505,4 +2484,4 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     fontFamily: Platform.select({ ios: "Menlo", android: "monospace", web: "ui-monospace, SFMono-Regular, Menlo, monospace" }),
   },
-});
+} as any);

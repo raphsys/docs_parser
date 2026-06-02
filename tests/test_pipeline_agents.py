@@ -828,12 +828,24 @@ class TestP1IntegrationWithOcrServer:
         AgentRegistry._instances["p1_extraction|phi35|auto"] = agent
         return agent
 
-    def test_dispatcher_uses_llm_corrector_by_default(self, monkeypatch):
-        """Sans PIPELINE_AGENT_P1_ENABLE, le dispatcher appelle _llm_postprocess_blocks."""
+    def test_dispatcher_keeps_deterministic_semantics_by_default(self, monkeypatch):
+        """Sans opt-in explicite, le dispatcher ne charge pas de correcteur IA."""
         called = {"llm": 0, "p1": 0}
         monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
         monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
         monkeypatch.delenv("PIPELINE_AGENT_P1_ENABLE", raising=False)
+        monkeypatch.delenv("DOCS_PARSER_ENABLE_SEMANTIC_LLM", raising=False)
+        self.ocr._postprocess_blocks_semantic([])
+        assert called["llm"] == 0
+        assert called["p1"] == 0
+
+    def test_dispatcher_uses_llm_corrector_when_enabled(self, monkeypatch):
+        """Avec DOCS_PARSER_ENABLE_SEMANTIC_LLM=1, le dispatcher appelle _llm_postprocess_blocks."""
+        called = {"llm": 0, "p1": 0}
+        monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
+        monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
+        monkeypatch.delenv("PIPELINE_AGENT_P1_ENABLE", raising=False)
+        monkeypatch.setenv("DOCS_PARSER_ENABLE_SEMANTIC_LLM", "1")
         self.ocr._postprocess_blocks_semantic([])
         assert called["llm"] == 1
         assert called["p1"] == 0

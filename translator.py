@@ -16,7 +16,7 @@ from terminology_manager import TerminologyManager
 from style_tone_classifier import StyleToneClassifier
 from translation_memory import TranslationMemory
 from translation_validator import TranslationValidator
-from document_object_contract import extract_inline_segments, parse_toc_line
+from document_object_contract import SCHEMA_VERSION as DOCUMENT_OBJECT_CONTRACT_SCHEMA_VERSION, extract_inline_segments, parse_toc_line
 
 try:
     import ctranslate2
@@ -501,7 +501,8 @@ class DocumentTranslator:
                 "inline_object_subtype": object_ctx.get("inline_object_subtype", ""),
                 "phrase_semantics": object_ctx.get("phrase_semantics", ""),
             }
-        strategy = self._normalize_spaces(unit.get("translation_strategy") or default_strategy).lower()
+        requested_strategy = self._normalize_spaces(unit.get("translation_strategy") or default_strategy).lower()
+        strategy = requested_strategy
         if strategy not in {"exact_preserve", "layout_constrained", "semantic_reflow"}:
             strategy = default_strategy
         raw_translatable = unit.get("translatable")
@@ -510,9 +511,12 @@ class DocumentTranslator:
         else:
             translatable = bool(raw_translatable)
         coverage_required = self._normalize_spaces(unit.get("coverage_required") or "strict").lower() or "strict"
-        unit_type = self._normalize_spaces(unit.get("unit_type") or "").lower()
+        requested_unit_type = self._normalize_spaces(unit.get("unit_type") or "").lower()
+        unit_type = requested_unit_type
         unit_text = self._translation_contract_unit_text(unit)
         object_ctx = self._unit_object_context(unit)
+        if not hasattr(self, "_page_policy_matrix") or self._page_policy_matrix is None:
+            self._page_policy_matrix = PagePolicyMatrix()
         matrix_policy = self._page_policy_matrix.classify_unit_policy(
             text=unit_text,
             role=self._normalize_spaces(unit.get("role") or (context or {}).get("block_role") or "body"),
@@ -553,6 +557,11 @@ class DocumentTranslator:
             strategy = "layout_constrained"
             translatable = True
             coverage_required = "strict"
+        if requested_strategy == "exact_preserve" and requested_unit_type in {"citation", "code_visible"}:
+            strategy = "exact_preserve"
+            coverage_required = "strict"
+            if requested_unit_type == "code_visible":
+                translatable = False
         if unit_type == "code_visible" and strategy == "exact_preserve" and self._should_relax_code_visible_contract(unit, unit_text, context=context):
             strategy = "layout_constrained"
             translatable = True
@@ -942,6 +951,18 @@ class DocumentTranslator:
         translated_title = self._normalize_spaces(translated_title or title)
         translated_title = re.sub(r"(?<=\d),(?=\d)", ".", translated_title)
         translated_title = re.sub(r"^[■•▪◦·\-\*]+\s*", "", translated_title)
+        if self._translation_pathologically_expanded(title, translated_title):
+            compact_title = self._normalize_spaces(self._translate_short_label_fr(
+                title,
+                block_context=block_context,
+                block_role=block_role,
+                domain=domain,
+                subdomain=subdomain,
+            ))
+            if compact_title and not self._translation_pathologically_expanded(title, compact_title):
+                translated_title = compact_title
+            else:
+                translated_title = title
         parts = []
         prefix = self._normalize_spaces(parsed.get("prefix") or "")
         if prefix:
@@ -989,6 +1010,31 @@ class DocumentTranslator:
             translated_lines.append(translated_line)
         block["translated_text"] = self._normalize_spaces(" ".join(line for line in translated_lines if line))
         block["translation_compose_mode"] = "toc_structured"
+        block["unit_type"] = "toc_label"
+        block["render_policy"] = "anchored_text"
+        block["translation_policy"] = {
+            "translation_strategy": "layout_constrained",
+            "translatable": True,
+            "coverage_required": "strict",
+            "render_policy": "anchored_text",
+            "reinject_mode": "fixed_overlay",
+            "protection": [],
+            "contract_key": "toc_entry",
+        }
+        existing_contract = dict(block.get("document_object_contract") or {})
+        existing_contract["schema_version"] = DOCUMENT_OBJECT_CONTRACT_SCHEMA_VERSION
+        existing_contract["translation"] = {
+            "strategy": "layout_constrained",
+            "translatable": True,
+            "coverage_required": "strict",
+            "protection": [],
+        }
+        existing_contract["reconstruction"] = {
+            "contract_key": "toc_entry",
+            "render_policy": "anchored_text",
+            "reinject_mode": "fixed_overlay",
+        }
+        block["document_object_contract"] = existing_contract
 
     def _looks_like_abbreviation_key_text(self, text):
         src = self._normalize_spaces(text)
@@ -1465,7 +1511,7 @@ class DocumentTranslator:
             tone="didactique",
         )
         translated = self._normalize_spaces(self._apply_cnn_glossary_fr(translated))
-        if translated and translated.lower() != src.lower():
+        if translated and translated.lower() != src.lower() and not self._translation_pathologically_expanded(src, translated):
             return translated
         if "(" in src or ")" in src or len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", src)) <= 6:
             snippet = self._normalize_spaces(
@@ -1478,14 +1524,34 @@ class DocumentTranslator:
                 )
             )
             snippet = self._normalize_spaces(self._apply_cnn_glossary_fr(snippet))
-            if snippet and snippet.lower() != src.lower():
+            if snippet and snippet.lower() != src.lower() and not self._translation_pathologically_expanded(src, snippet):
                 return snippet
             lexical = self._normalize_spaces(self._fr_short_label_lexical_fallback(src))
-            if lexical and lexical.lower() != src.lower():
+            if lexical and lexical.lower() != src.lower() and not self._translation_pathologically_expanded(src, lexical):
                 return lexical
         retry = self._normalize_spaces(self._direct_ct2_translate_chunks(src, target_lang="fr"))
         retry = self._normalize_spaces(self._apply_cnn_glossary_fr(retry))
+        if retry and self._translation_pathologically_expanded(src, retry):
+            return src
         return retry if retry else src
+
+    def _translation_pathologically_expanded(self, source_text, translated_text, *, max_factor=2.0, max_extra_words=6):
+        source = self._normalize_spaces(source_text or "")
+        translated = self._normalize_spaces(translated_text or "")
+        if not source or not translated:
+            return False
+        source_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", source))
+        translated_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", translated))
+        short_source = len(source) <= 10 or source_words <= 2
+        if short_source:
+            return (
+                len(translated) > max(len(source) + 12, int(len(source) * 1.6))
+                or translated_words > max(source_words + 2, int(source_words * 1.6))
+            )
+        return (
+            len(translated) > max(len(source) * max_factor, len(source) + 60)
+            or translated_words > max(source_words * max_factor, source_words + max_extra_words)
+        )
 
     def _fr_short_label_lexical_fallback(self, text):
         src = str(text or "")
@@ -1561,18 +1627,20 @@ class DocumentTranslator:
             page_text=block_context or "",
             document_text="",
         )
-        term_context = self._terminology_manager.infer_context(
-            " ".join(x for x in [block_context or "", text or ""] if x),
-            source_lang=self._guess_source_lang(text or block_context or ""),
-            doc_role=(block_role or "body").lower(),
-        )
-        if term_context.get("confidence", 0.0) >= report.get("domain_confidence", 0.0):
-            if term_context.get("domain"):
-                report["domain"] = term_context.get("domain")
-                report["domain_confidence"] = term_context.get("confidence", 0.0)
-            if term_context.get("subdomain"):
-                report["subdomain"] = term_context.get("subdomain")
-                report["subdomain_confidence"] = term_context.get("confidence", 0.0)
+        terminology_manager = getattr(self, "_terminology_manager", None)
+        if terminology_manager is not None:
+            term_context = terminology_manager.infer_context(
+                " ".join(x for x in [block_context or "", text or ""] if x),
+                source_lang=self._guess_source_lang(text or block_context or ""),
+                doc_role=(block_role or "body").lower(),
+            )
+            if term_context.get("confidence", 0.0) >= report.get("domain_confidence", 0.0):
+                if term_context.get("domain"):
+                    report["domain"] = term_context.get("domain")
+                    report["domain_confidence"] = term_context.get("confidence", 0.0)
+                if term_context.get("subdomain"):
+                    report["subdomain"] = term_context.get("subdomain")
+                    report["subdomain_confidence"] = term_context.get("confidence", 0.0)
         report["doc_role"] = (block_role or "body").lower()
         return report
 
@@ -2243,6 +2311,18 @@ class DocumentTranslator:
                 context={**page_translation_context, "block_role": block_role, "role": block_role},
             )
             block_unit_type = block_contract.get("unit_type") or ""
+            block_contract_key = ""
+            if block_contract.get("render_policy"):
+                block["render_policy"] = block_contract.get("render_policy")
+            block["translation_policy"] = {
+                "translation_strategy": block_contract.get("strategy") or "semantic_reflow",
+                "translatable": bool(block_contract.get("translatable", True)),
+                "coverage_required": block_contract.get("coverage_required") or "strict",
+                "render_policy": block_contract.get("render_policy") or "",
+                "reinject_mode": block_contract.get("reinject_mode") or "",
+                "protection": list(block_contract.get("translation_protection") or []),
+                "contract_key": block_contract.get("contract_key") or "",
+            }
             if block_contract.get("contract_key") == "toc_entry":
                 block_lines = block.get("lines", []) or []
                 block_ctx_txt = " ".join(
@@ -2271,12 +2351,19 @@ class DocumentTranslator:
                         "strategy": "exact_preserve",
                         "translatable": False,
                         "coverage_required": "strict",
-                        "unit_type": block_unit_type or "abbreviation_key",
+                        "unit_type": "abbreviation_key",
+                        "render_policy": "fixed_preserve",
+                        "contract_key": "glossary_pair",
                     }
+                    block_contract_key = "glossary_pair"
                 elif block_contract["strategy"] == "exact_preserve":
                     block_contract["strategy"] = "layout_constrained"
                     block_contract["translatable"] = True
                     block_contract["coverage_required"] = "strict"
+                    block_contract["unit_type"] = "abbreviation_value"
+                    block_contract["render_policy"] = "anchored_text"
+                    block_contract["contract_key"] = "glossary_pair"
+                    block_contract_key = "glossary_pair"
             immutable_code_block = self._block_has_immutable_programming_code(block)
             if immutable_code_block:
                 block["immutable_code_block"] = True
@@ -2284,8 +2371,11 @@ class DocumentTranslator:
                     "strategy": "exact_preserve",
                     "translatable": False,
                     "coverage_required": "strict",
-                    "unit_type": block_unit_type or "code_visible",
+                    "unit_type": "code_visible",
+                    "render_policy": "anchored_text",
+                    "contract_key": "code_block",
                 }
+                block_contract_key = "code_block"
             is_programming_code_line = bool(
                 role_lc in {"equation_inline", "equation_block"}
                 and self._looks_like_programming_code_line(block_text_preview)
@@ -2298,6 +2388,10 @@ class DocumentTranslator:
             )
             if (is_likely_figure_label or is_programming_code_line) and block_unit_type not in {"code_visible", "reference_link", "citation"}:
                 # Figure internals and equations are immutable by policy.
+                if is_likely_figure_label:
+                    block_contract_key = "figure_label"
+                elif is_programming_code_line:
+                    block_contract_key = "code_block"
                 kept = []
                 for line in block.get("lines", []):
                     line_parts = []
@@ -2408,7 +2502,52 @@ class DocumentTranslator:
                     if line["translated_text"]:
                         kept.append(line["translated_text"])
                 block["translated_text"] = self._normalize_spaces(" ".join(kept))
+                block["translation_compose_mode"] = "preserved"
+                if block_contract_key:
+                    block["unit_type"] = block_contract.get("unit_type") or block_contract_key
+                existing_contract = dict(block.get("document_object_contract") or {})
+                existing_translation_contract = dict(existing_contract.get("translation") or {})
+                existing_reconstruction_contract = dict(existing_contract.get("reconstruction") or {})
+                existing_translation_contract.update(
+                    {
+                        "strategy": block_contract.get("strategy") or "exact_preserve",
+                        "translatable": bool(block_contract.get("translatable", False)),
+                        "coverage_required": block_contract.get("coverage_required") or "strict",
+                        "protection": list(block_contract.get("translation_protection") or []),
+                    }
+                )
+                if block_contract_key:
+                    existing_reconstruction_contract["contract_key"] = block_contract_key
+                if block_contract.get("render_policy"):
+                    existing_reconstruction_contract["render_policy"] = block_contract.get("render_policy")
+                existing_contract["schema_version"] = DOCUMENT_OBJECT_CONTRACT_SCHEMA_VERSION
+                existing_contract["translation"] = existing_translation_contract
+                existing_contract["reconstruction"] = existing_reconstruction_contract
+                block["document_object_contract"] = existing_contract
                 continue
+            if block_contract_key:
+                block["unit_type"] = block_contract.get("unit_type") or block_contract_key
+            existing_contract = dict(block.get("document_object_contract") or {})
+            existing_translation_contract = dict(existing_contract.get("translation") or {})
+            existing_reconstruction_contract = dict(existing_contract.get("reconstruction") or {})
+            existing_translation_contract.update(
+                {
+                    "strategy": block_contract.get("strategy") or "semantic_reflow",
+                    "translatable": bool(block_contract.get("translatable", True)),
+                    "coverage_required": block_contract.get("coverage_required") or "strict",
+                    "protection": list(block_contract.get("translation_protection") or []),
+                }
+            )
+            if block_contract_key:
+                existing_reconstruction_contract["contract_key"] = block_contract_key
+            if block_contract.get("render_policy"):
+                existing_reconstruction_contract["render_policy"] = block_contract.get("render_policy")
+            if block_contract.get("reinject_mode"):
+                existing_reconstruction_contract["reinject_mode"] = block_contract.get("reinject_mode")
+            existing_contract["schema_version"] = DOCUMENT_OBJECT_CONTRACT_SCHEMA_VERSION
+            existing_contract["translation"] = existing_translation_contract
+            existing_contract["reconstruction"] = existing_reconstruction_contract
+            block["document_object_contract"] = existing_contract
             # Paragraph-level translation for narrative body blocks to preserve
             # sentence continuity across multiple lines while keeping enriched context.
             editorial_preserved_paragraph = bool(
@@ -2822,6 +2961,7 @@ class DocumentTranslator:
         self._enforce_structure_protected_inline_tokens(structure)
         self._p4_validate_translations(structure, tgt_code)
         self._repair_structure_target_text(structure, tgt_code)
+        self._repair_pathological_preserved_line_expansions(structure, target_lang=target_lang)
         return structure
 
     def translate_text(
@@ -3599,6 +3739,15 @@ class DocumentTranslator:
             (r"\bqu'est-ce qui est suradapté\b", "qu'est-ce que le surapprentissage"),
             (r"\bconstruire l'architecture du modele\b", "construire l'architecture du modèle"),
             (r"\bclassification d'image avec des CNN\b", "classification d'image avec des CNN"),
+            (r"\bréseau de voyance profonde\b", "réseau de croyances profondes"),
+            (r"\bréseaux de voyance profondes\b", "réseaux de croyances profondes"),
+            (r"\berreur carrière moyenne\b", "erreur quadratique moyenne"),
+            (r"\berreur moyenne carrée\b", "erreur quadratique moyenne"),
+            (r"\bmachine boltzmann repose\b", "machine de Boltzmann restreinte"),
+            (r"\bmachines à commander reposer\b", "machines de Boltzmann restreintes"),
+            (r"\bmachine boltzmann limitée à température\b", "machine de Boltzmann restreinte à température"),
+            (r"\bmachine vectorielle de soutien\b", "machine à vecteurs de support"),
+            (r"\bunité linéaire\b", "unité linéaire rectifiée"),
         ]
         for pat, repl in replacements:
             s = re.sub(pat, repl, s, flags=re.IGNORECASE)
@@ -3951,6 +4100,40 @@ class DocumentTranslator:
         compose_mode = "paragraph_flow"
         if preserve_source_lines:
             translated_lines = self._redistribute_translated_to_lines(translated_para, source_lines, source_markers)
+            for li, line_src in enumerate(source_lines):
+                if li >= len(translated_lines):
+                    break
+                src_line = self._normalize_spaces(line_src)
+                translated_line = self._normalize_spaces(translated_lines[li])
+                if not src_line or not translated_line:
+                    continue
+                src_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", src_line))
+                translated_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", translated_line))
+                too_expanded = (
+                    len(translated_line) > max(len(src_line) * 2.10, len(src_line) + 80)
+                    or translated_words > max(src_words * 2.15, src_words + 10)
+                )
+                if not too_expanded:
+                    continue
+                repaired = self._normalize_spaces(
+                    self._translate_unit_text(
+                        src_line,
+                        target_lang=target_lang,
+                        strategy="layout_constrained",
+                        block_context=context_text,
+                        block_role="body",
+                        domain=domain,
+                        subdomain=subdomain,
+                        style=style,
+                        tone=tone,
+                    )
+                )
+                if self._normalize_lang_code(target_lang) == "fr":
+                    repaired = self._apply_cnn_glossary_fr(repaired)
+                    repaired = self._fix_english_residuals_in_fr(repaired)
+                    repaired = self._apply_cnn_glossary_fr(repaired)
+                if repaired and repaired.lower() != src_line.lower():
+                    translated_lines[li] = repaired
             compose_mode = "preserved"
         for li, line in enumerate(lines):
             lt = translated_lines[li] if li < len(translated_lines) else ""
@@ -4263,7 +4446,7 @@ class DocumentTranslator:
             chain.append(sd)
         if d:
             chain.append(d)
-        if self._use_general_glossary:
+        if getattr(self, "_use_general_glossary", False):
             chain.append("general")
         out = []
         seen = set()
@@ -4298,8 +4481,15 @@ class DocumentTranslator:
     def _get_domain_pair_map(self, domain, source_lang, target_lang, subdomain=""):
         pair_key = f"{source_lang}_{target_lang}"
         out = {}
+        domain_glossaries = getattr(self, "_domain_glossaries", None)
+        if not domain_glossaries:
+            domain_glossaries = self._build_domain_glossaries()
+            try:
+                self._domain_glossaries = domain_glossaries
+            except Exception:
+                pass
         for dom in self._get_domain_priority_chain(domain=domain, subdomain=subdomain):
-            d = self._domain_glossaries.get(dom, {})
+            d = domain_glossaries.get(dom, {})
             pairs = d.get("pairs", {})
             g = pairs.get(pair_key, {})
             if isinstance(g, dict):
@@ -4359,13 +4549,16 @@ class DocumentTranslator:
             return s
         src_lang = self._guess_source_lang(s)
         tgt_lang = self._normalize_lang_code(target_lang)
-        managed_terms = self._terminology_manager.resolve_terms(
-            src_lang,
-            tgt_lang,
-            domain=domain,
-            subdomain=subdomain,
-            doc_role=doc_role,
-        )
+        terminology_manager = getattr(self, "_terminology_manager", None)
+        managed_terms = []
+        if terminology_manager is not None:
+            managed_terms = terminology_manager.resolve_terms(
+                src_lang,
+                tgt_lang,
+                domain=domain,
+                subdomain=subdomain,
+                doc_role=doc_role,
+            )
         if managed_terms:
             placeholder_source, placeholders = self._placeholderize_reserved_terms(s, managed_terms)
             if placeholders:
@@ -4491,14 +4684,31 @@ class DocumentTranslator:
             "science": {
                 "pairs": {
                     "en_fr": {
+                        "local response normalization": "normalisation locale des réponses",
+                        "missed detection rate": "taux de détection manquée",
+                        "modular deep belief networks": "réseaux modulaires de croyances profondes",
                         "gradient descent": "descente de gradient",
                         "learning rate": "taux d'apprentissage",
+                        "mean squared error": "erreur quadratique moyenne",
+                        "multilayer perceptron": "perceptron multicouche",
+                        "multiresolution deep belief network": "réseau de croyances profondes multirésolution",
+                        "nist special database 4": "NIST Special Database 4",
+                        "olivetti research ltd face dataset": "jeu de données de visages Olivetti Research Ltd",
+                        "principal component analysis": "analyse en composantes principales",
+                        "radial basis function": "fonction de base radiale",
+                        "rectified linear unit": "unité linéaire rectifiée",
+                        "restricted boltzmann machine": "machine de Boltzmann restreinte",
+                        "robust restricted boltzmann machines": "machines de Boltzmann restreintes robustes",
+                        "recurrent temporal restricted boltzmann machines": "machines de Boltzmann restreintes temporelles récurrentes",
                         "neural network": "réseau de neurones",
                         "error": "erreur",
                         "hyperparameter": "hyperparamètre",
                         "optimization": "optimisation",
                         "oscillating": "oscillant",
                         "feedforward": "propagation avant",
+                        "support vector machine": "machine à vecteurs de support",
+                        "stochastic gradient descent": "descente de gradient stochastique",
+                        "temperature-based restricted boltzmann machine": "machine de Boltzmann restreinte à température",
                     },
                 },
                 "normalize": {
@@ -4507,6 +4717,15 @@ class DocumentTranslator:
                         "gradient descente": "descente de gradient",
                         "taux d’apprentissage": "taux d'apprentissage",
                         "réseau nerveux": "réseau de neurones",
+                        "erreur carrière moyenne": "erreur quadratique moyenne",
+                        "erreur moyenne carrée": "erreur quadratique moyenne",
+                        "réseau de voyance profonde": "réseau de croyances profondes",
+                        "réseaux de voyance profondes": "réseaux de croyances profondes",
+                        "machines à commander reposer": "machines de Boltzmann restreintes",
+                        "machine boltzmann repose": "machine de Boltzmann restreinte",
+                        "machine boltzmann limitée à température": "machine de Boltzmann restreinte à température",
+                        "machine vectorielle de soutien": "machine à vecteurs de support",
+                        "unité linéaire": "unité linéaire rectifiée",
                     },
                 },
             },
@@ -4774,20 +4993,23 @@ class DocumentTranslator:
             return None
         src = self._guess_source_lang(s)
         tgt = self._normalize_lang_code(target_lang)
-        exact = self._terminology_manager.exact_match(
-            s,
-            source_lang=src,
-            target_lang=tgt,
-            domain=domain,
-            subdomain=subdomain,
-            doc_role=doc_role,
-        )
-        if exact:
-            return exact.get("target_text")
+        terminology_manager = getattr(self, "_terminology_manager", None)
+        if terminology_manager is not None:
+            exact = terminology_manager.exact_match(
+                s,
+                source_lang=src,
+                target_lang=tgt,
+                domain=domain,
+                subdomain=subdomain,
+                doc_role=doc_role,
+            )
+            if exact:
+                return exact.get("target_text")
         low = s.lower()
         pair_key = f"{src}_{tgt}"
+        domain_glossaries = getattr(self, "_domain_glossaries", {}) or {}
         for dom in self._get_domain_priority_chain(domain=domain, subdomain=subdomain):
-            d = self._domain_glossaries.get(dom, {})
+            d = domain_glossaries.get(dom, {})
             pairs = d.get("pairs", {})
             g = pairs.get(pair_key, {})
             if low in g:
@@ -4804,18 +5026,27 @@ class DocumentTranslator:
         out = translated
         tgt_lang = self._normalize_lang_code(target_lang)
         src_lang = self._guess_source_lang(source_text)
-        out = self._terminology_manager.apply_output_terms(
-            out,
-            source_text=source_text,
-            source_lang=src_lang,
-            target_lang=tgt_lang,
-            domain=domain,
-            subdomain=subdomain,
-            doc_role=doc_role,
-        )
+        terminology_manager = getattr(self, "_terminology_manager", None)
+        if terminology_manager is not None:
+            out = terminology_manager.apply_output_terms(
+                out,
+                source_text=source_text,
+                source_lang=src_lang,
+                target_lang=tgt_lang,
+                domain=domain,
+                subdomain=subdomain,
+                doc_role=doc_role,
+            )
         pair_key = f"{src_lang}_{tgt_lang}"
+        domain_glossaries = getattr(self, "_domain_glossaries", None)
+        if not domain_glossaries:
+            domain_glossaries = self._build_domain_glossaries()
+            try:
+                self._domain_glossaries = domain_glossaries
+            except Exception:
+                pass
         for dom in self._get_domain_priority_chain(domain=domain, subdomain=subdomain):
-            g = self._domain_glossaries.get(dom, {})
+            g = domain_glossaries.get(dom, {})
             pairs = g.get("pairs", {})
             norms = g.get("normalize", {})
             pair_map = pairs.get(pair_key, {})
@@ -4825,12 +5056,12 @@ class DocumentTranslator:
                 if sentence_like and (" " not in src):
                     # In full sentences, single-word forced replacements degrade fluency.
                     continue
-                out = re.sub(rf"(?i)\\b{re.escape(src)}\\b", tgt, out)
+                out = re.sub(rf"(?i)\b{re.escape(src)}\b", tgt, out)
             # Normalize common bad variants in target output.
             for bad, good in sorted(norm_map.items(), key=lambda kv: len(kv[0]), reverse=True):
                 if sentence_like and (" " not in bad):
                     continue
-                out = re.sub(rf"(?i)\\b{re.escape(bad)}\\b", good, out)
+                out = re.sub(rf"(?i)\b{re.escape(bad)}\b", good, out)
         return out
 
     def _translate_snippet(self, snippet, target_lang="French", block_context="", level="sentence", block_role="body", style="", tone=""):
@@ -5472,15 +5703,19 @@ class DocumentTranslator:
             subdomain=subdomain,
             doc_role=block_role,
         )
-        terminology_report = self._terminology_manager.validate_reserved_terms(
-            source_text=src,
-            translated_text=translated,
-            source_lang=self._guess_source_lang(src),
-            target_lang=self._normalize_lang_code(target_lang),
-            domain=domain,
-            subdomain=subdomain,
-            doc_role=block_role,
-        )
+        terminology_manager = getattr(self, "_terminology_manager", None)
+        if terminology_manager is not None:
+            terminology_report = terminology_manager.validate_reserved_terms(
+                source_text=src,
+                translated_text=translated,
+                source_lang=self._guess_source_lang(src),
+                target_lang=self._normalize_lang_code(target_lang),
+                domain=domain,
+                subdomain=subdomain,
+                doc_role=block_role,
+            )
+        else:
+            terminology_report = {"ok": True}
         validation_report = self._translation_validator.evaluate(
             source_text=src,
             translated_text=translated,
@@ -5539,8 +5774,8 @@ class DocumentTranslator:
                         translated = alt2
                 translated = self._normalize_technical_terms_fr(self._apply_cnn_glossary_fr(translated))
 
-        if not validation_report.get("ok", True):
-            repaired = self._terminology_manager.apply_output_terms(
+        if not validation_report.get("ok", True) and terminology_manager is not None:
+            repaired = terminology_manager.apply_output_terms(
                 translated,
                 source_text=src,
                 source_lang=self._guess_source_lang(src),
@@ -5550,7 +5785,7 @@ class DocumentTranslator:
                 doc_role=block_role,
             )
             repaired = self._normalize_spaces(repaired)
-            repaired_report = self._terminology_manager.validate_reserved_terms(
+            repaired_report = terminology_manager.validate_reserved_terms(
                 source_text=src,
                 translated_text=repaired,
                 source_lang=self._guess_source_lang(src),
@@ -5580,7 +5815,7 @@ class DocumentTranslator:
             r"|10\.\d{4,9}/[-._;()/:A-Za-z0-9]+"
             r"|(?:/[A-Za-z0-9_.\-]+){2,}/?"
             r"|[A-Za-z0-9_.\-]+\.(?:app|dmg|exe|py|json|yaml|yml|csv|txt|md|pdf|docx|xml|html|js|ts|sql)"
-            r"|\b(?:sudo|mkdir|echo|tee|postgresapp|pgAdmin|PostgreSQL|Postgres\.app|ReLU|CNN|ANN|DL|CV|SQL)\b"
+            r"|\b(?:sudo|mkdir|echo|tee|postgresapp|pgAdmin|PostgreSQL|Postgres\.app|ReLU|CNN|ANN|DL|CV|SQL|NIST|MNIST|CIFAR|Kaggle|ImageNet|Fashion-MNIST|MS COCO|GoogLeNet|ResNet|AlexNet|VGGNet|Inception|DeepDream|R-CNN|SSD|YOLO)\b"
             r"|\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\([^)\n]{0,64}\)"
             r"|\b[A-Za-z0-9]+\s*[=<>±×÷]\s*[-+A-Za-z0-9_\\^{}()./]+\b"
             r"|[A-Za-z0-9]+(?:_[A-Za-z0-9{}]+|\^[A-Za-z0-9{}]+)+"
@@ -6313,6 +6548,109 @@ class DocumentTranslator:
             if not is_dup:
                 kept.append(b)
         structure["blocks"] = kept
+
+    def _line_translation_pathologically_expanded(self, source_text, translated_text):
+        source = self._normalize_spaces(source_text or "")
+        translated = self._normalize_spaces(translated_text or "")
+        if not source or not translated:
+            return False
+        source_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", source))
+        translated_words = len(re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9'\-]*", translated))
+        return (
+            len(translated) > max(len(source) * 2.10, len(source) + 80)
+            or translated_words > max(source_words * 2.15, source_words + 10)
+        )
+
+    def _looks_like_signature_or_location_line(self, text):
+        source = self._normalize_spaces(text or "")
+        if not source:
+            return False
+        if re.search(r"\b(?:India|Srinagar|USA|UK|France|Germany|China|Japan)\b", source):
+            return True
+        tokens = re.findall(r"[A-Za-zÀ-ÿ.']+", source)
+        if 2 <= len(tokens) <= 5:
+            titled = 0
+            for token in tokens:
+                if token in {"M.", "Dr.", "Prof."} or token[:1].isupper():
+                    titled += 1
+            if titled == len(tokens):
+                return True
+        return False
+
+    def _repair_pathological_preserved_line_expansions(self, structure, target_lang="fr"):
+        if not isinstance(structure, dict):
+            return
+        tgt_code = self._normalize_lang_code(target_lang)
+        for block in structure.get("blocks", []) or []:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("translation_compose_mode") or "").strip().lower() != "preserved":
+                continue
+            lines = [line for line in (block.get("lines") or []) if isinstance(line, dict)]
+            if not lines:
+                continue
+            block_context = self._normalize_spaces(
+                " ".join(self._line_source_text_raw(line) for line in lines)
+            )[:600]
+            changed = False
+            for idx, line in enumerate(lines):
+                source = self._line_source_text_raw(line)
+                current = self._normalize_spaces(line.get("translated_text") or "")
+                in_tail = idx >= max(0, int(len(lines) * 0.65))
+                next_source = self._line_source_text_raw(lines[idx + 1]) if idx + 1 < len(lines) else ""
+                next_first = ""
+                next_match = re.search(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'.-]*", next_source)
+                if next_match:
+                    next_first = next_match.group(0)
+                shifted_tail_text = bool(
+                    in_tail
+                    and next_first
+                    and next_first.lower() not in self._normalize_spaces(source).lower()
+                    and re.search(r"\b" + re.escape(next_first) + r"\b", current, flags=re.IGNORECASE)
+                )
+                signature_or_location = bool(in_tail and self._looks_like_signature_or_location_line(source))
+                if not (
+                    self._line_translation_pathologically_expanded(source, current)
+                    or shifted_tail_text
+                    or (signature_or_location and current and current.lower() != self._normalize_spaces(source).lower())
+                ):
+                    continue
+                source_norm = self._normalize_spaces(source)
+                person_name_only = bool(
+                    signature_or_location
+                    and not re.search(r"\b(?:India|Srinagar|USA|UK|France|Germany|China|Japan)\b", source_norm)
+                )
+                if person_name_only:
+                    repaired = source_norm
+                else:
+                    repaired = self._normalize_spaces(
+                        self._translate_unit_text(
+                            source,
+                            target_lang=target_lang,
+                            strategy="layout_constrained",
+                            block_context=block_context,
+                            block_role=str(block.get("role") or "body"),
+                            domain=str(block.get("detected_domain") or "general"),
+                            subdomain=str(block.get("detected_subdomain") or ""),
+                            style=str(block.get("detected_style") or "professionnel"),
+                            tone=str(block.get("detected_tone") or "neutre"),
+                        )
+                    )
+                if tgt_code == "fr" and not person_name_only:
+                    repaired = self._apply_cnn_glossary_fr(repaired)
+                    repaired = self._fix_english_residuals_in_fr(repaired)
+                    repaired = self._apply_cnn_glossary_fr(repaired)
+                if repaired and self._normalize_spaces(repaired) != current:
+                    self._set_line_translation(line, repaired)
+                    changed = True
+            if changed:
+                block["translated_text"] = self._normalize_spaces(
+                    " ".join(
+                        self._normalize_spaces(line.get("translated_text") or "")
+                        for line in lines
+                        if self._normalize_spaces(line.get("translated_text") or "")
+                    )
+                )
 
     def _p4_validate_translations(self, structure: dict, tgt_code: str = "fr") -> None:
         """Post-validation et post-édition via P4TranslationAgent.

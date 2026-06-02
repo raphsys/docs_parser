@@ -4,6 +4,7 @@ from pathlib import Path
 import fitz
 
 from coverage_validator import _classify_rendered_presence, _classify_unit_status, _page_index_for_unit, analyze_document_coverage, analyze_rendered_text_coverage
+from scripts.run_reconstruction_validation import _source_overlay_findings_from_lines
 from publication_qa import _english_leak_count, _is_decorative_raster
 
 
@@ -361,6 +362,26 @@ class CoverageValidatorTests(unittest.TestCase):
         doc.close()
         report = analyze_rendered_text_coverage([], translated_pages, str(self.pdf_path))
         self.assertEqual(report["summary"]["rendered_missing_units"], 0)
+
+    def test_source_overlay_ignores_short_common_source_fragments(self):
+        findings = _source_overlay_findings_from_lines(
+            [
+                {
+                    "non_translated_expected": False,
+                    "text": "explique comment",
+                    "source_text": "and",
+                    "present_in_region": True,
+                },
+                {
+                    "non_translated_expected": False,
+                    "text": "texte traduit",
+                    "source_text": "Information",
+                    "present_in_region": True,
+                },
+            ],
+            region_text="texte traduit explique comment",
+        )
+        self.assertEqual(findings, [])
 
     def test_page_index_for_unit_prefers_explicit_page_index(self):
         self.assertEqual(_page_index_for_unit({"page_id": 25, "page_index": 4}, 25), 4)

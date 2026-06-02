@@ -1,0 +1,7 @@
+{
+  "bos_token": "<|endoftext|>",
+  "eos_token": "<|im_end|>",
+  "layer_norm_epsilon": 1e-06,
+  "multi_query_attention": true,
+  "unk_token": ""
+}

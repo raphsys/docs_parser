@@ -53,6 +53,175 @@ def _word_count(text):
     return len(re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", text or ""))
 
 
+def _block_is_atomic_formula_region(block):
+    role = str((block or {}).get("role") or "").strip().lower()
+    object_type = str((block or {}).get("object_type") or "").strip().lower()
+    object_class = str((block or {}).get("object_class") or "").strip().lower()
+    hints = dict((block or {}).get("structure_hints") or {})
+    structural_hint = str(hints.get("structural_role_hint") or "").strip().lower()
+    if role in {"equation_inline", "equation_block", "formula"}:
+        return True
+    if object_class == "formula" or object_type in {
+        "formula_block",
+        "formula_line",
+        "formula_equation",
+        "formula_region",
+        "inline_formula",
+        "inline_formula_cluster",
+    }:
+        return True
+    if structural_hint == "formula_block":
+        return True
+    return False
+
+
+def _formula_regions_from_layout_ai(page_data):
+    layout_ai = (page_data or {}).get("layout_ai_structure") or {}
+    regions = []
+    for idx, region in enumerate(layout_ai.get("formula_regions") or []):
+        rect = _rect_from_bbox((region or {}).get("bbox"))
+        if rect.get_area() <= 0:
+            continue
+        regions.append(
+            {
+                "id": f"formula_region_ai_{idx}",
+                "bbox": _bbox_from_rect(rect),
+                "source": "layout_ai_formula_region",
+                "render_policy": "source_region_preserve",
+                "translation_policy": "preserve",
+            }
+        )
+    return regions
+
+
+def _formula_regions_should_merge(left, right):
+    if left.get_area() <= 0 or right.get_area() <= 0:
+        return False
+    if (left & right).get_area() > 0:
+        return True
+    horizontal_gap = max(0.0, max(left.x0, right.x0) - min(left.x1, right.x1))
+    vertical_gap = max(0.0, max(left.y0, right.y0) - min(left.y1, right.y1))
+    if _vertical_overlap_ratio(left, right) >= 0.22 and horizontal_gap <= max(28.0, 0.18 * max(left.width, right.width)):
+        return True
+    if _horizontal_overlap_ratio(left, right) >= 0.18 and vertical_gap <= max(22.0, 0.45 * max(left.height, right.height)):
+        return True
+    return False
+
+
+def _merge_formula_region_candidates(candidates):
+    components = []
+    for candidate in candidates:
+        rect = candidate["rect"]
+        placed = False
+        for component in components:
+            if any(_formula_regions_should_merge(rect, other["rect"]) for other in component):
+                component.append(candidate)
+                placed = True
+                break
+        if not placed:
+            components.append([candidate])
+
+    changed = True
+    while changed:
+        changed = False
+        merged_components = []
+        while components:
+            current = components.pop(0)
+            current_rects = [item["rect"] for item in current]
+            absorbed = []
+            for idx, other in enumerate(components):
+                if any(_formula_regions_should_merge(a, b) for a in current_rects for b in [item["rect"] for item in other]):
+                    current.extend(other)
+                    current_rects = [item["rect"] for item in current]
+                    absorbed.append(idx)
+                    changed = True
+            components = [component for idx, component in enumerate(components) if idx not in absorbed]
+            merged_components.append(current)
+        components = merged_components
+
+    regions = []
+    for idx, component in enumerate(components):
+        rect = component[0]["rect"]
+        block_ids = []
+        sources = set()
+        for item in component:
+            rect = rect | item["rect"]
+            block_ids.extend(item.get("block_ids") or [])
+            sources.add(str(item.get("source") or ""))
+        regions.append(
+            {
+                "id": f"formula_region_{idx}",
+                "bbox": _bbox_from_rect(rect),
+                "source": "+".join(sorted(s for s in sources if s)) or "formula_region",
+                "block_ids": sorted(set(block_ids)),
+                "render_policy": "source_region_preserve",
+                "translation_policy": "preserve",
+            }
+        )
+    return regions
+
+
+def _annotate_formula_region_block(block, region_id):
+    block["formula_region_id"] = region_id
+    block["object_class"] = "formula"
+    block["object_type"] = "formula_region"
+    block["translation_policy"] = "preserve"
+    block["render_policy"] = "source_overlay"
+    block.setdefault("formula_source_lines", copy.deepcopy(block.get("lines") or []))
+    block["lines"] = []
+    block["line_texts"] = []
+    block["text"] = ""
+    block["raw_text"] = ""
+    _set_structure_hints_if_missing(
+        block,
+        structural_role_hint="formula_block",
+        layout_behavior_hint="source_region_preserve",
+        group_ids={"formula_region_id": region_id},
+    )
+
+
+def _assemble_formula_regions(page_data):
+    blocks = list((page_data or {}).get("blocks") or [])
+    candidates = []
+    for region in _formula_regions_from_layout_ai(page_data):
+        rect = _rect_from_bbox(region.get("bbox"))
+        if rect.get_area() > 0:
+            candidates.append({"rect": rect, "source": region.get("source"), "block_ids": []})
+    changed = False
+
+    for idx, block in enumerate(blocks):
+        if not isinstance(block, dict) or not _block_is_atomic_formula_region(block):
+            continue
+        rect = _rect_from_bbox(block.get("bbox"))
+        if rect.get_area() <= 0:
+            continue
+        candidates.append({"rect": rect, "source": "block_formula_role", "block_ids": [str(block.get("id") or f"block_{idx}")]})
+
+    regions = _merge_formula_region_candidates(candidates)
+    for region in regions:
+        region_rect = _rect_from_bbox(region.get("bbox"))
+        region_block_ids = set(region.get("block_ids") or [])
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_rect = _rect_from_bbox((block or {}).get("bbox"))
+            if block_rect.get_area() <= 0:
+                continue
+            block_id = str(block.get("id") or "")
+            if block_id not in region_block_ids and not (
+                _intersection_ratio(region_rect, block_rect) >= 0.35 or _intersection_ratio(block_rect, region_rect) >= 0.35
+            ):
+                continue
+            if block_id:
+                region_block_ids.add(block_id)
+            _annotate_formula_region_block(block, region["id"])
+            changed = True
+        region["block_ids"] = sorted(region_block_ids)
+    if regions:
+        page_data["formula_regions"] = regions
+    return page_data, changed
+
+
 def _block_style_signature(block):
     for line in block.get("lines", []) or []:
         for phrase in line.get("phrases", []) or []:
@@ -1210,6 +1379,11 @@ def apply_page_extraction_postprocessors(page_data):
             work["chart_structure"] = chart_structure
             applied.append("chart_structure")
 
+    work, local_changed = _assemble_formula_regions(work)
+    if local_changed:
+        changed = True
+        applied.append("formula_region_detection")
+
     chart_structure = work.get("chart_structure") or {}
     chart_block_ids = set()
     for key in ("y_tick_block_ids", "y_axis_label_ids", "x_axis_label_ids", "legend_label_ids"):
@@ -1219,6 +1393,7 @@ def apply_page_extraction_postprocessors(page_data):
         "table": None,
         "annotations": None,
         "chart": None,
+        "formula": None,
         "layout_ai": None,
     }
     if layout_type == "table_dominant" or page_family in {"table_page", "table_diagram_example"} or document_type in {"form", "invoice", "receipt"}:
@@ -1227,6 +1402,8 @@ def apply_page_extraction_postprocessors(page_data):
         native_structure["chart"] = _annotate_chart_native_structure(work)
     if layout_type == "annotated_page" or page_family in {"illustrated_label_page", "chart_label_page", "body_with_diagram"}:
         native_structure["annotations"] = _annotate_annotation_native_structure(work, excluded_block_ids=chart_block_ids)
+    if work.get("formula_regions"):
+        native_structure["formula"] = {"regions": list(work.get("formula_regions") or []), "count": len(work.get("formula_regions") or [])}
     native_structure["layout_ai"] = _annotate_layout_ai_native_structure(work)
     work["native_structure"] = native_structure
 

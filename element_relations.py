@@ -211,10 +211,21 @@ def _infer_pair_relation(block, previous, current, sequence_index, layout_direct
         "continuation": bool(continuation),
         "confidence": round(confidence, 4),
         "ai_review_required": bool(ai_review_required),
+        "heuristic_decision": {
+            "visual_relation": visual_relation,
+            "logical_relation": logical_relation,
+            "continuation": bool(continuation),
+            "confidence": round(confidence, 4),
+            "ai_review_required": bool(ai_review_required),
+        },
         "understanding": {
             "mode": "semantic_heuristics",
             "external_model_used": False,
             "ai_ready": True,
+        },
+        "semantic_ai_review": {
+            "applied": False,
+            "review_mode": "not_run",
         },
         "signals": {
             "same_line": bool(same_line),

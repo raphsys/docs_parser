@@ -2,7 +2,7 @@ import unittest
 
 import fitz
 
-from reconstructor import DocumentReconstructor
+from reconstructor import BlockRenderOp, DocumentReconstructor, EditorialBlockRenderer, LineTemplate
 
 
 class ReconstructorFontSizingTests(unittest.TestCase):
@@ -109,6 +109,40 @@ class ReconstructorFontSizingTests(unittest.TestCase):
         min_fs = reconstructor._min_fontsize_for_item(item, 12.48, strict=True)
         self.assertGreaterEqual(min_fs, 11.9)
 
+    def test_unit_render_tuning_preserves_source_floor_for_anchored_labels(self):
+        reconstructor = DocumentReconstructor()
+        unit = type("Unit", (), {})()
+        unit.style = {"size": 12.0}
+        unit.metadata = {"adaptive_profile": {"unit_profile": "anchored_label", "page_profile": "academic_dense"}}
+        tuning = reconstructor._unit_render_tuning(unit, plan=None)
+        self.assertGreaterEqual(tuning["min_fontsize"], 11.4)
+
+    def test_abbreviation_units_get_anchor_friendly_adaptive_profiles(self):
+        reconstructor = DocumentReconstructor()
+        raw_unit = {
+            "unit_type": "abbreviation_key",
+            "translation_policy": {"render_policy": "fixed_preserve", "contract_key": "glossary_pair"},
+            "object_comprehension": {"object_type": "short_label", "object_class": "visual_label"},
+        }
+        profile_key = reconstructor._unit_adaptive_profile(raw_unit, text="MSE", child_units=[], block={"role": "body"}, page_data={})
+        self.assertEqual(profile_key["unit_profile"], "protected_inline")
+
+        raw_unit_value = {
+            "unit_type": "abbreviation_value",
+            "translation_policy": {"render_policy": "anchored_text", "contract_key": "glossary_pair"},
+            "object_comprehension": {"object_type": "short_label", "object_class": "visual_label"},
+        }
+        profile_value = reconstructor._unit_adaptive_profile(raw_unit_value, text="Mean squared error", child_units=[], block={"role": "body"}, page_data={})
+        self.assertEqual(profile_value["unit_profile"], "anchored_label")
+
+    def test_glossary_pair_contract_is_recognized_by_reconstruction_key(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "translation_compose_mode": "abbreviation_pairs",
+            "object_comprehension": {"object_type": "short_label", "object_class": "visual_label"},
+        }
+        self.assertEqual(reconstructor._reconstruction_contract_key_for_block(block, page_data={}), "glossary_pair")
+
     def test_native_style_fidelity_locks_min_fontsize_to_original(self):
         reconstructor = DocumentReconstructor()
         item = {
@@ -118,7 +152,10 @@ class ReconstructorFontSizingTests(unittest.TestCase):
             "descriptor_v3_render_unit": {"structure_priority": "secondary"},
         }
         self.assertEqual(reconstructor._min_fontsize_for_item(item, 15.0, strict=False), 15.0)
-        self.assertEqual(reconstructor._min_fontsize_for_item(item, 15.0, strict=True), 15.0)
+
+    def test_clean_text_for_render_strips_control_characters(self):
+        reconstructor = DocumentReconstructor()
+        self.assertEqual(reconstructor._clean_text_for_render("A\x02 B\x07"), "A B")
 
     def test_native_structured_editorial_body_locks_fontsize(self):
         reconstructor = DocumentReconstructor()
@@ -517,6 +554,129 @@ class ReconstructorFontSizingTests(unittest.TestCase):
                 "body_paragraph",
             )
         )
+
+    def test_prose_renderer_detects_signature_tail_after_vertical_gap(self):
+        reconstructor = DocumentReconstructor()
+        renderer = EditorialBlockRenderer(reconstructor)
+        lines = [
+            {
+                "text": f"Chapter body line {idx}",
+                "source_text": f"Chapter body line {idx}",
+                "translated_text": f"Ligne de corps {idx}",
+            }
+            for idx in range(14)
+        ]
+        lines.extend(
+            [
+                {
+                    "text": "Srinagar, India",
+                    "source_text": "Srinagar, India",
+                    "translated_text": "Srinagar, Inde",
+                },
+                {
+                    "text": "M. Arif Wani",
+                    "source_text": "M. Arif Wani",
+                    "translated_text": "M. Arif Wani",
+                },
+                {
+                    "text": "Farooq Ahmad Bhat",
+                    "source_text": "Farooq Ahmad Bhat",
+                    "translated_text": "Farooq Ahmad Bhat",
+                },
+                {
+                    "text": "Saduf Afzal",
+                    "source_text": "Saduf Afzal",
+                    "translated_text": "Afzal Asif",
+                },
+            ]
+        )
+        templates = []
+        y = 60.0
+        for idx in range(len(lines)):
+            if idx == 14:
+                y += 24.0
+            x0 = 54.0 if idx == 14 else (250.0 if idx > 14 else 54.0)
+            templates.append(
+                LineTemplate(
+                    line_id=f"n_0:line:{idx}",
+                    source_line_indices=[idx],
+                    bbox=(x0, y, 385.0, y + 10.0),
+                    baseline_y=y + 8.0,
+                    ascent=8.0,
+                    descent=2.0,
+                    left_x=x0,
+                    right_x=385.0,
+                    usable_width=385.0 - x0,
+                    indent_px=0.0,
+                    first_line_indent_px=0.0,
+                    alignment="right" if idx > 14 else "left",
+                    paragraph_id="n_0:paragraph:0",
+                    paragraph_index=0,
+                    line_index_in_paragraph=idx,
+                    is_first_paragraph_line=idx == 0,
+                    is_last_paragraph_line_hint=False,
+                )
+            )
+            y += 10.0
+        plan = type(
+            "Plan",
+            (),
+            {
+                "source_block": {"id": "n_0", "lines": lines},
+                "block_bbox": (54.0, 58.0, 385.0, 320.0),
+                "line_templates": templates,
+                "editorial_relations": {},
+                "padding_top": 0.0,
+            },
+        )()
+
+        tail_start = renderer._anchored_tail_start_for_prose_block(plan, templates)
+        self.assertEqual(tail_start, 14)
+        paragraphs = renderer._paragraphs_from_source_line_range(plan, templates, 0, tail_start)
+        self.assertTrue(paragraphs[0].startswith("Ligne de corps 0"))
+        self.assertIn("Ligne de corps 13", paragraphs[0])
+        self.assertNotIn("Afzal Asif", " ".join(paragraphs))
+        self.assertTrue(renderer._should_try_linewise_for_anchored_tail_prose(plan))
+
+    def test_structured_prose_with_code_like_tokens_prefers_linewise_attempt(self):
+        reconstructor = DocumentReconstructor()
+        renderer = EditorialBlockRenderer(reconstructor)
+        unit = type(
+            "Unit",
+            (),
+            {
+                "metadata": {
+                    "fragments": [
+                        {
+                            "text": "Counting Rows and Values Using count()",
+                            "expression_semantics": {"inline_class": "technical_inline"},
+                        }
+                    ],
+                    "has_protected_fragments": True,
+                },
+                "text_source": "Counting Rows and Values Using count()",
+                "text_translated": "Counting Rows and Values Using count()",
+            },
+        )()
+        plan = type(
+            "Plan",
+            (),
+            {
+                "source_block": {
+                    "id": "n_5",
+                    "semantic_groups": [{"id": "g1"}],
+                    "lines": [
+                        {"text": "Creating the Library Survey Tables"},
+                        {"text": "Creating the 2014 Library Data Table"},
+                        {"text": "Counting Rows and Values Using count()"},
+                        {"text": "Finding Maximum and Minimum Values Using max() and min()"},
+                    ],
+                },
+                "units": [unit],
+            },
+        )()
+
+        self.assertTrue(renderer._should_try_linewise_for_structured_prose(plan))
 
     def test_anchored_text_non_editorial_body_can_keep_strict_line_items(self):
         reconstructor = DocumentReconstructor()
@@ -1057,6 +1217,167 @@ class ReconstructorFontSizingTests(unittest.TestCase):
         }
         self.assertFalse(reconstructor._item_requires_exact_slot_render(item))
         self.assertTrue(reconstructor._item_requires_anchored_render(item, anchored_figure_page=False))
+
+    def test_short_marker_does_not_infer_vertical_rotation_from_bbox(self):
+        reconstructor = DocumentReconstructor()
+        bbox = [72.0, 689.76, 80.16, 704.64]
+        self.assertEqual(reconstructor._rotation_deg_for_bbox_text(bbox, "9"), 0)
+        self.assertEqual(reconstructor._rotation_deg_for_bbox_text(bbox, "A"), 0)
+
+        explicit_item = {"text": "9", "rotation_deg": 90, "bbox": bbox}
+        self.assertEqual(
+            reconstructor._rotation_deg_for_item(explicit_item, bbox_like=bbox, text="9"),
+            90,
+        )
+
+    def test_presence_fallback_refuses_font_shrink_solution(self):
+        reconstructor = DocumentReconstructor()
+        doc = fitz.open()
+        page = doc.new_page(width=220, height=120)
+        block = {
+            "id": "b_dense",
+            "role": "body",
+            "bbox": [20, 20, 120, 38],
+            "text": "Short source",
+            "translated_text": "Une traduction beaucoup plus longue qui ne peut pas tenir sans agrandir le bloc",
+            "style": {"size": 12},
+            "lines": [{"bbox": [20, 20, 120, 38], "line_text": "Short source", "style": {"size": 12}}],
+        }
+        plan = reconstructor._build_block_reconstruction_plan(page, {"blocks": [block]}, block, target_lang="fr")
+        ops = reconstructor._validated_block_presence_fallback_ops(page, {"blocks": [block]}, block, "fr", plan=plan)
+        doc.close()
+
+        self.assertEqual(ops, [])
+
+    def test_page_text_overlap_is_blocking_between_blocks(self):
+        reconstructor = DocumentReconstructor()
+        plan = type("Plan", (), {"block_id": "b1"})()
+        existing = [{"block_id": "b0", "unit_id": "u0", "rect": fitz.Rect(20, 20, 100, 40)}]
+        ops = [
+            BlockRenderOp(
+                op_type="draw_text_run",
+                block_id="b1",
+                unit_id="u1",
+                bbox=(50, 25, 130, 42),
+                text="overlap",
+                style={},
+            )
+        ]
+
+        findings = reconstructor._validate_ops_against_page_text_rects(plan, ops, existing)
+
+        self.assertTrue(any(finding["type"] == "text_overlap" and finding["scope"] == "page" for finding in findings))
+
+    def test_rebalance_estimates_required_height_at_source_size(self):
+        reconstructor = DocumentReconstructor()
+        page_data = {"blocks": []}
+        block = {
+            "id": "b_reflow",
+            "role": "body",
+            "bbox": [20, 20, 140, 40],
+            "text": "Short source",
+            "translated_text": "Une traduction beaucoup plus longue qui doit declencher une expansion verticale avant le rendu",
+            "style": {"size": 12},
+            "lines": [{"bbox": [20, 20, 140, 40], "line_text": "Short source", "style": {"size": 12}}],
+        }
+        rect = reconstructor._fitz_rect_from_bbox_like(block["bbox"])
+
+        _, desired_h = reconstructor._rebalance_candidate_size(block, rect, page_data)
+
+        self.assertGreater(desired_h, rect.height)
+
+    def test_page_layout_solver_pushes_blocks_without_font_shrink(self):
+        reconstructor = DocumentReconstructor()
+        doc = fitz.open()
+        page = doc.new_page(width=220, height=180)
+        plan_a = type(
+            "Plan",
+            (),
+            {
+                "block_id": "a",
+                "block_bbox": (20, 20, 150, 42),
+                "block_bbox_pt": (20, 20, 150, 42),
+                "container_bbox": (20, 20, 150, 42),
+                "protected_regions": [],
+                "line_templates": [],
+                "constraints": {},
+            },
+        )()
+        plan_b = type(
+            "Plan",
+            (),
+            {
+                "block_id": "b",
+                "block_bbox": (20, 30, 150, 52),
+                "block_bbox_pt": (20, 30, 150, 52),
+                "container_bbox": (20, 30, 150, 52),
+                "protected_regions": [],
+                "line_templates": [],
+                "constraints": {},
+            },
+        )()
+        op_a = BlockRenderOp(
+            "draw_text_run",
+            "a",
+            "a:0",
+            bbox=(20, 20, 120, 34),
+            text="premier bloc",
+            style={"size": 12},
+            metadata={"point": (20, 31), "fontsize": 12, "source_fontsize": 12, "min_font_ratio": 1.0},
+        )
+        op_b = BlockRenderOp(
+            "draw_text_run",
+            "b",
+            "b:0",
+            bbox=(20, 28, 120, 42),
+            text="second bloc",
+            style={"size": 12},
+            metadata={"point": (20, 39), "fontsize": 12, "source_fontsize": 12, "min_font_ratio": 1.0},
+        )
+
+        commit_a = reconstructor._build_page_layout_commit(plan_a, [op_a], {}, {"expected_units": 1})
+        commit_b = reconstructor._build_page_layout_commit(plan_b, [op_b], {}, {"expected_units": 1})
+        resolved = reconstructor._resolve_page_layout_cascade(page, [commit_a], commit_b)
+        doc.close()
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(len(resolved), 2)
+        self.assertEqual(reconstructor._page_layout_overlap_pairs(resolved), [])
+        sizes = [
+            (op.metadata or {}).get("fontsize")
+            for commit in resolved
+            for op in commit.ops
+            if op.op_type == "draw_text_run"
+        ]
+        self.assertEqual(sizes, [12, 12])
+
+    def test_compact_translation_variant_is_available_for_layout_solver(self):
+        reconstructor = DocumentReconstructor()
+        block = {
+            "id": "b",
+            "translated_text": "une traduction volontairement tres longue",
+            "compact_translated_text": "traduction concise",
+            "lines": [
+                {
+                    "line_text": "short source",
+                    "translated_text": "une ligne traduite volontairement tres longue",
+                    "compact_translated_text": "ligne concise",
+                    "phrases": [
+                        {
+                            "texte": "une phrase traduite volontairement tres longue",
+                            "compact_translated_text": "phrase concise",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        variant = reconstructor._try_compact_translation_block_variant(block, "fr")
+
+        self.assertIsNotNone(variant)
+        self.assertEqual(variant["translated_text"], "traduction concise")
+        self.assertEqual(variant["lines"][0]["translated_text"], "ligne concise")
+        self.assertEqual(variant["lines"][0]["phrases"][0]["translated_text"], "phrase concise")
 
 if __name__ == "__main__":
     unittest.main()

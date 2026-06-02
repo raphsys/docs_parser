@@ -668,6 +668,97 @@ def _classify_rendered_presence(unit, page_text, full_text=""):
     return "missing", "not_rendered", expected
 
 
+def analyze_render_quality_gates(summary: dict) -> dict:
+    """Convertit les critères de validation en gates publication."""
+    crit = summary.get("criteria", {}) if isinstance(summary, dict) else {}
+    gates = {
+        "text_presence": {
+            "pass": crit.get("all_text_present_ok", True),
+            "score": round(crit.get("all_text_present_rate", 1.0), 4),
+            "threshold": 1.0,
+        },
+        "text_in_origin_block": {
+            "pass": crit.get("texts_stay_in_origin_ok", True),
+            "score": round(crit.get("texts_stay_in_origin_rate", 1.0), 4),
+            "threshold": 0.90,
+        },
+        "reading_order": {
+            "pass": crit.get("reading_order_ok", True),
+            "score": round(crit.get("reading_order_score", 1.0), 4),
+            "threshold": 0.95,
+        },
+        "geometry": {
+            "pass": crit.get("geometry_ok", True),
+            "score": round(crit.get("geometry_mean_iou", 1.0), 4),
+            "threshold": 0.45,
+        },
+        "line_breaks": {
+            "pass": crit.get("line_breaks_ok", True),
+            "score": round(crit.get("line_breaks_ok_rate", 1.0), 4),
+            "threshold": 1.0,
+        },
+        "styles": {
+            "pass": crit.get("styles_ok", True),
+            "score": round(crit.get("styles_ok_rate", 1.0), 4),
+            "threshold": 1.0,
+        },
+        "non_translated_reinserted": {
+            "pass": crit.get("non_translated_reinserted_ok", True),
+            "score": round(crit.get("non_translated_reinserted_rate", 1.0), 4),
+            "threshold": 1.0,
+        },
+        "protected_tokens": {
+            "pass": crit.get("protected_tokens_reinserted_ok", True),
+            "score": round(crit.get("protected_tokens_reinserted_rate", 1.0), 4),
+            "threshold": 1.0,
+        },
+        "no_disappeared_blocks": {
+            "pass": crit.get("no_block_disappears_ok", True),
+            "score": 1.0 if crit.get("no_block_disappears_ok", True) else 0.0,
+            "threshold": 1.0,
+        },
+        "render_findings": {
+            "pass": crit.get("render_findings_ok", True),
+            "count": crit.get("render_finding_count", 0),
+            "threshold_count": 0,
+        },
+        "render_verdicts": {
+            "pass": crit.get("render_verdicts_ok", True),
+            "count": crit.get("render_verdict_failed_count", 0),
+            "threshold_count": 0,
+        },
+        "source_overlays": {
+            "pass": crit.get("source_overlay_ok", True),
+            "count": crit.get("source_overlay_finding_count", 0),
+            "threshold_count": 0,
+        },
+        "glyphs": {
+            "pass": crit.get("glyphs_ok", True),
+            "count": crit.get("glyph_finding_count", 0),
+            "threshold_count": 0,
+        },
+        "table_cells": {
+            "pass": crit.get("table_cells_ok", True),
+            "count": crit.get("table_cell_validation_failed_count", 0),
+            "threshold_count": 0,
+        },
+        "background": {
+            "pass": crit.get("background_ok", True),
+            "count": crit.get("background_finding_count", 0),
+            "threshold_count": 0,
+        },
+    }
+    failed_gates = [name for name, gate in gates.items() if not gate["pass"]]
+    gates["_meta"] = {
+        "all_pass": not failed_gates,
+        "failed_count": len(failed_gates),
+        "failed_gates": failed_gates,
+        "case_id": summary.get("case_id", "") if isinstance(summary, dict) else "",
+        "page_index": summary.get("page_index") if isinstance(summary, dict) else None,
+    }
+    return gates
+
+
 def analyze_rendered_text_coverage(source_pages, translated_pages, pdf_path, target_lang="fr"):
     del source_pages, target_lang
     rendered_pages = _extract_rendered_page_texts(pdf_path)

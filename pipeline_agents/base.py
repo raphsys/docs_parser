@@ -114,7 +114,7 @@ def _resolve_backend(resolved_id: str, requested: str = "auto") -> tuple[str, st
     has_ct2 = _ct2_available(ct2_dir)
 
     if requested == "ct2":
-        return ("ct2", ct2_dir) if has_ct2 else ("transformers", "")
+        return ("ct2", ct2_dir)
     if requested == "transformers":
         return ("transformers", "")
     # auto

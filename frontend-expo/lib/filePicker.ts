@@ -44,13 +44,12 @@ export async function pickDocument(): Promise<PickedDocument | null> {
     multiple: false,
     type: ["application/pdf", "image/*"],
   });
-  if (result.canceled || !result.assets?.length) {
+  if (result.type === "cancel") {
     return null;
   }
-  const asset = result.assets[0];
   return {
-    uri: asset.uri,
-    name: asset.name,
-    mimeType: asset.mimeType || "application/octet-stream",
+    uri: result.uri,
+    name: result.name,
+    mimeType: result.mimeType || "application/octet-stream",
   };
 }

@@ -3,14 +3,13 @@
     "allowJs": true,
     "esModuleInterop": true,
     "strict": true,
-    "jsx": "react-jsx",
+    "jsx": "react-native",
     "lib": [
       "DOM",
       "ESNext"
     ],
     "module": "esnext",
-    "moduleDetection": "force",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
     "noEmit": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
@@ -21,5 +20,6 @@
     "babel.config.js",
     "android",
     "ios"
-  ]
+  ],
+  "extends": "expo/tsconfig.base"
 }

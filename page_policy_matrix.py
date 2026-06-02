@@ -160,7 +160,9 @@ class PagePolicyMatrix:
         layout_type="mixed_blocks",
         style_profile="mixed_irregular",
         fallback_policy="",
+        **kwargs,
     ):
+        del kwargs
         txt = re.sub(r"\s+", " ", str(text or "")).strip()
         role = self._norm(role, "body")
         source_kind = self._norm(source_kind)

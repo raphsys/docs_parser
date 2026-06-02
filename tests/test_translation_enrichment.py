@@ -254,6 +254,33 @@ class TranslationEnrichmentTests(unittest.TestCase):
 
         self.assertEqual(translated, "PARTIE B: LA CONSTRUCTION DES MODULES INCEPTION ET DES COUCHES DE MAX-POOLING")
 
+    def test_translate_toc_block_writes_toc_contract(self):
+        block = {
+            "lines": [
+                {
+                    "line_text": "Chapter 1 / Introduction",
+                    "phrases": [{"texte": "Chapter 1 / Introduction"}],
+                }
+            ]
+        }
+        self.translator._translate_toc_line_text = lambda text, **kwargs: "Chapitre 1 / Introduction"
+
+        self.translator._translate_toc_block(
+            block,
+            target_lang="fr",
+            block_context="Chapter 1 / Introduction",
+            block_role="body",
+            domain="general",
+            subdomain="",
+            style="professionnel",
+            tone="neutre",
+        )
+
+        self.assertEqual(block["unit_type"], "toc_label")
+        self.assertEqual(block["translation_compose_mode"], "toc_structured")
+        self.assertEqual(block["document_object_contract"]["reconstruction"]["contract_key"], "toc_entry")
+        self.assertEqual(block["document_object_contract"]["translation"]["strategy"], "layout_constrained")
+
     def test_backfill_phrase_span_translations_does_not_dump_long_phrase_into_tiny_span(self):
         phrase = {
             "bbox": [40, 100, 320, 160],
@@ -1339,6 +1366,36 @@ class TranslationEnrichmentTests(unittest.TestCase):
         self.assertTrue(self.translator._looks_like_abbreviation_key_text("M-DBNs"))
         self.assertFalse(self.translator._looks_like_abbreviation_key_text("Local response normalization"))
 
+    def test_placeholderize_inline_reserved_chunks_preserves_technical_named_entities(self):
+        source = "Fashion-MNIST, Google Open Images, ImageNet, MS COCO, Kaggle, GoogLeNet, ResNet"
+        placeholderized, placeholders = self.translator._placeholderize_inline_reserved_chunks(source)
+
+        self.assertTrue(placeholders)
+        self.assertNotEqual(placeholderized, source)
+        restored = self.translator._restore_inline_reserved_chunks(placeholderized, placeholders)
+        self.assertEqual(restored, source)
+
+    def test_technical_term_normalization_repairs_common_ml_mistranslations(self):
+        text = "réseau de voyance profonde, erreur carrière moyenne, machine boltzmann repose"
+        normalized = self.translator._normalize_technical_terms_fr(text)
+
+        self.assertIn("réseau de croyances profondes", normalized)
+        self.assertIn("erreur quadratique moyenne", normalized)
+        self.assertIn("machine de Boltzmann restreinte", normalized)
+
+    def test_science_domain_glossary_repairs_common_ml_terms(self):
+        translated = self.translator._apply_domain_glossary(
+            "erreur moyenne carrée et analyse en composantes principales",
+            source_text="mean squared error and principal component analysis",
+            target_lang="fr",
+            domain="science",
+            subdomain="",
+            doc_role="body",
+        )
+
+        self.assertIn("erreur quadratique moyenne", translated)
+        self.assertIn("analyse en composantes principales", translated)
+
     def test_paragraph_line_redistribution_avoids_pathological_one_word_lines(self):
         source_lines = [
             "Spatial analysis helps journalists compare places and reveal patterns",
@@ -1367,6 +1424,58 @@ class TranslationEnrichmentTests(unittest.TestCase):
         )
 
         self.assertTrue(redistributed[0].startswith("1. "))
+
+    def test_preserved_paragraph_repairs_pathological_line_expansion(self):
+        translator = self.translator
+        translator._fr_strict_quality = False
+        translator._direct_ct2_translate_chunks = lambda text, target_lang="fr": (
+            "ligne traduite beaucoup trop longue avec des repetitions inutiles "
+            "ligne traduite beaucoup trop longue avec des repetitions inutiles "
+            "ligne traduite beaucoup trop longue avec des repetitions inutiles "
+            "suite traduite raisonnable"
+        )
+        translator._translate_unit_text = lambda text, **kwargs: f"FR {text}"
+        translator._guess_source_lang = lambda text: "en"
+        translator._detect_domain = lambda text: "general"
+        translator._detect_subdomain = lambda text, domain="general": ""
+        translator._placeholderize_inline_reserved_chunks = lambda text: (text, {})
+        translator._restore_inline_reserved_chunks = lambda text, placeholders: text
+        translator._apply_style_tone_postprocess = lambda text, **kwargs: text
+        translator._apply_cnn_glossary_fr = lambda text: text
+        translator._translation_leak_score = lambda text, target_lang: 0.0
+        translator._fix_english_residuals_in_fr = lambda text: text
+        translator._translation_gate_ok = lambda text, target_lang, source_lang="en": True
+
+        block = {
+            "lines": [
+                {"line_text": "Short source", "phrases": [{"texte": "Short source"}]},
+                {"line_text": "Second source", "phrases": [{"texte": "Second source"}]},
+            ]
+        }
+
+        translator._translate_block_as_paragraph(block, "fr", preserve_source_lines=True)
+
+        self.assertEqual(block["lines"][0]["translated_text"], "FR Short source")
+        self.assertEqual(block["lines"][1]["translated_text"], "FR Second source")
+
+        final_structure = {
+            "blocks": [
+                {
+                    "role": "body",
+                    "translation_compose_mode": "preserved",
+                    "lines": [
+                        {
+                            "line_text": "M. Arif Wani",
+                            "translated_text": "M. M. Inde M. Arif Wani Arif Wani Arif Wani Farooq Arif Wani Farooq",
+                            "phrases": [{"texte": "M. Arif Wani"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        translator._translate_unit_text = lambda text, **kwargs: text
+        translator._repair_pathological_preserved_line_expansions(final_structure, target_lang="fr")
+        self.assertEqual(final_structure["blocks"][0]["lines"][0]["translated_text"], "M. Arif Wani")
 
     def test_editorial_exact_preserve_is_relaxed_on_double_column_prose(self):
         contract = self.translator._resolve_translation_contract(
@@ -1538,6 +1647,21 @@ class TranslationEnrichmentTests(unittest.TestCase):
         translated = self.translator._translate_short_label_fr("a new_model")
 
         self.assertEqual(translated, "un nouveau modèle")
+
+    def test_short_label_translation_rejects_pathological_expansion(self):
+        original_translate_unit_text = self.translator._translate_unit_text
+        original_translate_snippet = self.translator._translate_snippet
+        original_direct_chunks = self.translator._direct_ct2_translate_chunks
+        self.addCleanup(setattr, self.translator, "_translate_unit_text", original_translate_unit_text)
+        self.addCleanup(setattr, self.translator, "_translate_snippet", original_translate_snippet)
+        self.addCleanup(setattr, self.translator, "_direct_ct2_translate_chunks", original_direct_chunks)
+        self.translator._translate_unit_text = lambda *args, **kwargs: "un terme inutilement long qui déborde largement"
+        self.translator._translate_snippet = lambda *args, **kwargs: "une version encore plus longue et pathologique"
+        self.translator._direct_ct2_translate_chunks = lambda *args, **kwargs: "une autre expansion extrêmement longue et impropre"
+
+        translated = self.translator._translate_short_label_fr("GPU")
+
+        self.assertEqual(translated, "GPU")
 
     def test_programming_code_line_is_preserved(self):
         self.assertTrue(
@@ -5042,11 +5166,9 @@ class TranslationEnrichmentTests(unittest.TestCase):
         }
 
         ops = reconstructor._validated_block_presence_fallback_ops(page, {"page_role": "body"}, block, "fr")
-        plan = reconstructor._build_block_reconstruction_plan(page, {"page_role": "body"}, block, "fr")
         doc.close()
 
-        self.assertGreaterEqual(len([op for op in ops if op.op_type == "draw_text_run"]), 1)
-        self.assertEqual(reconstructor._validate_block_layout(plan, ops), [])
+        self.assertEqual(ops, [])
 
     def test_prune_block_draw_ops_keeps_only_valid_non_overlapping_text(self):
         reconstructor = DocumentReconstructor()

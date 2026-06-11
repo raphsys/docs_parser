@@ -637,8 +637,11 @@ class TestAgentRegistry:
 
 class TestP5IntegrationWithReconstructor:
     """
-    Teste l'étape G de compute_block_semantic_profile :
-    affinage de la stratégie via P5RenderAgent (mock).
+    Teste la compatibilité avec P5RenderAgent.
+
+    Le rendu final est désormais déterministe : P5 reste disponible comme
+    agent isolé, mais le reconstructeur ne l'utilise plus pour overrider la
+    stratégie heuristique dans le chemin critique.
     """
 
     def setup_method(self):
@@ -695,16 +698,16 @@ class TestP5IntegrationWithReconstructor:
         strategy = rec._ai_refine_render_strategy(block, "prose_reflow")
         assert strategy == "prose_reflow"
 
-    def test_agent_overrides_prose_to_label_with_high_confidence(self):
-        """Quand l'agent est confiant (≥ 0.70) et le bloc est ambigu, override."""
+    def test_agent_does_not_override_prose_to_label(self):
+        """Même injecté, P5 ne doit pas modifier la stratégie heuristique."""
         rec = self._make_reconstructor()
         self._inject_mock_agent(rec, "label_stack", confidence=0.88)
         block = self._block_ambiguous()
         strategy = rec._ai_refine_render_strategy(block, "prose_reflow")
-        assert strategy == "label_stack"
+        assert strategy == "prose_reflow"
 
-    def test_agent_overrides_label_to_prose_with_high_confidence(self):
-        """Override inverse : label_stack → prose_reflow."""
+    def test_agent_does_not_override_label_to_prose(self):
+        """L'override inverse reste également désactivé."""
         rec = self._make_reconstructor()
         self._inject_mock_agent(rec, "prose_reflow", confidence=0.91)
         block = {
@@ -717,7 +720,7 @@ class TestP5IntegrationWithReconstructor:
             ],
         }
         strategy = rec._ai_refine_render_strategy(block, "label_stack")
-        assert strategy == "prose_reflow"
+        assert strategy == "label_stack"
 
     def test_low_confidence_keeps_heuristic(self):
         """Confiance < 0.70 → pas d'override."""
@@ -762,15 +765,15 @@ class TestP5IntegrationWithReconstructor:
         strategy = rec._ai_refine_render_strategy(block, "heading_reflow")
         assert strategy == "heading_reflow"
 
-    def test_compute_block_semantic_profile_ai_refinement_applied(self):
-        """compute_block_semantic_profile intègre l'override IA sur bloc ambigu."""
+    def test_compute_block_semantic_profile_ignores_ai_refinement(self):
+        """compute_block_semantic_profile reste sur la stratégie déterministe."""
         rec = self._make_reconstructor()
         self._inject_mock_agent(rec, "label_stack", confidence=0.85)
         block = self._block_ambiguous()
         profile = rec.compute_block_semantic_profile(block, page_data=None)
         assert profile is not None
-        assert profile.render_strategy == "label_stack"
-        assert profile.content_class == "label"
+        assert profile.render_strategy == "prose_reflow"
+        assert profile.content_class == "prose"
 
     def test_compute_block_semantic_profile_no_ai_when_disabled(self):
         """Sans agent, compute_block_semantic_profile retourne la stratégie heuristique."""
@@ -828,24 +831,12 @@ class TestP1IntegrationWithOcrServer:
         AgentRegistry._instances["p1_extraction|phi35|auto"] = agent
         return agent
 
-    def test_dispatcher_keeps_deterministic_semantics_by_default(self, monkeypatch):
-        """Sans opt-in explicite, le dispatcher ne charge pas de correcteur IA."""
+    def test_dispatcher_uses_llm_corrector_by_default(self, monkeypatch):
+        """Sans PIPELINE_AGENT_P1_ENABLE, le dispatcher appelle _llm_postprocess_blocks."""
         called = {"llm": 0, "p1": 0}
         monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
         monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
         monkeypatch.delenv("PIPELINE_AGENT_P1_ENABLE", raising=False)
-        monkeypatch.delenv("DOCS_PARSER_ENABLE_SEMANTIC_LLM", raising=False)
-        self.ocr._postprocess_blocks_semantic([])
-        assert called["llm"] == 0
-        assert called["p1"] == 0
-
-    def test_dispatcher_uses_llm_corrector_when_enabled(self, monkeypatch):
-        """Avec DOCS_PARSER_ENABLE_SEMANTIC_LLM=1, le dispatcher appelle _llm_postprocess_blocks."""
-        called = {"llm": 0, "p1": 0}
-        monkeypatch.setattr(self.ocr, "_llm_postprocess_blocks", lambda b: called.__setitem__("llm", called["llm"] + 1))
-        monkeypatch.setattr(self.ocr, "_p1_agent_postprocess_blocks", lambda b: called.__setitem__("p1", called["p1"] + 1))
-        monkeypatch.delenv("PIPELINE_AGENT_P1_ENABLE", raising=False)
-        monkeypatch.setenv("DOCS_PARSER_ENABLE_SEMANTIC_LLM", "1")
         self.ocr._postprocess_blocks_semantic([])
         assert called["llm"] == 1
         assert called["p1"] == 0

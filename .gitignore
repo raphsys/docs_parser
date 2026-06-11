@@ -73,6 +73,8 @@ ai_models/translation/*
 !ai_models/translation/style_tone_profiles.json
 ai_models/ppstructurev3/*
 !ai_models/ppstructurev3/README.md
+ai_models/fonts/embedded/*
+!ai_models/fonts/embedded/.gitkeep
 datasets/terminology_sources/
 
 # Large model/binary files

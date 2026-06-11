@@ -7,7 +7,6 @@ import subprocess
 import json
 import copy
 import logging
-import time
 import xml.etree.ElementTree as ET
 import uvicorn
 import fitz
@@ -2620,12 +2619,11 @@ def _postprocess_blocks_semantic(blocks: list) -> None:
     """Dispatche vers P1ExtractionAgent ou llm_semantic_corrector selon l'environnement.
 
     Utiliser PIPELINE_AGENT_P1_ENABLE=1 pour activer l'agent open-source.
-    Utiliser DOCS_PARSER_ENABLE_SEMANTIC_LLM=1 pour activer le correcteur LLM.
-    Par defaut, les heuristiques deterministes deja appliquees sont conservees.
+    Par défaut, utilise llm_semantic_corrector (comportement existant).
     """
     if os.environ.get("PIPELINE_AGENT_P1_ENABLE") == "1":
         _p1_agent_postprocess_blocks(blocks)
-    elif os.environ.get("DOCS_PARSER_ENABLE_SEMANTIC_LLM") == "1":
+    else:
         _llm_postprocess_blocks(blocks)
 
 
@@ -3327,6 +3325,314 @@ def _collect_text_regions_for_inpainting(blocks, non_text_zones, immutable_overl
             continue
         regions.append(bb)
     return regions
+
+
+def _native_toc_rows_from_pdf_page(pdf_page, sx=1.0, sy=1.0):
+    if pdf_page is None:
+        return []
+    try:
+        words = list(pdf_page.get_text("words") or [])
+    except Exception:
+        return []
+    words = [w for w in words if len(w) >= 5 and str(w[4] or "").strip()]
+    if not words:
+        return []
+
+    def clean(text):
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    def _hex_color(value):
+        try:
+            return f"#{int(value or 0) & 0xFFFFFF:06x}"
+        except Exception:
+            return "#000000"
+
+    def _style_from_native_span(span):
+        font = str((span or {}).get("font") or "Times-Roman")
+        flags_value = int((span or {}).get("flags") or 0)
+        family = font.lower()
+        bold = bool(flags_value & 16) or any(token in family for token in ("bold", "demi", "black", "semibold"))
+        italic = bool(flags_value & 2) or any(token in family for token in ("italic", "itali", "oblique"))
+        serif = not any(token in family for token in ("gothic", "arial", "helvetica", "sans", "zapf", "dingbat"))
+        monospace = any(token in family for token in ("mono", "courier", "consola"))
+        embedded_font_path = None
+        try:
+            embedded_font_path = native_pdf_extractor._resolve_embedded_font_path(embedded_font_map, font)
+        except Exception:
+            embedded_font_path = None
+        return {
+            "font": font,
+            "font_name": font,
+            "font_name_raw": font,
+            "font_key_normalized": re.sub(r"[^a-z0-9]+", "", font.split("+", 1)[-1].lower()),
+            "embedded_font_path": embedded_font_path,
+            "size": float((span or {}).get("size") or 10.0),
+            "color": _hex_color((span or {}).get("color")),
+            "flags": {
+                "bold": bool(bold),
+                "italic": bool(italic),
+                "serif": bool(serif),
+                "monospace": bool(monospace),
+            },
+        }
+
+    native_spans = []
+    try:
+        embedded_font_map = native_pdf_extractor._get_page_embedded_font_map(pdf_page)
+    except Exception:
+        embedded_font_map = {}
+    try:
+        page_dict = pdf_page.get_text("dict") or {}
+        for block in page_dict.get("blocks", []) or []:
+            for line in block.get("lines", []) or []:
+                for span in line.get("spans", []) or []:
+                    span_text = clean(span.get("text") or "")
+                    if not span_text:
+                        continue
+                    try:
+                        span_rect = fitz.Rect(span.get("bbox"))
+                    except Exception:
+                        continue
+                    if span_rect.get_area() <= 0:
+                        continue
+                    native_spans.append(
+                        {
+                            "rect": span_rect,
+                            "text": span_text,
+                            "style": _style_from_native_span(span),
+                        }
+                    )
+    except Exception:
+        native_spans = []
+
+    def _style_for_rect(rect, prefer_non_marker=True):
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return None
+        candidates = []
+        for span in native_spans:
+            span_rect = span["rect"]
+            inter = fitz.Rect(rect) & span_rect
+            if inter.get_area() <= 0:
+                continue
+            if inter.get_area() < min(rect.get_area(), span_rect.get_area()) * 0.12:
+                continue
+            text = span.get("text") or ""
+            marker_penalty = 0.25 if prefer_non_marker and re.fullmatch(r"[■•▪◦·]+", text) else 1.0
+            weight = (inter.get_area() + len(text) * 3.0) * marker_penalty
+            candidates.append((weight, span))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return dict(candidates[0][1].get("style") or {})
+
+    def _marker_style_for_rect(rect):
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return None
+        for span in native_spans:
+            if not re.fullmatch(r"[■•▪◦·]+", span.get("text") or ""):
+                continue
+            inter = fitz.Rect(rect) & span["rect"]
+            if inter.get_area() > 0:
+                return dict(span.get("style") or {})
+        return None
+
+    def _marker_bboxes_for_rect(rect):
+        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
+            return []
+        out = []
+        for span in native_spans:
+            if not re.fullmatch(r"[■•▪◦·]+", span.get("text") or ""):
+                continue
+            inter = fitz.Rect(rect) & span["rect"]
+            if inter.get_area() <= 0:
+                continue
+            sr = span["rect"]
+            out.append([sr.x0 * sx, sr.y0 * sy, sr.x1 * sx, sr.y1 * sy])
+        return out
+
+    lines = []
+    for word in sorted(words, key=lambda w: (float(w[1]), float(w[0]))):
+        rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+        text = clean(word[4])
+        if rect.get_area() <= 0 or not text:
+            continue
+        cy = (rect.y0 + rect.y1) * 0.5
+        placed = False
+        for line in lines:
+            line_threshold = max(2.5, min(6.0, min(line["height"], rect.height) * 0.55))
+            if abs(cy - line["cy"]) <= line_threshold:
+                line["words"].append((rect, text))
+                line["cy"] = (line["cy"] * (len(line["words"]) - 1) + cy) / len(line["words"])
+                line["height"] = max(line["height"], rect.height)
+                placed = True
+                break
+        if not placed:
+            lines.append({"cy": cy, "height": rect.height, "words": [(rect, text)]})
+
+    lines.sort(key=lambda line: line["cy"])
+    line_texts = []
+    for line in lines:
+        line["words"].sort(key=lambda item: item[0].x0)
+        text = clean(" ".join(text for _, text in line["words"]))
+        if text:
+            line_texts.append(text)
+
+    toc_score = 0
+    for text in line_texts[:80]:
+        low = text.lower()
+        if low in {"contents", "table of contents", "sommaire"}:
+            toc_score += 4
+        if re.match(r"^\s*(?:\d+(?:\.\d+)*|[ivxlcdm]+)\b", text, flags=re.I):
+            toc_score += 1
+        if re.search(r"\b\d{1,4}\s*$", text):
+            toc_score += 1
+        if any(marker in text for marker in ("■", "•", "▪", "◦", "·")):
+            toc_score += 1
+    if toc_score < 6:
+        return []
+
+    rows = []
+    page_width = float(pdf_page.rect.width)
+    for idx, line in enumerate(lines):
+        words_line = line["words"]
+        text = clean(" ".join(word_text for _, word_text in words_line))
+        if not text:
+            continue
+        content_indices = [
+            i for i, (_, word_text) in enumerate(words_line)
+            if clean(word_text).lower() in {"contents", "sommaire"}
+        ]
+        if content_indices and clean(text).lower() not in {"contents", "sommaire"}:
+            title_i = content_indices[0]
+            prefix_words = words_line[:title_i]
+            title_words = words_line[title_i:]
+            if prefix_words:
+                prefix_rect = fitz.Rect(prefix_words[0][0])
+                for word_rect, _ in prefix_words[1:]:
+                    prefix_rect |= word_rect
+                prefix_text = clean(" ".join(word_text for _, word_text in prefix_words))
+                if prefix_text:
+                    prefix_style = _style_for_rect(prefix_rect) or {
+                        "font": "Times-Roman",
+                        "size": max(5.5, min(10.0, prefix_rect.height * 0.95)),
+                        "color": "#000000",
+                        "flags": {"bold": True, "italic": False, "serif": True, "monospace": False},
+                    }
+                    rows.append(
+                        {
+                            "id": f"native_toc_row_{idx}_folio",
+                            "role": "page_marker",
+                            "label": prefix_text,
+                            "page": "",
+                            "source_text": prefix_text,
+                            "label_bbox": [prefix_rect.x0 * sx, prefix_rect.y0 * sy, prefix_rect.x1 * sx, prefix_rect.y1 * sy],
+                            "page_bbox": None,
+                            "bbox": [prefix_rect.x0 * sx, prefix_rect.y0 * sy, prefix_rect.x1 * sx, prefix_rect.y1 * sy],
+                            "style": prefix_style,
+                            "page_style": prefix_style,
+                            "translation_style": "professionnel",
+                            "translation_tone": "neutre",
+                            "source": "native_pdf_toc_words",
+                        }
+                    )
+            words_line = title_words
+            text = clean(" ".join(word_text for _, word_text in words_line))
+            if not text:
+                continue
+        rect = fitz.Rect(words_line[0][0])
+        for word_rect, _ in words_line[1:]:
+            rect |= word_rect
+
+        label_rect = fitz.Rect(rect)
+        page_rect = None
+        page_value = ""
+        if len(words_line) >= 2:
+            last_rect, last_text = words_line[-1]
+            structured_toc_label = bool(re.match(r"^\s*\d+(?:\.\d+)+\b", text))
+            page_column_like = last_rect.x0 >= page_width * 0.42
+            line_end_page_like = (
+                structured_toc_label
+                and bool(re.search(r"[A-Za-zÀ-ÿ][^\n]*\s+\d{1,4}\s*$", text))
+            )
+            if re.fullmatch(r"\d{1,4}|[ivxlcdm]+", last_text, flags=re.I) and (page_column_like or line_end_page_like):
+                page_value = last_text
+                page_rect = fitz.Rect(last_rect)
+                label_rect = fitz.Rect(rect.x0, rect.y0, max(rect.x0 + 1.0, last_rect.x0 - 2.0), rect.y1)
+
+        label = text
+        if page_value and label.endswith(page_value):
+            label = clean(label[: -len(page_value)])
+
+        role = "toc_entry"
+        label_low = label.lower()
+        if label_low in {"contents", "table of contents", "sommaire"}:
+            role = "toc_title"
+        elif re.match(r"^\s*\d+\s+[A-Za-zÀ-ÿ]", label):
+            role = "chapter_heading"
+        elif re.match(r"^\s*\d+\.\d+\b", label):
+            role = "section_heading"
+        elif any(marker in label for marker in ("■", "•", "▪", "◦", "·")):
+            role = "subentry"
+
+        font_size_pt = max(5.5, min(18.0, rect.height * 0.95))
+        fallback_style = {
+            "font": "Times-Roman",
+            "size": font_size_pt,
+            "color": "#000000",
+            "flags": {
+                "bold": role in {"toc_title", "chapter_heading"},
+                "italic": role == "subentry",
+                "serif": True,
+                "monospace": False,
+            },
+        }
+        style = _style_for_rect(label_rect) or _style_for_rect(rect) or fallback_style
+        page_style = _style_for_rect(page_rect, prefer_non_marker=False) or style
+        marker_style = _marker_style_for_rect(rect)
+        marker_bboxes = _marker_bboxes_for_rect(rect)
+        rows.append(
+            {
+                "id": f"native_toc_row_{idx}",
+                "role": role,
+                "label": label,
+                "page": page_value,
+                "source_text": text,
+                "label_bbox": [label_rect.x0 * sx, label_rect.y0 * sy, label_rect.x1 * sx, label_rect.y1 * sy],
+                "page_bbox": [page_rect.x0 * sx, page_rect.y0 * sy, page_rect.x1 * sx, page_rect.y1 * sy] if page_rect else None,
+                "bbox": [rect.x0 * sx, rect.y0 * sy, rect.x1 * sx, rect.y1 * sy],
+                "style": style,
+                "page_style": page_style,
+                "marker_style": marker_style,
+                "marker_bboxes": marker_bboxes,
+                "translation_style": "professionnel",
+                "translation_tone": "neutre",
+                "source": "native_pdf_toc_words",
+            }
+        )
+    return rows
+
+
+def _inject_native_toc_rows(page_structure, pdf_page, sx=1.0, sy=1.0):
+    if not isinstance(page_structure, dict) or pdf_page is None:
+        return page_structure
+    if ((page_structure.get("toc") or {}).get("toc_rows") or []):
+        return page_structure
+    rows = _native_toc_rows_from_pdf_page(pdf_page, sx=sx, sy=sy)
+    if not rows:
+        return page_structure
+    page_structure["page_role"] = "toc"
+    page_structure["layout_type"] = page_structure.get("layout_type") or "toc"
+    page_structure["page_family"] = page_structure.get("page_family") or "toc_page"
+    page_structure["toc"] = {
+        **dict(page_structure.get("toc") or {}),
+        "toc_rows": rows,
+        "source": "native_pdf_words",
+        "row_count": len(rows),
+    }
+    native = dict(page_structure.get("native_structure") or {})
+    native["toc"] = {"rows": rows, "count": len(rows), "source": "native_pdf_words"}
+    page_structure["native_structure"] = native
+    return page_structure
 
 
 def _dedupe_final_blocks(native_blocks, ocr_blocks):
@@ -4687,17 +4993,6 @@ def _write_layout_xml(blocks, filename, page_idx, img_w, img_h):
 
 
 def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=False, font_ai_audit=False, text_removal_mode="default", include_debug_layers=False):
-    trace_process = os.environ.get("DOCS_PARSER_PROCESS_PAGE_TRACE", "0") == "1"
-    trace_last = time.perf_counter()
-
-    def _trace_step(label):
-        nonlocal trace_last
-        if not trace_process:
-            return
-        now = time.perf_counter()
-        print(f"PROCESS_PAGE_TRACE {idx}:{label}: {now - trace_last:.2f}s", flush=True)
-        trace_last = now
-
     safe_filename = _safe_runtime_stem(filename)
     source_fn = f"src_{uuid.uuid4().hex}_{idx + 1}.png"
     source_path = os.path.join(RESULTS_DIR, source_fn)
@@ -4720,18 +5015,9 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         non_text_zones = native.get("non_text_zones", [])
         native_images = native.get("images", [])
         native_drawings = native.get("drawings", [])
-    _trace_step("native_extract")
 
-    # 2. OCR pour le reste. En validation ciblee des PDF natifs, l'OCR
-    # complementaire peut dominer le temps sans apporter de nouveaux blocs.
-    skip_ocr_when_native = (
-        os.environ.get("DOCS_PARSER_SKIP_OCR_WHEN_NATIVE", "0") == "1"
-        and pdf_page is not None
-        and not force_ai
-        and bool(native_blocks)
-    )
-    result, _ = ([], None) if skip_ocr_when_native else engine_ocr(np.array(img))
-    _trace_step("ocr")
+    # 2. OCR pour le reste
+    result, _ = engine_ocr(np.array(img))
     raw_ocr = []
     if result:
         for res in result:
@@ -4748,7 +5034,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     ocr_structure = parser.parse(raw_ocr, img) if raw_ocr else []
     if ocr_structure:
         ocr_structure = _prune_weak_ocr_lines(ocr_structure)
-    _trace_step("ocr_parse")
     font_ai_summary = {
         "enabled": False,
         "ready": False,
@@ -4762,7 +5047,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     if EXTRACTION_AI_ENABLED and ocr_structure:
         font_ai_summary = apply_ai_font_matching(ocr_structure, img, enable_audit=font_ai_audit)
     final_blocks = _dedupe_final_blocks(native_blocks, ocr_structure)
-    _trace_step("dedupe")
     merged_blocks_pre_postprocess = copy.deepcopy(final_blocks)
     final_blocks = _postprocess_blocks(final_blocks, img.width, img.height)
     _enrich_layout_markers(final_blocks)
@@ -4772,10 +5056,8 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
     _build_semantic_groups_for_blocks(final_blocks)
-    _trace_step("semantic_pre_style")
     merged_blocks_postprocess = copy.deepcopy(final_blocks)
     immutable_overlays = _extract_immutable_overlays(final_blocks, img, filename, idx)
-    _trace_step("immutable_overlays")
 
     layout_meta = _annotate_layout(final_blocks, img.width, img.height)
     visual_style_profile = {}
@@ -4788,7 +5070,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         )
     except Exception as e:
         print(f"Erreur style profiler : {e}")
-    _trace_step("style_profile")
     # Ensure layout markers and semantic phrases remain present after style profiling transforms.
     _enrich_layout_markers(final_blocks)
     _build_semantic_phrases_for_blocks(final_blocks)
@@ -4797,7 +5078,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
     _build_semantic_spans_for_blocks(final_blocks)
     _build_semantic_runs_for_blocks(final_blocks)
     _build_semantic_groups_for_blocks(final_blocks)
-    _trace_step("semantic_post_style")
 
     # 3. GÉNERATION DU FOND MAÎTRE NETTOYÉ (Workflow Inpainting IA)
     bg_master_path = ""
@@ -4818,7 +5098,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         cv2.imwrite(mask_master_path, mask)
     except Exception as e:
         print(f"Erreur génération fond maître chirurgical : {e}")
-    _trace_step("text_removal")
 
     p6_bg_audit = _p6_audit_background(
         final_blocks,
@@ -4828,7 +5107,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         img_width=img.width,
         img_height=img.height,
     )
-    _trace_step("p6_audit")
 
     # 4. VISUALISATION (Bboxes colorées pour l aperçu)
     vis_fn = f"vis_{safe_filename}_{idx}.jpg"
@@ -4842,7 +5120,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
              for p in line["phrases"]: 
                 draw.rectangle(p["bbox"], outline="red", width=1)
     img_draw.save(os.path.join(RESULTS_DIR, vis_fn))
-    _trace_step("visualization")
 
     # 5. CONSTRUCTION DU CONTENU DÉTAILLÉ (Pour l affichage Flutter)
     display_text = f"DOC: {img.width}x{img.height} | DPI: {TARGET_DPI}\n"
@@ -4910,7 +5187,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         layout_xml_path = _write_layout_xml(final_blocks, filename, idx, img.width, img.height)
     except Exception as e:
         print(f"Erreur écriture layout XML: {e}")
-    _trace_step("display_text_layout_xml")
 
     if hierarchical_extraction.get("phrases"):
         display_text += "\n[PHRASES_RECONSTITUEES]\n"
@@ -4921,8 +5197,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         "blocks": final_blocks,
         "background_path": bg_master_path,
         "source_image_path": source_path,
-        "source_pdf_path": str(getattr(getattr(pdf_page, "parent", None), "name", "") or "") if pdf_page is not None else "",
-        "source_page_index": int(idx or 0),
         "source_image_url": f"/results/{source_fn}" if source_path else "",
         "mask_master_path": mask_master_path,
         "immutable_overlays": immutable_overlays,
@@ -4958,6 +5232,7 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         page_structure, postprocess_info = apply_page_extraction_postprocessors(page_structure)
         if postprocess_info.get("changed") or postprocess_info.get("applied") or page_structure.get("native_structure"):
             page_structure = layout_v2_builder.build(page_structure)
+        page_structure = _inject_native_toc_rows(page_structure, pdf_page, sx=sx, sy=sy)
         page_structure["layout_ai"] = layout_ai_info
         page_structure["extraction_postprocess"] = postprocess_info
         _enrich_layout_markers(page_structure.get("blocks", []))
@@ -4971,7 +5246,6 @@ def process_page(img, idx, filename, pdf_page=None, translate_to=None, force_ai=
         fidelity_layout = _build_fidelity_layout_export(page_structure.get("blocks", []) or [])
     except Exception as e:
         print(f"Erreur LayoutV2Builder: {e}")
-    _trace_step("layout_v2_postprocess")
 
     return {
         "page": idx + 1, 

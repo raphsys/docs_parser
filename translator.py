@@ -2274,6 +2274,8 @@ class DocumentTranslator:
             "reference_heavy_page": reference_heavy_page,
         }
         toc_page = page_role == "toc"
+        if toc_page and isinstance((structure.get("toc") or {}).get("toc_rows"), list):
+            self.translate_layout_v2(structure, target_lang=target_lang)
 
         for block in structure.get("blocks", []):
             block_role = block.get("role", "body")
@@ -3471,14 +3473,35 @@ class DocumentTranslator:
             if token in src_lc:
                 out = re.sub(re.escape(canonical), canonical, out, flags=re.IGNORECASE)
 
+        protected_terms = [
+            "CNN",
+            "VGGNet",
+            "AlexNet",
+            "LeNet",
+            "ResNet",
+            "GoogLeNet",
+            "MNIST",
+            "Keras",
+            "SSD",
+            "YOLO",
+            "R-CNN",
+        ]
+        for term in protected_terms:
+            out = re.sub(rf"(?<=[A-Za-zÀ-ÿ])(?={re.escape(term)})", " ", out)
+            out = re.sub(rf"(?<={re.escape(term)})(?=[A-Za-zÀ-ÿ])", " ", out)
+
         return self._normalize_spaces(out)
 
     def _translate_toc_label_fr(self, label, role=""):
         src = self._normalize_spaces(label)
         if not src:
             return src
-        numeric_prefix, core = self._split_toc_numeric_prefix(src)
         role_lc = self._normalize_spaces(role).lower()
+        if role_lc in {"page_marker", "page_number", "folio"}:
+            return src
+        if re.fullmatch(r"\d+|[ivxlcdm]+", src, flags=re.IGNORECASE):
+            return src
+        numeric_prefix, core = self._split_toc_numeric_prefix(src)
         short_translation = self._translate_toc_short_label_fr(core, role=role_lc)
         if short_translation:
             return self._normalize_spaces(f"{numeric_prefix} {short_translation}".strip())

@@ -5,6 +5,10 @@ import tempfile
 from collections import Counter
 
 
+def _project_embedded_font_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_models", "fonts", "embedded")
+
+
 def _normalize_font_key(font_name: str) -> str:
     raw = (font_name or "").split("+", 1)[-1].strip()
     return re.sub(r"[^a-z0-9]+", "", raw.lower())
@@ -175,8 +179,8 @@ class NativePDFExtractor:
     def __init__(self, embedded_font_cache_dir=None):
         cache_dir = embedded_font_cache_dir or os.getenv("LAYOUT_EMBEDDED_FONT_CACHE_DIR", "").strip()
         if not cache_dir:
-            cache_dir = os.path.join(tempfile.gettempdir(), "docs_parser_embedded_fonts")
-        self.embedded_font_cache_dir = cache_dir
+            cache_dir = _project_embedded_font_dir()
+        self.embedded_font_cache_dir = os.path.abspath(cache_dir)
         self._embedded_font_file_cache = {}
         self._embedded_font_map_cache = {}
 

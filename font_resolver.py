@@ -9,7 +9,23 @@ except Exception:
     fitz = None
 
 FONT_EXTENSIONS = (".ttf", ".otf", ".cff", ".cid")
+
+
+def _project_embedded_font_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_models", "fonts", "embedded")
+
+
+def _env_font_dirs() -> Tuple[str, ...]:
+    raw = os.getenv("LAYOUT_FONT_DIRS", "").strip()
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(os.pathsep) if part.strip())
+
+
 DEFAULT_FONT_DIRS = (
+    *_env_font_dirs(),
+    _project_embedded_font_dir(),
+    os.getenv("LAYOUT_EMBEDDED_FONT_CACHE_DIR", "").strip(),
     "/usr/share/fonts",
     "/usr/local/share/fonts",
     os.path.expanduser("~/.fonts"),
@@ -287,8 +303,14 @@ class FontResolver:
             return False
         try:
             target = os.path.realpath(path)
-            cache_root = os.path.realpath(os.path.join(tempfile.gettempdir(), "docs_parser_embedded_fonts"))
-            return target.startswith(cache_root + os.sep) or target == cache_root
+            cache_roots = [
+                os.path.realpath(os.path.join(tempfile.gettempdir(), "docs_parser_embedded_fonts")),
+                os.path.realpath(_project_embedded_font_dir()),
+            ]
+            env_cache = os.getenv("LAYOUT_EMBEDDED_FONT_CACHE_DIR", "").strip()
+            if env_cache:
+                cache_roots.append(os.path.realpath(env_cache))
+            return any(target.startswith(root + os.sep) or target == root for root in cache_roots if root)
         except Exception:
             return False
 

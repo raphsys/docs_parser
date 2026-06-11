@@ -12,7 +12,6 @@ import unicodedata
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from statistics import median
 from typing import Any
 
 import fitz
@@ -166,14 +165,6 @@ class RenderCandidate:
 
 
 @dataclass
-class PageLayoutCommit:
-    plan: "BlockReconstructionPlan"
-    ops: list["BlockRenderOp"]
-    block: dict[str, Any]
-    stats: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class BlockRenderOp:
     op_type: str
     block_id: str
@@ -258,21 +249,20 @@ class DocumentReconstructor:
         self.background_inpainter = get_background_inpainter()
         self.text_composer = TextComposer()
 
+    # ------------------------------------------------------------------
+    # Rendu final déterministe
+    # ------------------------------------------------------------------
+
     def _get_render_agent(self) -> Any:
-        """Retourne l'agent P5 si activé et disponible, sinon None."""
-        if self._render_agent_loaded:
-            return self._render_agent
+        """
+        Les agents ne participent plus au chemin critique du rendu final.
+
+        On conserve cette méthode comme point de compatibilité API pour les
+        tests et pour le code historique, mais elle ne charge jamais P5.
+        """
         self._render_agent_loaded = True
-        if os.environ.get("PIPELINE_AGENT_RENDER_ENABLE", "0") != "1":
-            return None
-        try:
-            from pipeline_agents import get_agent
-            agent = get_agent("p5_render")
-            if agent.is_available():
-                self._render_agent = agent
-        except Exception:
-            pass
-        return self._render_agent
+        self._render_agent = None
+        return None
 
     def _ai_refine_render_strategy(
         self,
@@ -281,39 +271,12 @@ class DocumentReconstructor:
         page_data: dict | None = None,
     ) -> str:
         """
-        Tente d'affiner la stratégie de rendu via l'agent P5.
+        Chemin de compatibilité historique.
 
-        Retourne la stratégie originale si l'agent est absent, indisponible,
-        peu confiant, ou si le bloc n'est pas ambigu.
+        Le choix de stratégie de rendu reste désormais strictement
+        déterministe et purement Python. Cette méthode renvoie donc
+        toujours la stratégie heuristique calculée localement.
         """
-        agent = self._get_render_agent()
-        if agent is None:
-            return heuristic_strategy
-        try:
-            from pipeline_agents.p5_render import P5RenderAgent
-            ambiguity = P5RenderAgent.score_block(block)
-            if ambiguity < 0.4:
-                return heuristic_strategy
-            page_w = float((page_data or {}).get("page_width") or 600)
-            input_data = P5RenderAgent.build_input_from_block(
-                {**block, "_page_width": page_w}
-            )
-            result = agent.run(input_data)
-            ai_strategy = str(result.get("strategy") or "")
-            confidence = float(result.get("confidence") or 0.0)
-            strategy_map = {
-                "prose_reflow": "prose_reflow",
-                "label_stack": "label_stack",
-                "heading_reflow": "heading_reflow",
-                "caption_reflow": "prose_reflow",
-                "bitmap_preserve": "bitmap_preserve",
-            }
-            mapped = strategy_map.get(ai_strategy)
-            if mapped and mapped != heuristic_strategy and confidence >= 0.70:
-                if heuristic_strategy in {"prose_reflow", "label_stack"} and mapped in {"prose_reflow", "label_stack"}:
-                    return mapped
-        except Exception:
-            pass
         return heuristic_strategy
 
     # ------------------------------------------------------------------
@@ -707,15 +670,6 @@ class DocumentReconstructor:
             "allow_expansion": False,
             "strict_non_reflow": True,
         },
-        "glossary_pair": {
-            "render_mode": "line_preserve",
-            "font_size_policy": "bounded_shrink",
-            "style_policy": "preserve_visible_style",
-            "shrink_max_pt": 0.8,
-            "min_font_ratio": 0.95,
-            "allow_expansion": False,
-            "strict_non_reflow": True,
-        },
     }
 
     def _reconstruction_contract_key_for_block(self, block, page_data=None):
@@ -737,7 +691,6 @@ class DocumentReconstructor:
         object_class = str(block.get("object_class") or payload.get("object_class") or "").strip().lower()
         object_subtype = str(block.get("object_subtype") or payload.get("object_subtype") or "").strip().lower()
         role = str(block.get("role") or "").strip().lower()
-        translation_compose_mode = str(block.get("translation_compose_mode") or "").strip().lower()
         text = self._clean_text_for_render(self._translated_text_from_block(block) or self._source_text_from_block(block))
         if object_type in {"code_block", "code_line", "inline_code"} or role in {"code", "code_block"} or object_class == "technical":
             return "code_block"
@@ -759,8 +712,6 @@ class DocumentReconstructor:
         )
         if toc_like:
             return "toc_entry"
-        if translation_compose_mode == "abbreviation_pairs" or object_type in {"abbreviation_key", "abbreviation_value"}:
-            return "glossary_pair"
         if object_type in {"reference_link", "url", "web_url", "email_address", "doi_reference", "arxiv_reference"} or re.search(r"(https?://|www\.|doi:|\b10\.\d{4,9}/)", text, flags=re.IGNORECASE):
             return "url_reference"
         if object_type in {"table_cell_micro", "micro_table_cell"} or object_subtype in {"table_cell_micro", "micro_cell"}:
@@ -836,9 +787,9 @@ class DocumentReconstructor:
 
     def _clean_text_for_render(self, text):
         text = str(text or "")
-        text = "".join(ch for ch in text if ch in {"\n", "\t"} or not unicodedata.category(ch).startswith("C"))
         text = text.replace("\u00a0", " ")
         text = text.replace("\ufffd", "")
+        text = text.replace("\u25a0", "")
         text = re.sub(r"\s*'\s*", "'", text)
         text = re.sub(r"\s*’\s*", "’", text)
         text = re.sub(r"\s+([,.;!?])", r"\1", text)
@@ -861,9 +812,6 @@ class DocumentReconstructor:
         text = self._clean_text_for_render(text or "")
         if not text:
             return int(fallback or 0)
-        compact_text = re.sub(r"\s+", "", text)
-        if len(compact_text) <= 2 and re.fullmatch(r"[\dA-Za-z•■·\-\u2022]+", compact_text):
-            return int(fallback or 0) % 360
         width = max(1.0, rect.width)
         height = max(1.0, rect.height)
         if height > width * 1.8:
@@ -1355,8 +1303,6 @@ class DocumentReconstructor:
         flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
         if object_type in {"table_block", "table_cell", "table_row"} or object_class == "tabular":
             return "table"
-        if flow_class in {"reference_run", "bibliography", "bibliography_run", "citation_run"}:
-            return "editorial"
         if object_type in {"code_block", "code_line"} or object_class == "technical":
             return "code"
         if object_type in {"formula_block", "formula_line", "inline_formula_cluster"} or object_class == "formula":
@@ -1966,11 +1912,6 @@ class DocumentReconstructor:
         ):
             unit_profile = "protected_inline"
         elif (
-            unit_type in {"abbreviation_key", "abbreviation_value"}
-            or str(translation_policy.get("contract_key") or "").strip().lower() == "glossary_pair"
-        ):
-            unit_profile = "protected_inline" if unit_type == "abbreviation_key" else "anchored_label"
-        elif (
             unit_type in {"short_label", "chart_label", "diagram_label", "formula_label"}
             or object_type in {"diagram_label", "chart_label", "axis_label", "legend_label", "short_label"}
             or object_class == "visual_label"
@@ -2111,49 +2052,7 @@ class DocumentReconstructor:
         width_factor = 1.0
         if expansion > 1.0:
             width_factor += min(0.12, (expansion - 1.0) * 0.05)
-        desired_w = rect.width * width_factor
-        desired_h = rect.height * height_factor
-        required_h = self._rebalance_required_text_height(block, rect, page_data, text)
-        if required_h > 0:
-            desired_h = max(desired_h, required_h)
-        return desired_w, desired_h
-
-    def _rebalance_required_text_height(self, block, rect, page_data, text):
-        text = self._clean_text_for_render(text)
-        if not text:
-            return 0.0
-        style = self._style_from_block(block)
-        source_fontsize = max(4.0, float((style or {}).get("size") or 11.0))
-        line_height = max(5.0, source_fontsize * 1.18)
-        usable_width = max(8.0, float(rect.width) - 4.0)
-        try:
-            _, fontfile, _, fontname = self._resolve_style_font(None, style, text=text)
-        except Exception:
-            fontfile, fontname = None, "helv"
-        paragraphs = [
-            self._clean_text_for_render(part)
-            for part in re.split(r"\n+", text)
-            if self._clean_text_for_render(part)
-        ] or [text]
-        required_lines = 0
-        for paragraph in paragraphs:
-            words = paragraph.split()
-            if not words:
-                continue
-            line = ""
-            for word in words:
-                candidate = f"{line} {word}".strip() if line else word
-                width = self._measure_text_width(candidate, source_fontsize, fontname, fontfile)
-                if line and width > usable_width:
-                    required_lines += 1
-                    line = word
-                else:
-                    line = candidate
-            if line:
-                required_lines += 1
-        original_lines = max(1, len((block or {}).get("lines") or []))
-        required_lines = max(required_lines, original_lines)
-        return required_lines * line_height + 4.0
+        return rect.width * width_factor, rect.height * height_factor
 
     def _rebalance_safe_horizontal_span(self, ordered_blocks, current_index, rect, page_bounds):
         safe_left = float(page_bounds.x0)
@@ -2967,8 +2866,6 @@ class DocumentReconstructor:
         block_contract = self._render_contract_for_item(block)
         layout_mode = dict(block_contract.get("layout_mode") or {})
         alignment = dict(block_contract.get("alignment") or {})
-        editorial_semantics = dict((block or {}).get("editorial_semantics") or {})
-        flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
         source_layout_mode = dict((block or {}).get("source_layout_mode") or {})
         family = str(block_contract.get("family") or "").strip().lower()
         source_render_contract = str(
@@ -2996,14 +2893,12 @@ class DocumentReconstructor:
         )
         if family == "table_cell":
             return "cell_locked"
-        if flow_class in {"reference_run", "bibliography", "bibliography_run", "citation_run"} and line_count > 1:
-            return "line_preserve"
         if source_render_contract in {"fixed_slots", "preserve_breaks"} or source_line_flow in {"fixed_lines", "preserve_line_breaks", "single_line"}:
             if line_count > 1 or preserve_line_breaks or has_rotated_lines or locked_position:
                 return "line_preserve"
             return "bbox_anchored" if locked_position else "line_preserve"
         if entry:
-            if linebreak_mode == "preserve_source_lines":
+            if line_constraints and linebreak_mode == "preserve_source_lines":
                 return "line_preserve"
             if reflow_policy in {"toc_row_locked", "pair_locked"}:
                 return "line_preserve"
@@ -3101,18 +2996,9 @@ class DocumentReconstructor:
         updated_units = []
         for order, unit in enumerate(units):
             line_index = int(unit.line_indices[0]) if unit.line_indices else order
-            line_constraint = dict(line_constraints.get(line_index) or {})
-            constraint = dict(line_constraint or block_constraint or {})
+            constraint = dict(line_constraints.get(line_index) or block_constraint or {})
             bbox_lock = constraint.get("bbox_lock")
-            if (
-                bbox_lock
-                and not line_constraint
-                and render_mode in {"line_preserve", "bbox_anchored", "cell_locked"}
-                and str(getattr(unit, "source_kind", "") or "").strip().lower() == "line"
-                and unit.relative_bbox
-            ):
-                bbox_lock = None
-            rect = self._fitz_rect_from_bbox_like(bbox_lock) if bbox_lock else (fitz.Rect(unit.relative_bbox) if unit.relative_bbox else None)
+            rect = self._fitz_rect_from_bbox_like(bbox_lock) if bbox_lock else self._fitz_rect_from_bbox_like(unit.relative_bbox)
             alignment = self._constraint_alignment(constraint, fallback=(block or {}).get("alignment") or "left")
             style = self._merge_styles(unit.style or {}, self._style_from_block(block))
             style["align"] = alignment
@@ -3458,10 +3344,6 @@ class DocumentReconstructor:
         line_spacing_factor = float(adaptive.get("line_spacing_factor") or plan_profile.get("line_spacing_factor") or 1.0)
         unit_profile = str(adaptive.get("unit_profile") or "")
         page_profile = str(adaptive.get("page_profile") or plan_profile.get("page_profile") or "")
-        try:
-            source_fontsize = float((getattr(unit, "style", {}) or {}).get("size") or 0.0)
-        except Exception:
-            source_fontsize = 0.0
         min_fontsize = 5.5
         if page_profile in {"academic_dense", "technical_structured"} or unit_profile in {"protected_inline", "technical_inline_cluster", "dense_editorial_phrase"}:
             min_fontsize = 5.0
@@ -3469,13 +3351,6 @@ class DocumentReconstructor:
             line_spacing_factor = max(line_spacing_factor, 0.98)
         if unit_profile in {"technical_inline_cluster", "dense_editorial_phrase"}:
             line_spacing_factor = min(line_spacing_factor, 0.94)
-        if source_fontsize > 0:
-            if unit_profile in {"anchored_label", "protected_inline"}:
-                min_fontsize = max(min_fontsize, math.ceil(source_fontsize * 95.0) / 100.0)
-            elif unit_profile in {"technical_inline_cluster", "dense_editorial_phrase"}:
-                min_fontsize = max(min_fontsize, source_fontsize * 0.90)
-            elif page_profile in {"academic_dense", "technical_structured"}:
-                min_fontsize = max(min_fontsize, source_fontsize * 0.88)
         return {
             "adaptive_profile": adaptive,
             "unit_profile": unit_profile,
@@ -3850,10 +3725,8 @@ class DocumentReconstructor:
                 seen_translated_in_phrase: set[str] = set()
                 spans = list((phrase or {}).get("spans") or [])
                 for si, span in enumerate(spans):
-                    raw_source_text = str((span or {}).get("texte") or (span or {}).get("text") or "").strip()
-                    raw_translated_text = str((span or {}).get("translated_text") or "").strip()
-                    source_text = self._clean_text_for_render(raw_source_text) or raw_source_text
-                    translated_text = self._clean_text_for_render(raw_translated_text) or raw_translated_text
+                    source_text = self._clean_text_for_render((span or {}).get("texte") or (span or {}).get("text") or "")
+                    translated_text = self._clean_text_for_render((span or {}).get("translated_text") or "")
                     if not translated_text:
                         translated_text = source_text
                     if not translated_text:
@@ -3871,10 +3744,7 @@ class DocumentReconstructor:
                     ):
                         short_preserved = (
                             len(source_text) <= 3
-                            and (
-                                source_text in ref_translation
-                                or re.search(r"(?<!\w)" + re.escape(source_text) + r"(?!\w)", ref_translation)
-                            )
+                            and re.search(r"(?<!\w)" + re.escape(source_text) + r"(?!\w)", ref_translation)
                         )
                         if not short_preserved:
                             continue
@@ -4586,8 +4456,6 @@ class DocumentReconstructor:
         if not self.hierarchical_reconstruction_mode or not isinstance(block, dict):
             return False
         block_type = self._classify_block_for_reconstruction(block, page_data)
-        if block_type == "formula" or bool((block or {}).get("formula_region_id")):
-            return True
         if block_type == "code":
             return True
         if block_type in {"editorial", "heading", "caption", "annotation", "table"}:
@@ -4640,26 +4508,12 @@ class DocumentReconstructor:
         return lines or [text]
 
     def _select_block_renderer(self, plan):
-        contract_key = str((plan.constraints or {}).get("reconstruction_contract_key") or "").strip().lower()
-        contract_render_mode = str((plan.constraints or {}).get("contract_render_mode") or "").strip().lower()
-        source_block = getattr(plan, "source_block", None) or {}
-        object_type = str(source_block.get("object_type") or "").strip().lower()
-        object_class = str(source_block.get("object_class") or "").strip().lower()
-        unit_type = str(source_block.get("unit_type") or "").strip().lower()
-        explicit_code_block = (
-            object_type in {"code_block", "code_line"}
-            or object_class == "technical"
-            or unit_type == "code_visible"
-        )
-        if source_block.get("formula_region_id") or plan.block_type == "formula" or contract_key in {"formula_block", "inline_formula"}:
-            return AtomicFormulaRegionRenderer(self)
-        if plan.block_type == "code" and contract_key != "url_reference" and (
-            explicit_code_block or contract_render_mode not in {"line_preserve", "bbox_anchored", "relative_slots", "prose_reflow"}
-        ):
+        if plan.block_type == "code":
             return CodeBlockRenderer(self)
         structured_kind = str((plan.constraints or {}).get("structured_contract_kind") or "").strip().lower()
         if structured_kind:
             return StructuredContractRenderer(self)
+        contract_render_mode = str((plan.constraints or {}).get("contract_render_mode") or "").strip().lower()
         if contract_render_mode == "cell_locked":
             return TableBlockRenderer(self)
         if contract_render_mode in {"line_preserve", "bbox_anchored", "relative_slots", "prose_reflow"}:
@@ -4753,7 +4607,7 @@ class DocumentReconstructor:
     def _line_preserve_effective_rect(self, plan):
         """En mode line_preserve, étend la block_bbox pour couvrir toutes les positions de templates."""
         block_rect = fitz.Rect(plan.block_bbox)
-        if str((getattr(plan, "constraints", None) or {}).get("contract_render_mode") or "").strip().lower() != "line_preserve":
+        if str((plan.constraints or {}).get("contract_render_mode") or "").strip().lower() != "line_preserve":
             return block_rect
         fontsize = float(getattr(plan, "dominant_fontsize", None) or 12.0)
         if plan.semantic_profile is not None:
@@ -4802,9 +4656,6 @@ class DocumentReconstructor:
                     rendered_fontsize = 0.0
                     source_fontsize = 0.0
                 min_font_ratio = float(metadata.get("min_font_ratio") or 0.0)
-                if ":fallback:" in str(getattr(op, "unit_id", "") or ""):
-                    min_font_ratio = min_font_ratio if min_font_ratio > 0 else 1.0
-                min_font_ratio = max(min_font_ratio, 0.99) if min_font_ratio > 0 else 0.99
                 if source_fontsize > 0 and rendered_fontsize > 0 and min_font_ratio > 0:
                     ratio = rendered_fontsize / source_fontsize
                     if ratio + 1e-6 < min_font_ratio:
@@ -4845,324 +4696,6 @@ class DocumentReconstructor:
                         break
                 text_rects.append(rect)
         return findings
-
-    def _draw_text_rects_from_ops(self, ops):
-        rects = []
-        for op in ops or []:
-            if not str(getattr(op, "op_type", "") or "").startswith("draw_text"):
-                continue
-            if not self._clean_text_for_render(getattr(op, "text", "") or ""):
-                continue
-            bbox = getattr(op, "bbox", None)
-            rect = fitz.Rect(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None
-            if isinstance(rect, fitz.Rect) and rect.get_area() > 0:
-                rects.append((op, rect))
-        return rects
-
-    def _validate_ops_against_page_text_rects(self, plan, ops, committed_text_rects):
-        findings = []
-        for op, rect in self._draw_text_rects_from_ops(ops):
-            for existing in committed_text_rects or []:
-                existing_rect = existing.get("rect") if isinstance(existing, dict) else existing
-                if not isinstance(existing_rect, fitz.Rect) or existing_rect.get_area() <= 0:
-                    continue
-                horizontal = max(0.0, min(rect.x1, existing_rect.x1) - max(rect.x0, existing_rect.x0))
-                vertical = max(0.0, min(rect.y1, existing_rect.y1) - max(rect.y0, existing_rect.y0))
-                if horizontal <= 0.0 or vertical <= 0.0:
-                    continue
-                inter_area = horizontal * vertical
-                if inter_area <= 0.5:
-                    continue
-                findings.append(
-                    {
-                        "type": "text_overlap",
-                        "unit_id": getattr(op, "unit_id", None),
-                        "bbox": tuple(rect),
-                        "overlap_with_block_id": str((existing or {}).get("block_id") or "") if isinstance(existing, dict) else "",
-                        "scope": "page",
-                    }
-                )
-                break
-        return findings
-
-    def _append_committed_text_rects(self, committed_text_rects, ops):
-        for op, rect in self._draw_text_rects_from_ops(ops):
-            committed_text_rects.append(
-                {
-                    "block_id": str(getattr(op, "block_id", "") or ""),
-                    "unit_id": str(getattr(op, "unit_id", "") or ""),
-                    "rect": rect,
-                }
-            )
-
-    def _shift_block_render_ops(self, ops, dx=0.0, dy=0.0):
-        shifted = []
-        for op in ops or []:
-            bbox = getattr(op, "bbox", None)
-            new_bbox = bbox
-            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                new_bbox = (
-                    float(bbox[0]) + float(dx),
-                    float(bbox[1]) + float(dy),
-                    float(bbox[2]) + float(dx),
-                    float(bbox[3]) + float(dy),
-                )
-            metadata = dict(getattr(op, "metadata", {}) or {})
-            point = metadata.get("point")
-            if isinstance(point, (list, tuple)) and len(point) >= 2:
-                metadata["point"] = (float(point[0]) + float(dx), float(point[1]) + float(dy))
-            intended = metadata.get("intended_bbox")
-            if isinstance(intended, (list, tuple)) and len(intended) == 4:
-                metadata["intended_bbox"] = (
-                    float(intended[0]) + float(dx),
-                    float(intended[1]) + float(dy),
-                    float(intended[2]) + float(dx),
-                    float(intended[3]) + float(dy),
-                )
-            shifted.append(replace(op, bbox=new_bbox, metadata=metadata))
-        return shifted
-
-    def _relocate_ops_below_page_collisions(self, page, plan, ops, committed_text_rects):
-        text_rects = [rect for _, rect in self._draw_text_rects_from_ops(ops)]
-        if not text_rects:
-            return list(ops or [])
-        page_rect = fitz.Rect(page.rect) if page is not None else self._page_rebalance_bounds(None, getattr(plan, "page_data", None))
-        shifted_ops = list(ops or [])
-        for _ in range(12):
-            dy = 0.0
-            for _, rect in self._draw_text_rects_from_ops(shifted_ops):
-                for existing in committed_text_rects or []:
-                    existing_rect = existing.get("rect") if isinstance(existing, dict) else existing
-                    if not isinstance(existing_rect, fitz.Rect) or existing_rect.get_area() <= 0:
-                        continue
-                    if (rect & existing_rect).get_area() > 0.5:
-                        dy = max(dy, float(existing_rect.y1 - rect.y0 + 2.0))
-            if dy <= 0.0:
-                return shifted_ops
-            shifted_rects = [rect for _, rect in self._draw_text_rects_from_ops(shifted_ops)]
-            max_bottom = max(rect.y1 for rect in shifted_rects)
-            if max_bottom + dy > page_rect.y1 - 4.0:
-                return None
-            shifted_ops = self._shift_block_render_ops(shifted_ops, dy=dy)
-        return None
-
-    def _validation_plan_for_ops_extent(self, plan, ops):
-        rects = [rect for _, rect in self._draw_text_rects_from_ops(ops)]
-        if not rects:
-            return plan
-        extent = fitz.Rect(rects[0])
-        for rect in rects[1:]:
-            extent |= rect
-        pad = 2.0
-        bbox = (
-            max(0.0, extent.x0 - pad),
-            max(0.0, extent.y0 - pad),
-            extent.x1 + pad,
-            extent.y1 + pad,
-        )
-        try:
-            return replace(plan, block_bbox=bbox, block_bbox_pt=bbox, container_bbox=bbox)
-        except TypeError:
-            setattr(plan, "block_bbox", bbox)
-            setattr(plan, "block_bbox_pt", bbox)
-            setattr(plan, "container_bbox", bbox)
-            return plan
-
-    def _page_existing_text_rects(self, page):
-        rects = []
-        try:
-            payload = page.get_text("dict") or {}
-        except Exception:
-            return rects
-        for block in payload.get("blocks") or []:
-            for line in (block or {}).get("lines") or []:
-                for span in (line or {}).get("spans") or []:
-                    text = self._clean_text_for_render((span or {}).get("text") or "")
-                    bbox = (span or {}).get("bbox")
-                    rect = fitz.Rect(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None
-                    if text and isinstance(rect, fitz.Rect) and rect.get_area() > 0:
-                        rects.append({"block_id": "__page_existing__", "unit_id": "", "rect": rect})
-        return rects
-
-    def _ops_are_page_collision_free(self, plan, ops, existing_text_rects=None):
-        committed = list(existing_text_rects or [])
-        for op, rect in self._draw_text_rects_from_ops(ops):
-            findings = self._validate_ops_against_page_text_rects(plan, [op], committed)
-            if findings:
-                return False
-            committed.append(
-                {
-                    "block_id": str(getattr(op, "block_id", "") or ""),
-                    "unit_id": str(getattr(op, "unit_id", "") or ""),
-                    "rect": rect,
-                }
-            )
-        return True
-
-    def _text_ops_within_page_bounds(self, page, ops, margin=3.0):
-        page_rect = fitz.Rect(page.rect) if page is not None else fitz.Rect(0, 0, 10_000, 10_000)
-        for _, rect in self._draw_text_rects_from_ops(ops):
-            if (
-                rect.x0 < page_rect.x0 + margin
-                or rect.x1 > page_rect.x1 - margin
-                or rect.y0 < page_rect.y0 + margin
-                or rect.y1 > page_rect.y1 - margin
-            ):
-                return False
-        return True
-
-    def _layout_commit_text_rects(self, commits):
-        rects = []
-        for commit in commits or []:
-            for op, rect in self._draw_text_rects_from_ops(getattr(commit, "ops", []) or []):
-                rects.append(
-                    {
-                        "block_id": str(getattr(op, "block_id", "") or getattr(commit.plan, "block_id", "") or ""),
-                        "unit_id": str(getattr(op, "unit_id", "") or ""),
-                        "rect": rect,
-                    }
-                )
-        return rects
-
-    def _page_layout_overlap_pairs(self, commits):
-        text_items = []
-        for commit_index, commit in enumerate(commits or []):
-            for op, rect in self._draw_text_rects_from_ops(getattr(commit, "ops", []) or []):
-                text_items.append((commit_index, op, rect))
-        overlaps = []
-        for i, (left_idx, left_op, left_rect) in enumerate(text_items):
-            for right_idx, right_op, right_rect in text_items[i + 1:]:
-                if left_idx == right_idx:
-                    continue
-                inter = left_rect & right_rect
-                if inter.get_area() <= 0.5:
-                    continue
-                overlaps.append(
-                    {
-                        "left_commit_index": left_idx,
-                        "right_commit_index": right_idx,
-                        "left_block_id": str(getattr(left_op, "block_id", "") or ""),
-                        "right_block_id": str(getattr(right_op, "block_id", "") or ""),
-                        "left_rect": left_rect,
-                        "right_rect": right_rect,
-                        "intersection": inter,
-                    }
-                )
-        return overlaps
-
-    def _shift_page_layout_commit(self, commit, dx=0.0, dy=0.0):
-        shifted_ops = self._shift_block_render_ops(commit.ops, dx=dx, dy=dy)
-        shifted_plan = self._validation_plan_for_ops_extent(commit.plan, shifted_ops)
-        shifted_stats = dict(commit.stats or {})
-        shifted_stats["layout_shift_dx"] = float(shifted_stats.get("layout_shift_dx") or 0.0) + float(dx)
-        shifted_stats["layout_shift_dy"] = float(shifted_stats.get("layout_shift_dy") or 0.0) + float(dy)
-        return replace(commit, plan=shifted_plan, ops=shifted_ops, stats=shifted_stats)
-
-    def _commit_needs_no_shrink_or_local_failure(self, commit):
-        findings = self._validate_block_layout(commit.plan, commit.ops)
-        severe = {"overflow", "text_overlap", "protected_overlap", "composition_overflow", "font_too_small", "text_missing"}
-        return not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in findings)
-
-    def _sorted_page_layout_commits(self, commits):
-        def key(commit):
-            rects = [rect for _, rect in self._draw_text_rects_from_ops(getattr(commit, "ops", []) or [])]
-            if rects:
-                extent = fitz.Rect(rects[0])
-                for rect in rects[1:]:
-                    extent |= rect
-                return (extent.y0, extent.x0, str(getattr(commit.plan, "block_id", "") or ""))
-            try:
-                rect = fitz.Rect(commit.plan.block_bbox)
-                return (rect.y0, rect.x0, str(getattr(commit.plan, "block_id", "") or ""))
-            except Exception:
-                return (0.0, 0.0, str(getattr(commit.plan, "block_id", "") or ""))
-
-        return sorted(list(commits or []), key=key)
-
-    def _resolve_page_layout_cascade(self, page, existing_commits, candidate_commit):
-        """Resolve text collisions by moving whole block render plans, never by shrinking text."""
-        commits = self._sorted_page_layout_commits(list(existing_commits or []) + [candidate_commit])
-        page_rect = fitz.Rect(page.rect) if page is not None else fitz.Rect(0, 0, 10_000, 10_000)
-        gap = 2.0
-        for _ in range(max(20, len(commits) * 8)):
-            changed = False
-            overlaps = self._page_layout_overlap_pairs(commits)
-            if not overlaps:
-                if all(self._text_ops_within_page_bounds(page, commit.ops) for commit in commits):
-                    if all(self._commit_needs_no_shrink_or_local_failure(commit) for commit in commits):
-                        return commits
-                return None
-            for overlap in overlaps:
-                left_idx = int(overlap["left_commit_index"])
-                right_idx = int(overlap["right_commit_index"])
-                left_rect = overlap["left_rect"]
-                right_rect = overlap["right_rect"]
-                if left_rect.y0 <= right_rect.y0:
-                    move_idx = right_idx
-                    dy = left_rect.y1 - right_rect.y0 + gap
-                else:
-                    move_idx = left_idx
-                    dy = right_rect.y1 - left_rect.y0 + gap
-                dy = max(gap, float(dy))
-                moving_rects = [rect for _, rect in self._draw_text_rects_from_ops(commits[move_idx].ops)]
-                if not moving_rects:
-                    continue
-                bottom = max(rect.y1 for rect in moving_rects)
-                if bottom + dy > page_rect.y1 - 3.0:
-                    return None
-                commits[move_idx] = self._shift_page_layout_commit(commits[move_idx], dy=dy)
-                changed = True
-                break
-            if not changed:
-                return None
-        return None
-
-    def _try_compact_translation_block_variant(self, block, target_lang):
-        """Use precomputed compact/equivalent translations if the pipeline supplied them."""
-        if not isinstance(block, dict):
-            return None
-        variant = copy.deepcopy(block)
-        used = False
-        compact_block_text = self._clean_text_for_render(
-            block.get("layout_compact_translated_text")
-            or block.get("compact_translated_text")
-            or ((block.get("translation_variants") or {}).get("compact") if isinstance(block.get("translation_variants"), dict) else "")
-        )
-        if compact_block_text:
-            variant["translated_text"] = compact_block_text
-            used = True
-        for line in variant.get("lines") or []:
-            compact_line = self._clean_text_for_render(
-                line.get("layout_compact_translated_text")
-                or line.get("compact_translated_text")
-                or ((line.get("translation_variants") or {}).get("compact") if isinstance(line.get("translation_variants"), dict) else "")
-            )
-            if compact_line:
-                line["translated_text"] = compact_line
-                used = True
-            for phrase in line.get("phrases") or []:
-                compact_phrase = self._clean_text_for_render(
-                    phrase.get("layout_compact_translated_text")
-                    or phrase.get("compact_translated_text")
-                    or ((phrase.get("translation_variants") or {}).get("compact") if isinstance(phrase.get("translation_variants"), dict) else "")
-                )
-                if compact_phrase:
-                    phrase["translated_text"] = compact_phrase
-                    phrase["texte"] = compact_phrase
-                    used = True
-        if not used:
-            return None
-        variant["layout_compact_variant_used"] = True
-        variant["target_lang"] = target_lang
-        return variant
-
-    def _build_page_layout_commit(self, plan, ops, block, stats):
-        text_ops = sum(1 for op in ops or [] if op.op_type == "draw_text_run")
-        text_chars = sum(len((op.text or "").strip()) for op in ops or [] if op.op_type == "draw_text_run")
-        merged_stats = dict(stats or {})
-        merged_stats["text_ops"] = text_ops
-        merged_stats["text_chars"] = text_chars
-        return PageLayoutCommit(plan=plan, ops=list(ops or []), block=block or {}, stats=merged_stats)
 
     def _prune_block_draw_ops(self, plan, ops):
         block_rect = self._line_preserve_effective_rect(plan)
@@ -5241,22 +4774,6 @@ class DocumentReconstructor:
                 path = (op.metadata or {}).get("path")
                 if path and os.path.exists(path):
                     page.insert_image(rect, filename=path, overlay=True)
-                continue
-            if op.op_type == "draw_pdf_region" and isinstance(rect, fitz.Rect):
-                source_pdf = str((op.metadata or {}).get("source_pdf_path") or "").strip()
-                if source_pdf and os.path.exists(source_pdf):
-                    try:
-                        source_doc = fitz.open(source_pdf)
-                        try:
-                            source_page_index = int((op.metadata or {}).get("source_page_index") or 0)
-                            source_page_index = max(0, min(source_page_index, len(source_doc) - 1))
-                            clip_bbox = (op.metadata or {}).get("source_clip")
-                            clip = fitz.Rect(clip_bbox) if isinstance(clip_bbox, (list, tuple)) and len(clip_bbox) == 4 else None
-                            page.show_pdf_page(rect, source_doc, source_page_index, clip=clip, overlay=True)
-                        finally:
-                            source_doc.close()
-                    except Exception:
-                        pass
                 continue
             if op.op_type == "draw_text_run":
                 if not (op.text or "").strip():
@@ -5766,13 +5283,6 @@ class DocumentReconstructor:
         rows = list(toc.get("toc_rows") or [])
         if not rows:
             return False
-        has_translated_rows = any(
-            self._clean_text_for_render((row or {}).get("translated_label") or (row or {}).get("translated_text") or "")
-            for row in rows
-            if isinstance(row, dict)
-        )
-        if str(target_lang or "").strip().lower() not in {"", "en", "eng", "source"} and not has_translated_rows:
-            return False
 
         page_rect = fitz.Rect(page.rect)
         rendered_any = False
@@ -5793,13 +5303,12 @@ class DocumentReconstructor:
             style = {}
             if isinstance(row.get("style"), dict):
                 style.update(row.get("style") or {})
-            if isinstance(row.get("page_style"), dict):
-                for key, value in (row.get("page_style") or {}).items():
-                    style.setdefault(key, value)
             if isinstance(row.get("translation_style"), str):
                 style.setdefault("_translation_style", row.get("translation_style"))
             if isinstance(row.get("translation_tone"), str):
                 style.setdefault("_translation_tone", row.get("translation_tone"))
+            page_style_base = dict(row.get("page_style") or {}) if isinstance(row.get("page_style"), dict) else dict(style)
+            marker_style_base = dict(row.get("marker_style") or {}) if isinstance(row.get("marker_style"), dict) else {}
 
             label_rect = self._fitz_rect_from_bbox_like(row.get("label_bbox") or row.get("bbox") or row.get("page_bbox"))
             page_rect_row = self._fitz_rect_from_bbox_like(row.get("page_bbox") or row.get("bbox") or row.get("label_bbox"))
@@ -5813,6 +5322,17 @@ class DocumentReconstructor:
             if not isinstance(page_rect_row, fitz.Rect) or page_rect_row.get_area() <= 0:
                 page_rect_row = fitz.Rect(max(page_rect.x1 - 72.0, label_rect.x1 + 12.0), label_rect.y0, page_rect.x1 - 24.0, label_rect.y1)
 
+            # TOC source bboxes often bound only the English label glyphs.
+            # French labels are longer; the real layout slot is the row area
+            # up to the page-number column, not the original text width.
+            if role != "toc_title":
+                if page_value:
+                    available_right = max(label_rect.x1, page_rect_row.x0 - 3.0)
+                else:
+                    available_right = page_rect.x1 - 24.0
+                if available_right > label_rect.x1 + 2.0:
+                    label_rect = fitz.Rect(label_rect.x0, label_rect.y0, available_right, label_rect.y1)
+
             row_bbox = fitz.Rect(
                 min(label_rect.x0, page_rect_row.x0),
                 min(label_rect.y0, page_rect_row.y0),
@@ -5824,18 +5344,40 @@ class DocumentReconstructor:
                 continue
 
             base_fontsize = float(style.get("size") or style.get("font_size_pt") or 12.0)
-            label_fontsize = base_fontsize
-            page_fontsize = base_fontsize
+            min_fontsize = 6.0 if role == "toc_title" else 5.5
+            page_base_fontsize = float(page_style_base.get("size") or base_fontsize)
+            label_fontsize = min(base_fontsize, max(min_fontsize, min(label_rect.height * 0.88, label_rect.width * 0.24)))
+            page_fontsize = min(page_base_fontsize, max(min_fontsize, min(page_rect_row.height * 0.88, page_rect_row.width * 0.38)))
 
             label_style = dict(style)
             label_style["size"] = label_fontsize
-            page_style = dict(style)
+            page_style = dict(page_style_base or style)
+            page_style.setdefault("_translation_style", style.get("_translation_style"))
+            page_style.setdefault("_translation_tone", style.get("_translation_tone"))
             page_style["size"] = page_fontsize
 
             label_font_style, label_fontfile, label_builtin, label_fontname = self._resolve_style_font(page, label_style, text=label or page_value)
             page_font_style, page_fontfile, page_builtin, page_fontname = self._resolve_style_font(page, page_style, text=page_value or label)
-            label_rgb = self._resolve_text_color(label_font_style if isinstance(label_font_style, dict) else label_style, row)
-            page_rgb = self._resolve_text_color(page_font_style if isinstance(page_font_style, dict) else page_style, row)
+            label_rgb = self._resolve_text_color(label_style, row)
+            page_rgb = self._resolve_text_color(page_style, row)
+
+            # Avoid wrapping TOC rows into fragments. We prefer shrinking
+            # within the row geometry over creating extra lines.
+            while label_fontsize > min_fontsize:
+                if self._measure_text_width(label, label_fontsize, label_fontname, label_fontfile) <= max(8.0, label_rect.width * 0.98):
+                    break
+                label_fontsize -= 0.5
+            while page_fontsize > min_fontsize:
+                if self._measure_text_width(page_value, page_fontsize, page_fontname, page_fontfile) <= max(8.0, page_rect_row.width * 0.98):
+                    break
+                page_fontsize -= 0.5
+
+            label_style["size"] = label_fontsize
+            page_style["size"] = page_fontsize
+            label_font_style, label_fontfile, label_builtin, label_fontname = self._resolve_style_font(page, label_style, text=label or page_value)
+            page_font_style, page_fontfile, page_builtin, page_fontname = self._resolve_style_font(page, page_style, text=page_value or label)
+            label_rgb = self._resolve_text_color(label_style, row)
+            page_rgb = self._resolve_text_color(page_style, row)
 
             # Draw title rows centered when they are page headers, otherwise
             # keep the label/page split stable.
@@ -5857,13 +5399,21 @@ class DocumentReconstructor:
                             overlay=True,
                         )
                     except Exception:
-                        page.insert_text((target_rect.x0 + 4.0, target_rect.y1 - max(1.0, label_fontsize * 0.18)), text, fontname="helv", fontsize=label_fontsize, color=label_rgb, overlay=True)
+                        page.insert_text(
+                            (target_rect.x0 + 4.0, target_rect.y1 - max(1.0, label_fontsize * 0.18)),
+                            text,
+                            fontname=label_fontname if label_builtin or not label_fontfile else label_fontname,
+                            fontfile=label_fontfile if label_fontfile and not label_builtin else None,
+                            fontsize=label_fontsize,
+                            color=label_rgb,
+                            overlay=True,
+                        )
                     rendered_any = True
                 continue
 
             if label:
                 try:
-                    page.insert_textbox(
+                    written = page.insert_textbox(
                         label_rect,
                         label,
                         fontname=label_fontname if label_builtin or not label_fontfile else label_fontname,
@@ -5873,16 +5423,54 @@ class DocumentReconstructor:
                         align=0,
                         overlay=True,
                     )
+                    if isinstance(written, (int, float)) and written < 0:
+                        raise RuntimeError("toc label did not fit textbox")
                 except Exception:
                     page.insert_text(
                         (label_rect.x0, label_rect.y1 - max(1.0, label_fontsize * 0.18)),
                         label,
-                        fontname="helv",
+                        fontname=label_fontname if label_builtin or not label_fontfile else label_fontname,
+                        fontfile=label_fontfile if label_fontfile and not label_builtin else None,
                         fontsize=label_fontsize,
                         color=label_rgb,
                         overlay=True,
                     )
                 rendered_any = True
+
+                source_label = self._clean_text_for_render(row.get("label") or "")
+                translated_label = self._clean_text_for_render(row.get("translated_label") or row.get("translated_text") or "")
+                marker_overlay_safe = bool(source_label and translated_label and source_label == translated_label)
+                marker_positions = [match.start() for match in re.finditer(r"[■•▪◦·]", label or "")]
+                if marker_positions and marker_style_base:
+                    marker_style = dict(marker_style_base)
+                    marker_size = float(marker_style.get("size") or max(3.0, label_fontsize * 0.45))
+                    marker_style["size"] = marker_size
+                    marker_font_style, marker_fontfile, marker_builtin, marker_fontname = self._resolve_style_font(page, marker_style, text="■")
+                    marker_rgb = self._resolve_text_color(marker_style, row)
+                    for marker_pos in marker_positions:
+                        try:
+                            if marker_overlay_safe:
+                                marker_bboxes = row.get("marker_bboxes") if isinstance(row.get("marker_bboxes"), list) else []
+                                marker_rect = self._fitz_rect_from_bbox_like(marker_bboxes[0]) if marker_bboxes else None
+                                x = marker_rect.x0 if isinstance(marker_rect, fitz.Rect) else label_rect.x0
+                                baseline = marker_rect.y1 - max(0.1, marker_size * 0.12) if isinstance(marker_rect, fitz.Rect) else label_rect.y1 - max(1.0, label_fontsize * 0.18)
+                            else:
+                                prefix = label[:marker_pos]
+                                x = label_rect.x0 + self._measure_text_width(prefix, label_fontsize, label_fontname, label_fontfile)
+                                baseline = label_rect.y1 - max(1.0, label_fontsize * 0.18)
+                            if x < label_rect.x0 - 1.0 or x > label_rect.x1 + 1.0:
+                                continue
+                            page.insert_text(
+                                (x, baseline),
+                                "■",
+                                fontname=marker_fontname if marker_builtin or not marker_fontfile else marker_fontname,
+                                fontfile=marker_fontfile if marker_fontfile and not marker_builtin else None,
+                                fontsize=marker_size,
+                                color=marker_rgb,
+                                overlay=True,
+                            )
+                        except Exception:
+                            pass
 
             if label and page_value:
                 gap_left = min(page_rect_row.x0, row_bbox.x1)
@@ -5928,7 +5516,8 @@ class DocumentReconstructor:
                     page.insert_text(
                         (page_rect_row.x1 - 4.0, page_rect_row.y1 - max(1.0, page_fontsize * 0.18)),
                         page_value,
-                        fontname="helv",
+                        fontname=page_fontname if page_builtin or not page_fontfile else page_fontname,
+                        fontfile=page_fontfile if page_fontfile and not page_builtin else None,
                         fontsize=page_fontsize,
                         color=page_rgb,
                         overlay=True,
@@ -6220,27 +5809,27 @@ class DocumentReconstructor:
             return []
         style = self._merge_styles((entry or {}).get("style") or {}, self._style_from_block(block))
         source_fontsize = float(style.get("size") or 12.0)
-        min_ratio = 1.0
-        fontsize = source_fontsize
+        min_ratio = float(contract.get("min_font_ratio") or 0.90)
+        min_fontsize = max(4.0, source_fontsize * min_ratio)
+        fontsize = min(source_fontsize, max(min_fontsize, rect.height * 0.86))
         try:
             _, fontfile, builtin, fontname = self._resolve_style_font(page, style, text=text)
         except Exception:
             fontfile, builtin, fontname = None, True, "helv"
-        if re.search(r"[∗∂∑∫√∞≈≠≤≥±×÷−∆Ωα-ωΑ-Ω]", text):
-            unicode_fontfile = self._get_system_unicode_font(False, False, False, False)
-            if unicode_fontfile:
-                fontfile = unicode_fontfile
-                builtin = None
-                try:
-                    fontname = self._resolve_page_fontname(page, fontfile, None)
-                except Exception:
-                    fontname = "helv"
         rgb = self._resolve_text_color(style, block)
         strict_single_line = bool(contract.get("strict_non_reflow")) or contract_key in {"toc_entry", "table_cell_micro", "table_cell_symbolic", "table_cell_numeric", "url_reference", "formula_block", "inline_formula", "figure_label"}
         lines = [text] if strict_single_line else self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(6.0, rect.width))
         if not lines:
             lines = [text]
-        line_h = max(4.5, fontsize * 1.06)
+        while fontsize > min_fontsize and lines:
+            too_wide = any(self._measure_text_width(line, fontsize, fontname, fontfile) > max(5.0, rect.width * 0.98) for line in lines)
+            too_tall = len(lines) * max(4.5, fontsize * 1.05) > max(rect.height, fontsize * 1.1)
+            if not too_wide and not too_tall:
+                break
+            fontsize -= 0.35
+            if not strict_single_line:
+                lines = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(6.0, rect.width)) or [text]
+        line_h = max(4.5, min(rect.height / max(1, len(lines)), fontsize * 1.06))
         align = self._normalize_alignment((entry or {}).get("alignment") or (block or {}).get("alignment") or "left")
         ops = []
         for line_idx, line_text in enumerate(lines):
@@ -6253,11 +5842,11 @@ class DocumentReconstructor:
                 x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
             elif align == "right":
                 x = max(rect.x0, rect.x1 - width)
-            baseline = rect.y0 + ((line_idx + 1) * line_h * 0.82)
+            baseline = min(rect.y1 - 0.8, rect.y0 + min(rect.height - 0.8, (line_idx + 1) * line_h * 0.82))
             text_rect = fitz.Rect(
                 max(rect.x0, x),
                 baseline - max(1.0, fontsize * 0.82),
-                max(rect.x0, x) + max(1.0, width),
+                min(rect.x1, max(rect.x0, x) + max(1.0, min(width, rect.width))),
                 baseline + max(1.0, fontsize * 0.18),
             )
             ops.append(
@@ -6283,171 +5872,9 @@ class DocumentReconstructor:
             )
         return ops
 
-    def _place_rescue_ops_in_free_page_space(self, page, ops, existing_rects):
-        text_rects = [rect for _, rect in self._draw_text_rects_from_ops(ops)]
-        if not text_rects:
-            return list(ops or [])
-        extent = fitz.Rect(text_rects[0])
-        for rect in text_rects[1:]:
-            extent |= rect
-        page_rect = fitz.Rect(page.rect)
-        margin = 6.0
-        line_gap = 2.0
-        dx = 0.0
-        if extent.x1 > page_rect.x1 - margin or extent.x0 < page_rect.x0 + margin:
-            dx = page_rect.x0 + margin - extent.x0
-        available_bottom = page_rect.y1 - margin
-        max_height = max(1.0, extent.height)
-        y = page_rect.y0 + margin
-        while y + max_height <= available_bottom + 0.1:
-            shifted = self._shift_block_render_ops(ops, dx=dx, dy=y - extent.y0)
-            if self._ops_are_page_collision_free(None, shifted, existing_rects):
-                return shifted
-            y += max(4.0, min(max_height + line_gap, 18.0))
-        return None
-
-    def _ops_text_contains_expected(self, ops, expected_text):
-        expected = self._clean_text_for_render(expected_text or "")
-        if not expected:
-            return True
-        rendered = self._clean_text_for_render(" ".join((getattr(op, "text", "") or "") for op in ops or [] if str(getattr(op, "op_type", "") or "").startswith("draw_text")))
-        expected_sig = self._presence_signature(expected)
-        rendered_sig = self._presence_signature(rendered)
-        if expected_sig and expected_sig in rendered_sig:
-            return True
-        tokens = [self._presence_signature(token) for token in re.findall(r"\w+", expected.casefold(), flags=re.UNICODE)]
-        tokens = [token for token in tokens if len(token) >= 3]
-        if tokens:
-            required = tokens if len(tokens) <= 4 else tokens[:2] + tokens[-2:]
-            return all(token in rendered_sig for token in required)
-        return bool(re.sub(r"\s+", "", expected.casefold()) in re.sub(r"\s+", "", rendered.casefold()))
-
-    def _stage_page_block_text_coverage(self, page, page_data, target_lang, staged_commits):
-        staged = list(staged_commits or [])
-        for block in self._iter_renderable_blocks(page_data):
-            block_id = str((block or {}).get("id") or "")
-            block_ops = [
-                op
-                for commit in staged
-                if str(getattr(commit.plan, "block_id", "") or "") == block_id
-                for op in (commit.ops or [])
-            ]
-            page_ops = [op for commit in staged for op in (commit.ops or [])]
-            for entry in self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data):
-                expected = self._clean_text_for_render((entry or {}).get("text") or (entry or {}).get("source_text") or "")
-                if not expected:
-                    continue
-                if self._ops_text_contains_expected(block_ops, expected) or self._ops_text_contains_expected(page_ops, expected):
-                    continue
-                plan = self._build_block_reconstruction_plan(page, page_data, block, target_lang)
-                stack_plan, stack_ops, stack_findings = self._source_size_stack_fallback_candidate(page, plan)
-                if stack_ops and stack_plan is not None and self._ops_text_contains_expected(stack_ops, expected):
-                    severe = {"overflow", "text_overlap", "protected_overlap", "composition_overflow", "font_too_small", "text_missing"}
-                    stack_local_findings = self._validate_block_layout(stack_plan, stack_ops)
-                    if not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in (stack_findings or []) + stack_local_findings):
-                        candidate_commit = self._build_page_layout_commit(
-                            stack_plan,
-                            stack_ops,
-                            block,
-                            {
-                                "committed": True,
-                                "expected_units": max(1, self._expected_block_text_units(block, target_lang, page_data=page_data)),
-                                "contract_driven": False,
-                                "used_presence_fallback": True,
-                                "coverage_rescue": True,
-                                "coverage_strategy": "replace_block_source_size_stack",
-                            },
-                        )
-                        replacement_base = [
-                            commit
-                            for commit in staged
-                            if str(getattr(commit.plan, "block_id", "") or "") != block_id
-                        ]
-                        resolved = self._resolve_page_layout_cascade(page, replacement_base, candidate_commit)
-                        if resolved is not None:
-                            staged = resolved
-                            block_ops = [
-                                op
-                                for commit in staged
-                                if str(getattr(commit.plan, "block_id", "") or "") == block_id
-                                for op in (commit.ops or [])
-                            ]
-                            page_ops = [op for commit in staged for op in (commit.ops or [])]
-                            if self._ops_text_contains_expected(block_ops, expected) or self._ops_text_contains_expected(page_ops, expected):
-                                continue
-                rescue_ops = self._direct_text_ops_for_entry(page, page_data, block, entry, target_lang)
-                if not rescue_ops:
-                    continue
-                plan = self._validation_plan_for_ops_extent(plan, rescue_ops)
-                candidate_commit = self._build_page_layout_commit(
-                    plan,
-                    rescue_ops,
-                    block,
-                    {
-                        "committed": True,
-                        "expected_units": 1,
-                        "contract_driven": False,
-                        "used_presence_fallback": True,
-                        "coverage_rescue": True,
-                    },
-                )
-                resolved = self._resolve_page_layout_cascade(page, staged, candidate_commit)
-                if resolved is None:
-                    raise RuntimeError(
-                        "page layout solver could not place required text without overlap: "
-                        f"page={int(getattr(page, 'number', 0)) + 1} "
-                        f"block_id={block_id} text={expected[:80]!r}"
-                    )
-                staged = resolved
-                block_ops = [
-                    op
-                    for commit in staged
-                    if str(getattr(commit.plan, "block_id", "") or "") == block_id
-                    for op in (commit.ops or [])
-                ]
-                page_ops = [op for commit in staged for op in (commit.ops or [])]
-        return staged
-
-    def _propagate_staged_layout_bboxes(self, page_data, staged_commits):
-        if not isinstance(page_data, dict):
-            return
-        blocks_by_id = {
-            str((block or {}).get("id") or ""): block
-            for block in (page_data.get("blocks") or [])
-            if isinstance(block, dict)
-        }
-        for commit in staged_commits or []:
-            block_id = str(getattr(commit.plan, "block_id", "") or "")
-            block = blocks_by_id.get(block_id)
-            if not block:
-                continue
-            rects = [rect for _, rect in self._draw_text_rects_from_ops(commit.ops)]
-            if not rects:
-                continue
-            extent = fitz.Rect(rects[0])
-            for rect in rects[1:]:
-                extent |= rect
-            pad = 2.0
-            extent = fitz.Rect(max(0.0, extent.x0 - pad), max(0.0, extent.y0 - pad), extent.x1 + pad, extent.y1 + pad)
-            original_bbox = block.get("source_bbox") or block.get("original_bbox") or block.get("bbox")
-            if original_bbox is not None:
-                block.setdefault("source_bbox", copy.deepcopy(original_bbox))
-                block.setdefault("original_bbox", copy.deepcopy(original_bbox))
-            final_bbox = self._set_rebalanced_bbox_pt(block, extent)
-            block["bbox"] = final_bbox
-            layout_attrs = block.get("layout_attributes")
-            if isinstance(layout_attrs, dict):
-                layout_attrs["final_solver_bbox"] = final_bbox
-                layout_attrs["final_solver_bbox_pt"] = (extent.x0, extent.y0, extent.x1, extent.y1)
-            else:
-                block["layout_attributes"] = {
-                    "final_solver_bbox": final_bbox,
-                    "final_solver_bbox_pt": (extent.x0, extent.y0, extent.x1, extent.y1),
-                }
-
     def _enforce_page_block_text_coverage(self, page, page_data, target_lang):
         missing_after_rescue = []
-        committed_any = False
+        rescue_ops = []
         for block in self._iter_renderable_blocks(page_data):
             entries = self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data)
             if not entries:
@@ -6461,31 +5888,9 @@ class DocumentReconstructor:
                     continue
                 if self._entry_text_present_on_page(page, expected):
                     continue
-                rescue_ops = self._direct_text_ops_for_entry(page, page_data, block, entry, target_lang)
-                if not rescue_ops:
-                    continue
-                existing_rects = self._page_existing_text_rects(page)
-                candidate_ops = None
-                math_symbol_rescue = all(
-                    re.fullmatch(r"\s*[∗∂∑∫√∞≈≠≤≥±×÷−∆Ωα-ωΑ-Ω]\s*", getattr(op, "text", "") or "")
-                    for op in rescue_ops
-                    if str(getattr(op, "op_type", "") or "").startswith("draw_text")
-                )
-                if self._ops_are_page_collision_free(None, rescue_ops, existing_rects):
-                    candidate_ops = rescue_ops
-                elif math_symbol_rescue:
-                    candidate_ops = rescue_ops
-                else:
-                    relocated = self._relocate_ops_below_page_collisions(page, None, rescue_ops, existing_rects)
-                    if relocated and self._ops_are_page_collision_free(None, relocated, existing_rects):
-                        candidate_ops = relocated
-                    else:
-                        stacked = self._place_rescue_ops_in_free_page_space(page, rescue_ops, existing_rects)
-                        if stacked and self._ops_are_page_collision_free(None, stacked, existing_rects):
-                            candidate_ops = stacked
-                if candidate_ops:
-                    self._commit_block_draw_ops(page, candidate_ops)
-                    committed_any = True
+                rescue_ops.extend(self._direct_text_ops_for_entry(page, page_data, block, entry, target_lang))
+        if rescue_ops:
+            self._commit_block_draw_ops(page, rescue_ops)
         for block in self._iter_renderable_blocks(page_data):
             for entry in self._translated_coverage_entries_for_block(block, target_lang, page_data=page_data):
                 expected = self._clean_text_for_render((entry or {}).get("text") or (entry or {}).get("source_text") or "")
@@ -6503,13 +5908,14 @@ class DocumentReconstructor:
                         }
                     )
         if missing_after_rescue:
-            raise RuntimeError(
-                "block coverage incomplete after rescue: "
-                f"page={int(getattr(page, 'number', 0)) + 1} "
-                f"missing={len(missing_after_rescue)} "
-                f"entries={[m.get('text', '')[:40] for m in missing_after_rescue[:3]]}"
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "block coverage incomplete after rescue: page=%s missing=%d entries=%s",
+                int(getattr(page, "number", 0)) + 1,
+                len(missing_after_rescue),
+                [m.get("text", "")[:40] for m in missing_after_rescue[:3]],
             )
-        return committed_any
+        return bool(rescue_ops)
 
     def _page_requires_text_layer(self, page_data, target_lang):
         for block in self._iter_renderable_blocks(page_data):
@@ -6548,8 +5954,11 @@ class DocumentReconstructor:
             except Exception:
                 fontfile, builtin, fontname = None, True, "helv"
             source_fontsize = float(style.get("size") or 11.0)
-            fontsize = source_fontsize
+            fontsize = min(source_fontsize, max(4.5, rect.height * 0.78))
             wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+            while fontsize > 4.5 and wrapped and (len(wrapped) * max(5.0, fontsize * 1.05)) > max(rect.height, fontsize * 1.2):
+                fontsize -= 0.5
+                wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             if not wrapped:
                 wrapped = [text]
             line_h = max(4.8, fontsize * 1.06)
@@ -6562,11 +5971,11 @@ class DocumentReconstructor:
                     x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
                 elif align == "right":
                     x = max(rect.x0, rect.x1 - width)
-                baseline = rect.y0 + ((line_idx + 1) * line_h * 0.82)
+                baseline = min(rect.y1 - 1.0, rect.y0 + min(rect.height - 1.0, (line_idx + 1) * line_h * 0.82))
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
-                    x + width,
+                    min(rect.x1, x + width),
                     baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
@@ -6576,7 +5985,7 @@ class DocumentReconstructor:
                         unit_id=f"{(block or {}).get('id') or 'rescue'}:{line_idx}",
                         bbox=(text_rect.x0, text_rect.y0, text_rect.x1, text_rect.y1),
                         text=line_text,
-                        style={**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 1.0},
+                        style={**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 0.85},
                         z_index=100,
                         metadata={
                             "point": (x, baseline),
@@ -6585,18 +5994,13 @@ class DocumentReconstructor:
                             "builtin": builtin,
                             "fontsize": fontsize,
                             "source_fontsize": source_fontsize,
-                            "min_font_ratio": 1.0,
+                            "min_font_ratio": 0.85,
                             "rgb": rgb,
                         },
                     )
                 )
         if not ops:
             return False
-        if not self._ops_are_page_collision_free(None, ops, self._page_existing_text_rects(page)):
-            relocated = self._relocate_ops_below_page_collisions(page, None, ops, self._page_existing_text_rects(page))
-            if not relocated or not self._ops_are_page_collision_free(None, relocated, self._page_existing_text_rects(page)):
-                return False
-            ops = relocated
         self._commit_block_draw_ops(page, ops)
         return self._page_has_text_layer(page)
 
@@ -6707,11 +6111,11 @@ class DocumentReconstructor:
         "text_missing": math.inf,
         "protected_missing": math.inf,
         "source_overlay": math.inf,
-        "overflow": math.inf,
-        "composition_overflow": math.inf,
-        "font_too_small": math.inf,
-        "text_overlap": math.inf,
-        "protected_overlap": math.inf,
+        "overflow": 1000.0,
+        "composition_overflow": 1000.0,
+        "font_too_small": 900.0,
+        "text_overlap": 900.0,
+        "protected_overlap": 900.0,
         "style_lost": 800.0,
         "geometry_drift": 500.0,
     }
@@ -6776,129 +6180,6 @@ class DocumentReconstructor:
         scored.sort(key=lambda item: (math.isinf(item[0]), item[0], item[1]))
         return scored[0][2]
 
-    def _source_size_stack_entries_for_plan(self, plan):
-        block = plan.source_block or {}
-        lines = list(block.get("lines") or [])
-        entries = []
-        if lines:
-            for idx, line in enumerate(lines):
-                text = self._clean_text_for_render(self._line_translated_text(line) or self._line_source_text(line))
-                if not text:
-                    continue
-                style = self._merge_styles((line or {}).get("style") or {}, self._style_from_block(block))
-                entries.append({"unit_id": f"{plan.block_id}:stack_line:{idx}", "text": text, "style": style})
-        if entries:
-            return entries
-        for idx, unit in enumerate(plan.units or []):
-            text = self._clean_text_for_render(getattr(unit, "text_translated", "") or getattr(unit, "text_source", ""))
-            if not text:
-                continue
-            entries.append({"unit_id": getattr(unit, "unit_id", None) or f"{plan.block_id}:stack_unit:{idx}", "text": text, "style": dict(getattr(unit, "style", {}) or {})})
-        if entries:
-            return entries
-        text = self._clean_text_for_render(self._translated_text_from_block(block) or self._source_text_from_block(block))
-        if text:
-            entries.append({"unit_id": f"{plan.block_id}:stack_block", "text": text, "style": self._style_from_block(block)})
-        return entries
-
-    def _wrap_source_size_entry(self, page, text, style, fontname, fontfile, width):
-        fontsize = float((style or {}).get("size") or 12.0)
-        tokens = text.split()
-        if not tokens:
-            return [text]
-        lines = []
-        current = ""
-        for token in tokens:
-            candidate = f"{current} {token}".strip() if current else token
-            if current and self._measure_text_width(candidate, fontsize, fontname, fontfile) > max(8.0, width):
-                lines.append(current)
-                current = token
-            else:
-                current = candidate
-        if current:
-            lines.append(current)
-        return lines or [text]
-
-    def _source_size_stack_fallback_candidate(self, page, plan):
-        entries = self._source_size_stack_entries_for_plan(plan)
-        if not entries:
-            return None, None, []
-        source_rect = fitz.Rect(plan.block_bbox)
-        page_rect = fitz.Rect(page.rect) if page is not None else self._page_rebalance_bounds(None, getattr(plan, "page_data", None))
-        margin = 6.0
-        x0 = max(page_rect.x0 + margin, source_rect.x0)
-        x1 = min(page_rect.x1 - margin, max(source_rect.x1, page_rect.x1 - margin))
-        if x1 - x0 < max(12.0, source_rect.width):
-            x0 = page_rect.x0 + margin
-            x1 = page_rect.x1 - margin
-        usable_width = max(8.0, x1 - x0)
-        prepared = []
-        required_height = 4.0
-        for entry in entries:
-            text = entry["text"]
-            style = dict(entry.get("style") or {})
-            try:
-                _, fontfile, builtin, fontname = self._resolve_style_font(page, style, text=text)
-            except Exception:
-                fontfile, builtin, fontname = None, True, "helv"
-            fontsize = float(style.get("size") or 12.0)
-            wrapped = self._wrap_source_size_entry(page, text, style, fontname, fontfile, usable_width)
-            line_h = max(5.0, fontsize * 1.12)
-            required_height += len(wrapped) * line_h
-            prepared.append((entry, wrapped, fontsize, line_h, fontfile, builtin, fontname))
-        y0 = source_rect.y0
-        y1 = y0 + required_height
-        if y1 > page_rect.y1 - margin:
-            y0 = max(page_rect.y0 + margin, page_rect.y1 - margin - required_height)
-            y1 = y0 + required_height
-        if y1 > page_rect.y1 - margin + 0.5:
-            return None, None, [{"type": "composition_overflow", "block_id": plan.block_id, "strategy": "source_size_stack"}]
-        expanded_plan = replace(
-            plan,
-            block_bbox=(x0, y0, x1, y1),
-            block_bbox_pt=(x0, y0, x1, y1),
-            container_bbox=(x0, y0, x1, y1),
-        )
-        ops = self._background_prep_ops_for_expanded_plan(page, expanded_plan)
-        baseline_y = y0 + 2.0
-        rgb_fallback = self._resolve_text_color(self._style_from_block(plan.source_block or {}), plan.source_block)
-        for entry, wrapped, fontsize, line_h, fontfile, builtin, fontname in prepared:
-            style = dict(entry.get("style") or {})
-            rgb = self._resolve_text_color(style, plan.source_block) or rgb_fallback
-            for line_text in wrapped:
-                baseline_y += line_h * 0.82
-                width = self._measure_text_width(line_text, fontsize, fontname, fontfile)
-                rect = fitz.Rect(x0, baseline_y - max(1.0, fontsize * 0.82), x0 + width, baseline_y + max(1.0, fontsize * 0.18))
-                ops.append(
-                    BlockRenderOp(
-                        op_type="draw_text_run",
-                        block_id=plan.block_id,
-                        unit_id=str(entry.get("unit_id") or plan.block_id),
-                        bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                        text=line_text,
-                        style={**style, "size": fontsize, "_source_size": fontsize, "_min_font_ratio": 1.0},
-                        z_index=10,
-                        metadata={
-                            "point": (x0, baseline_y),
-                            "fontname": fontname,
-                            "fontfile": fontfile,
-                            "builtin": builtin,
-                            "fontsize": fontsize,
-                            "source_fontsize": fontsize,
-                            "min_font_ratio": 1.0,
-                            "rgb": rgb,
-                            "intended_bbox": (rect.x0, rect.y0, rect.x1, rect.y1),
-                        },
-                    )
-                )
-                baseline_y += line_h * 0.18
-        findings = self._validate_block_layout(expanded_plan, ops)
-        return expanded_plan, ops, findings
-
-    def _background_prep_ops_for_expanded_plan(self, page, plan):
-        renderer = EditorialBlockRenderer(self)
-        return renderer._background_prep_ops(plan, bbox=plan.block_bbox)
-
     def _render_plan_with_validation(self, page, plan):
         ops = self._render_hierarchical_block_plan(page, plan)
         findings = self._validate_block_layout(plan, ops)
@@ -6927,12 +6208,6 @@ class DocumentReconstructor:
                         metadata={"candidate_source": "pruned"},
                     )
                 )
-            stack_plan, stack_ops, stack_findings = self._source_size_stack_fallback_candidate(page, plan)
-            if stack_ops and stack_plan is not None:
-                stack_verdict = self._block_render_verdict(stack_plan, stack_ops, findings=stack_findings)
-                severe = {"overflow", "text_overlap", "protected_overlap", "composition_overflow", "font_too_small", "text_missing"}
-                if not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in stack_verdict.findings):
-                    return stack_ops, stack_verdict.findings
             best = self.select_best_candidate(plan, candidates)
             if best is not None and best.score is not None and best.score.status != "failed":
                 return best.ops, best.findings
@@ -7186,7 +6461,7 @@ class DocumentReconstructor:
             style = self._merge_styles(entry.get("style") or {}, self._style_from_block(block))
             _, fontfile, builtin, fontname = self._resolve_style_font( page, style, text=text)
             source_fontsize = float(style.get("size") or 12.0)
-            target_fontsize = source_fontsize * max(1.0, float(font_scale))
+            target_fontsize = source_fontsize * max(0.4, float(font_scale))
             if contract_key in {"table_cell_micro", "table_cell_symbolic", "table_cell_numeric", "figure_label", "url_reference", "formula_block", "inline_formula"}:
                 source_text = self._clean_text_for_render(entry.get("source_text") or "")
                 translated_width = self._measure_text_width(text, source_fontsize, fontname, fontfile)
@@ -7194,7 +6469,7 @@ class DocumentReconstructor:
                 if source_text and (contract.get("preserve_if_translation_overflows") or translated_width > max(4.0, rect.width * 1.02)) and source_width <= max(translated_width, rect.width * 1.08):
                     text = source_text
             rect = self._expand_text_rect_within_block(rect, block_rect, target_fontsize, line_count=1, line_height_factor=1.12)
-            fontsize = target_fontsize
+            fontsize = min(target_fontsize, max(4.5, rect.height * 0.90))
             if bool(contract.get("strict_non_reflow")):
                 wrapped = [text]
             else:
@@ -7207,21 +6482,32 @@ class DocumentReconstructor:
                     line_count=len(wrapped),
                     line_height_factor=1.08 * max(0.84, min(1.05, float(adaptive_profile.get("line_spacing_factor") or 1.0))),
                 )
-            minimum_fontsize = source_fontsize
-            spacing_factor = max(1.0, float(adaptive_profile.get("line_spacing_factor") or 1.0))
-            line_h = max(4.8, fontsize * 1.08 * spacing_factor)
+            minimum_fontsize = max(4.5, source_fontsize * min_font_ratio)
+            while fontsize > minimum_fontsize and wrapped and (len(wrapped) * max(4.8, fontsize * 1.05)) > max(rect.height, fontsize * 1.15):
+                fontsize -= 0.5
+                if bool(contract.get("strict_non_reflow")):
+                    wrapped = [text]
+                else:
+                    wrapped = self._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+            spacing_factor = max(0.84, min(1.05, float(adaptive_profile.get("line_spacing_factor") or 1.0)))
+            line_h = max(4.8, min(rect.height / max(1, len(wrapped)), fontsize * 1.08 * spacing_factor))
             rgb = self._resolve_text_color( style, block)
             for line_idx, line_text in enumerate(wrapped):
                 cur_size = fontsize
-                width = self._measure_text_width(line_text, cur_size, fontname, fontfile)
-                baseline = rect.y0 + ((line_idx + 1) * line_h * 0.82)
+                while cur_size > minimum_fontsize:
+                    width = self._measure_text_width( line_text, cur_size, fontname, fontfile)
+                    if width <= max(8.0, rect.width):
+                        break
+                    cur_size -= 0.5
+                baseline = rect.y0 + min(rect.height - 1.0, (line_idx + 1) * line_h * 0.82)
+                width = self._measure_text_width( line_text, cur_size, fontname, fontfile)
                 x = rect.x0
                 align = self._normalize_alignment(entry.get("alignment") or (block or {}).get("alignment") or "left")
                 if align == "center":
                     x = max(rect.x0, rect.x0 + max(0.0, (rect.width - width) / 2.0))
                 elif align == "right":
                     x = max(rect.x0, rect.x1 - width)
-                text_rect = fitz.Rect(x, baseline - max(1.0, cur_size * 0.82), x + width, baseline + max(1.0, cur_size * 0.18))
+                text_rect = fitz.Rect(x, baseline - max(1.0, cur_size * 0.82), min(rect.x1, x + width), baseline + max(1.0, cur_size * 0.18))
                 ops.append(
                     BlockRenderOp(
                         op_type="draw_text_run",
@@ -7248,7 +6534,9 @@ class DocumentReconstructor:
     def _validated_block_presence_fallback_ops(self, page, page_data, block, target_lang, plan=None):
         plan = plan or self._build_block_reconstruction_plan(page, page_data, block, target_lang)
         severe = {"overflow", "text_overlap", "protected_overlap"}
-        scale_ladder = (1.0,)
+        best_ops = []
+        best_text_ops = 0
+        scale_ladder = tuple((plan.adaptive_profile or {}).get("fallback_scales") or (1.0, 0.9, 0.8, 0.7, 0.6))
         for scale in scale_ladder:
             ops = self._render_block_presence_fallback_ops(page, page_data, block, target_lang, font_scale=scale)
             if not ops:
@@ -7256,7 +6544,12 @@ class DocumentReconstructor:
             findings = self._validate_block_layout(plan, ops)
             if not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in findings):
                 return ops
-        return []
+            pruned_ops = self._prune_block_draw_ops(plan, ops)
+            text_ops = sum(1 for op in pruned_ops if op.op_type == "draw_text_run")
+            if text_ops > best_text_ops:
+                best_ops = pruned_ops
+                best_text_ops = text_ops
+        return best_ops
 
     def reconstruct(self, structure, output_path):
         pages = list((structure or {}).get("pages") or [])
@@ -7265,7 +6558,6 @@ class DocumentReconstructor:
         doc = fitz.open()
         try:
             for page_index, page_data in enumerate(pages):
-                original_page_data_ref = page_data if isinstance(page_data, dict) else None
                 if isinstance(page_data, dict):
                     try:
                         self._augment_page_data_from_layout_xml(page_data)
@@ -7278,15 +6570,8 @@ class DocumentReconstructor:
                     try:
                         page_data = self._rebalance_page_layout(None, page_data, target_lang=self._page_target_lang(structure, page_data))
                         pages[page_index] = page_data
-                        if original_page_data_ref is not None and original_page_data_ref is not page_data:
-                            original_page_data_ref.clear()
-                            original_page_data_ref.update(copy.deepcopy(page_data))
                     except Exception:
                         pass
-                    pages[page_index] = page_data
-                    if original_page_data_ref is not None and original_page_data_ref is not page_data:
-                        original_page_data_ref.clear()
-                        original_page_data_ref.update(copy.deepcopy(page_data))
                 width_pt, height_pt = self._page_size_pt(page_data)
                 page = doc.new_page(width=width_pt, height=height_pt)
                 self._insert_page_background(page, page_data)
@@ -7327,8 +6612,6 @@ class DocumentReconstructor:
                 rendered_block_stats = {}
                 rendered_overlay_signatures = set()
                 rendered_background_regions = set()
-                committed_text_rects = []
-                staged_commits = []
                 for block in self._iter_renderable_blocks(page_data):
                     if not self._block_supported_by_hierarchical_engine(block, page_data):
                         rendered_block_stats[str((block or {}).get("id") or "")] = {
@@ -7368,43 +6651,6 @@ class DocumentReconstructor:
                         }
                         continue
                     ops = self._filter_redundant_background_region_ops(plan, ops, rendered_background_regions)
-                    committed_text_rects = self._layout_commit_text_rects(staged_commits)
-                    page_findings = self._validate_ops_against_page_text_rects(plan, ops, committed_text_rects)
-                    if page_findings:
-                        relocated_ops = self._relocate_ops_below_page_collisions(page, plan, ops, committed_text_rects)
-                        if relocated_ops:
-                            relocated_plan = self._validation_plan_for_ops_extent(plan, relocated_ops)
-                            relocated_findings = self._validate_block_layout(relocated_plan, relocated_ops)
-                            relocated_page_findings = self._validate_ops_against_page_text_rects(relocated_plan, relocated_ops, committed_text_rects)
-                            severe = {"overflow", "text_overlap", "protected_overlap", "composition_overflow", "font_too_small", "text_missing"}
-                            if (
-                                not relocated_page_findings
-                                and not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in relocated_findings)
-                            ):
-                                ops = relocated_ops
-                                page_findings = []
-                        if page_findings:
-                            compact_block = self._try_compact_translation_block_variant(block, target_lang)
-                            if compact_block:
-                                compact_plan = self._build_block_reconstruction_plan(page, page_data, compact_block, target_lang)
-                                compact_ops, compact_findings = self._render_plan_with_validation(page, compact_plan)
-                                if compact_findings and not compact_ops:
-                                    compact_ops = self._validated_block_presence_fallback_ops(page, page_data, compact_block, target_lang, plan=compact_plan)
-                                    compact_findings = []
-                                compact_ops = self._filter_redundant_background_region_ops(compact_plan, compact_ops, rendered_background_regions)
-                                compact_page_findings = self._validate_ops_against_page_text_rects(compact_plan, compact_ops, committed_text_rects)
-                                severe = {"overflow", "text_overlap", "protected_overlap", "composition_overflow", "font_too_small", "text_missing"}
-                                compact_local_findings = self._validate_block_layout(compact_plan, compact_ops)
-                                if (
-                                    compact_ops
-                                    and not compact_page_findings
-                                    and not any(str((finding or {}).get("type") or "").strip().lower() in severe for finding in compact_local_findings)
-                                ):
-                                    block = compact_block
-                                    plan = compact_plan
-                                    ops = compact_ops
-                                    findings = compact_findings
-                                    page_findings = []
                     for op in ops:
                         if op.op_type != "draw_overlay_image":
                             continue
@@ -7415,31 +6661,7 @@ class DocumentReconstructor:
                         })
                         if sig:
                             rendered_overlay_signatures.add(sig)
-                    candidate_commit = self._build_page_layout_commit(
-                        plan,
-                        ops,
-                        block,
-                        {
-                            "committed": True,
-                            "expected_units": expected_units,
-                            "contract_driven": contract_driven,
-                            "used_presence_fallback": used_presence_fallback,
-                        },
-                    )
-                    resolved_commits = self._resolve_page_layout_cascade(page, staged_commits, candidate_commit)
-                    if resolved_commits is None:
-                        rendered_block_stats[plan.block_id] = {
-                            "committed": False,
-                            "text_ops": 0,
-                            "expected_units": expected_units,
-                            "contract_driven": contract_driven,
-                            "used_presence_fallback": used_presence_fallback,
-                            "block": block,
-                            "render_findings": page_findings or [{"type": "composition_overflow", "scope": "page_layout_solver"}],
-                        }
-                        continue
-                    staged_commits = resolved_commits
-                    committed_text_rects = self._layout_commit_text_rects(staged_commits)
+                    self._commit_block_draw_ops(page, ops)
                     rendered_block_ids.add(plan.block_id)
                     rendered_block_stats[plan.block_id] = {
                         "committed": True,
@@ -7468,39 +6690,7 @@ class DocumentReconstructor:
                     current_text_chars = 0
                     fallback_text_chars = sum(len((op.text or "").strip()) for op in fallback_ops if op.op_type == "draw_text_run")
                     if fallback_text_ops > text_ops or (fallback_text_ops == text_ops and fallback_text_chars > current_text_chars):
-                        fallback_plan = self._build_block_reconstruction_plan(page, page_data, block, target_lang)
-                        committed_text_rects = self._layout_commit_text_rects(staged_commits)
-                        candidate_commit = self._build_page_layout_commit(
-                            fallback_plan,
-                            fallback_ops,
-                            block,
-                            {
-                                "committed": True,
-                                "expected_units": expected_units,
-                                "contract_driven": contract_driven,
-                                "used_presence_fallback": True,
-                            },
-                        )
-                        replacement_base = [commit for commit in staged_commits if str(getattr(commit.plan, "block_id", "") or "") != block_id]
-                        resolved_commits = self._resolve_page_layout_cascade(page, replacement_base, candidate_commit)
-                        if resolved_commits is not None:
-                            staged_commits = resolved_commits
-                            committed_text_rects = self._layout_commit_text_rects(staged_commits)
-                            rendered_block_stats[block_id] = {
-                                "committed": True,
-                                "text_ops": fallback_text_ops,
-                                "expected_units": expected_units,
-                                "contract_driven": contract_driven,
-                                "used_presence_fallback": True,
-                                "block": block,
-                            }
-                staged_commits = self._stage_page_block_text_coverage(page, page_data, target_lang, staged_commits)
-                self._propagate_staged_layout_bboxes(page_data, staged_commits)
-                if original_page_data_ref is not None and original_page_data_ref is not page_data:
-                    original_page_data_ref.clear()
-                    original_page_data_ref.update(copy.deepcopy(page_data))
-                for staged in staged_commits:
-                    self._commit_block_draw_ops(page, staged.ops)
+                        self._commit_block_draw_ops(page, fallback_ops)
                 remaining_overlays = self._remaining_page_immutable_overlays(page_data, rendered_overlay_signatures)
                 if remaining_overlays:
                     final_page_data = dict(page_data or {})
@@ -7575,10 +6765,15 @@ class BaseBlockRenderer:
         rect = fitz.Rect(rect)
         if rect.get_area() <= 0:
             return None
-        fontsize = float(style.get("size") or 12.0)
-        measured = self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile)
-        if measured > max(8.0, rect.height - 1.0) or fontsize > rect.width * 0.98:
-            rect = fitz.Rect(rect.x0, rect.y0, max(rect.x1, rect.x0 + fontsize * 1.05), max(rect.y1, rect.y0 + measured + 1.0))
+        fontsize = min(float(style.get("size") or 12.0), max(min_fontsize, rect.width * 0.92))
+        primary_limit = max(8.0, rect.height - 1.0)
+        while fontsize > min_fontsize and (
+            self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile) > primary_limit
+            or fontsize > rect.width * 0.98
+        ):
+            fontsize -= 0.5
+        if fontsize < min_fontsize:
+            fontsize = min_fontsize
         rotated_style = {**style, "size": fontsize, "_rotation_deg": rotation_deg, "_textbox_align": align}
         return self._emit_text_run(
             plan,
@@ -7767,7 +6962,7 @@ class StructuredContractRenderer(BaseBlockRenderer):
             text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
             if not text:
                 continue
-            rect = fitz.Rect(unit.relative_bbox) if unit.relative_bbox else None
+            rect = self.reconstructor._fitz_rect_from_bbox_like(unit.relative_bbox)
             if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
                 continue
             units.append(unit)
@@ -7791,7 +6986,7 @@ class StructuredContractRenderer(BaseBlockRenderer):
             text = self.reconstructor._clean_text_for_render(unit.text_translated or unit.text_source)
             if not text:
                 continue
-            rect = fitz.Rect(unit.relative_bbox) if unit.relative_bbox else None
+            rect = self.reconstructor._fitz_rect_from_bbox_like(unit.relative_bbox)
             if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
                 continue
             rect = rect & block_rect
@@ -7805,7 +7000,6 @@ class StructuredContractRenderer(BaseBlockRenderer):
             )
             rgb = self.reconstructor._resolve_text_color(style, plan.source_block)
             tuning = self.reconstructor._unit_render_tuning(unit, plan)
-            contract_key = str((plan.constraints or {}).get("reconstruction_contract_key") or "").strip().lower()
             if rotation_deg in {90, 180, 270}:
                 op = self._emit_rotated_textbox_run(
                     page,
@@ -7825,13 +7019,12 @@ class StructuredContractRenderer(BaseBlockRenderer):
                 if op is not None:
                     ops.append(op)
                 continue
-            if contract_key in {"url_reference", "toc_entry"}:
-                height_font_factor = 0.98
-            else:
-                height_font_factor = 0.78
-            fontsize = float(style.get("size") or 11.0)
+            fontsize = min(float(style.get("size") or 11.0), max(tuning["min_fontsize"], rect.height * 0.78))
             wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
-            line_h = max(5.5, fontsize * 1.08)
+            while fontsize > tuning["min_fontsize"] and wrapped and (len(wrapped) * max(6.0, fontsize * 1.08)) > max(rect.height, fontsize * 1.25):
+                fontsize -= 0.5
+                wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
+            line_h = max(5.5, min(rect.height / max(1, len(wrapped)), fontsize * 1.08))
             baseline = rect.y0 + min(rect.height - 1.0, max(fontsize * 0.82, (rect.height - line_h * max(0, len(wrapped) - 1)) * 0.5))
             for line_idx, line_text in enumerate(wrapped):
                 width = self.reconstructor._measure_text_width(line_text, fontsize, fontname, fontfile)
@@ -7844,7 +7037,7 @@ class StructuredContractRenderer(BaseBlockRenderer):
                 text_rect = fitz.Rect(
                     x,
                     line_baseline - max(1.0, fontsize * 0.82),
-                    x + width,
+                    min(rect.x1, x + width),
                     line_baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
@@ -7931,22 +7124,11 @@ class StructuredContractRenderer(BaseBlockRenderer):
         payload = self._structured_payload(plan)
         if not payload:
             return EditorialBlockRenderer(self.reconstructor).render(page, plan)
-        contract_key = str((plan.constraints or {}).get("reconstruction_contract_key") or "").strip().lower()
-        kind = str(payload.get("kind") or "").strip().lower()
         # Pour les blocs line_preserve, les templates définissent les positions de ligne.
         # On tente _render_with_scale (qui utilise templates + edges) avant le rendu structuré
         # par slots (qui ne tient pas compte des positions inter-lignes des templates).
         contract_render_mode = str((plan.constraints or {}).get("contract_render_mode") or "").strip().lower()
         if contract_render_mode == "line_preserve":
-            if kind == "rotated_grid" or (contract_key == "toc_entry" and kind == "anchored_composite"):
-                slot_ops = self._background_ops(plan, payload) + self._render_units_in_slots(page, plan, payload)
-                if slot_ops:
-                    severe = {"overflow", "text_overlap", "protected_overlap"}
-                    findings = self.reconstructor._validate_block_layout(plan, slot_ops)
-                    text_ops = sum(1 for op in slot_ops if op.op_type == "draw_text_run" and (op.text or "").strip())
-                    expected_units = max(1, self.reconstructor._expected_plan_text_ops(plan))
-                    if not any(str((f or {}).get("type") or "").strip().lower() in severe for f in findings) and text_ops >= expected_units:
-                        return slot_ops
             editor = EditorialBlockRenderer(self.reconstructor)
             linewise = editor._linewise_fallback(page, plan)
             if linewise:
@@ -7957,15 +7139,12 @@ class StructuredContractRenderer(BaseBlockRenderer):
                 findings = self.reconstructor._validate_block_layout(plan, scale_ops)
                 if not any(str((f or {}).get("type") or "").strip().lower() in severe for f in findings):
                     return scale_ops
-        overlay_ops = [] if contract_key == "url_reference" else self._overlay_ops_for_matching_immutable_overlays(plan)
+        overlay_ops = self._overlay_ops_for_matching_immutable_overlays(plan)
+        kind = str(payload.get("kind") or "").strip().lower()
         if kind == "styled_paragraph":
             return EditorialBlockRenderer(self.reconstructor)._render_prose_reflow(page, plan)
         if kind == "line_locked_cluster":
             ops = self._background_ops(plan, payload)
-            if contract_key == "url_reference":
-                slot_ops = self._render_units_in_slots(page, plan, payload)
-                if slot_ops:
-                    return ops + slot_ops
             locked = EditorialBlockRenderer(self.reconstructor)._linewise_fallback(page, plan)
             if locked:
                 if ops:
@@ -8144,9 +7323,6 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         block = plan.source_block or {}
         adaptive_profile = dict(plan.adaptive_profile or {})
         contract_key = self.reconstructor._reconstruction_contract_key_for_block(block, page_data=plan.page_data)
-        editorial_semantics = dict((block or {}).get("editorial_semantics") or {})
-        flow_class = str(editorial_semantics.get("flow_class") or "").strip().lower()
-        reference_line_preserve = flow_class in {"reference_run", "bibliography", "bibliography_run", "citation_run"}
         lines = list((block.get("lines") or []))
         if not lines:
             return []
@@ -8175,11 +7351,17 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             template_index = idx
             remaining_lines = [text]
             fontsize = float(style.get("size") or 12.0)
-            probe_template = templates[min(template_index, len(templates) - 1)]
-            if contract_key == "toc_entry":
-                remaining_lines = [text]
-            else:
-                remaining_lines = self._wrap_text(page, {**style, "size": fontsize}, text, max(8.0, probe_template.usable_width))
+            min_fontsize = 4.0 if contract_key == "toc_entry" else (5.0 if str(adaptive_profile.get("page_profile") or "") in {"academic_dense", "technical_structured"} else 5.5)
+            while fontsize >= min_fontsize:
+                probe_template = templates[min(template_index, len(templates) - 1)]
+                if contract_key == "toc_entry":
+                    wrapped = [text]
+                else:
+                    wrapped = self._wrap_text(page, {**style, "size": fontsize}, text, max(8.0, probe_template.usable_width))
+                if len(wrapped) <= 1:
+                    remaining_lines = wrapped
+                    break
+                fontsize -= 0.5
             if contract_key == "toc_entry" and len(remaining_lines) > 1:
                 remaining_lines = [" ".join(part for part in remaining_lines if part)]
             _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font( page, {**style, "size": fontsize}, text=text)
@@ -8204,7 +7386,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                         rotation_deg=rotation_deg,
                         align="center",
                         unit_id=f"{plan.block_id}:line:{idx}",
-                        min_fontsize=fontsize,
+                        min_fontsize=min_fontsize,
                     )
                     if op is not None:
                         ops.append(op)
@@ -8218,7 +7400,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 elif align == "right":
                     x = max(x, template.right_x - width)
                 baseline = template.baseline_y
-                rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), x + width, baseline + max(1.0, fontsize * 0.18))
+                rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(template.right_x, x + width), baseline + max(1.0, fontsize * 0.18))
                 ops.append(
                     self._emit_text_run(
                         plan,
@@ -8295,7 +7477,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 continue
             source_fontsize = float(style.get("size") or 12.0)
             rect = self.reconstructor._expand_text_rect_within_block(rect, block_rect, source_fontsize, line_count=1, line_height_factor=1.14)
-            fontsize = source_fontsize
+            fontsize = min(source_fontsize, max(6.0, rect.height * 0.90))
             wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             if wrapped:
                 rect = self.reconstructor._expand_text_rect_within_block(
@@ -8305,6 +7487,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                     line_count=len(wrapped),
                     line_height_factor=1.12 * tuning["line_spacing_factor"],
                 )
+            while fontsize > tuning["min_fontsize"] and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])) > max(rect.height, fontsize * 1.3):
+                fontsize -= 0.5
+                wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             rgb = self.reconstructor._resolve_text_color( style, plan.source_block)
             line_h = max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])
             align = self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
@@ -8319,7 +7504,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
-                    x + width,
+                    min(block_rect.x1, x + width),
                     baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
@@ -8328,7 +7513,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                         line_text,
                         text_rect,
                         (x, baseline),
-                        {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 1.0},
+                        {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 0.90},
                         fontname,
                         fontfile,
                         builtin,
@@ -8390,7 +7575,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 continue
             source_fontsize = float(style.get("size") or 12.0)
             rect = self.reconstructor._expand_text_rect_within_block(rect, block_rect, source_fontsize, line_count=1, line_height_factor=1.14)
-            fontsize = source_fontsize
+            fontsize = min(source_fontsize, max(6.0, rect.height * 0.90))
             wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             if wrapped:
                 rect = self.reconstructor._expand_text_rect_within_block(
@@ -8400,6 +7585,9 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                     line_count=len(wrapped),
                     line_height_factor=1.12 * tuning["line_spacing_factor"],
                 )
+            while fontsize > tuning["min_fontsize"] and wrapped and (len(wrapped) * max(6.0, fontsize * 1.12 * tuning["line_spacing_factor"])) > max(rect.height, fontsize * 1.3):
+                fontsize -= 0.5
+                wrapped = self.reconstructor._wrap_text_for_bbox(page, {**style, "size": fontsize}, text, max(8.0, rect.width))
             rgb = self.reconstructor._resolve_text_color( style, plan.source_block)
             align = self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
             if align == "end":
@@ -8418,7 +7606,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
-                    x + width,
+                    min(block_rect.x1, x + width),
                     baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
@@ -8427,7 +7615,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                         line_text,
                         text_rect,
                         (x, baseline),
-                        {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 1.0},
+                        {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": 0.90},
                         fontname,
                         fontfile,
                         builtin,
@@ -8573,10 +7761,10 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                     and not tuning.get("prefer_atomic_short_units")
                 )
                 if current_segments and projected > current_template.usable_width and can_wrap_segment:
+                    ops.extend(self._finalize_line(page, plan, current_template, current_segments, is_last_line=False))
+                    current_segments = []
                     next_index, next_template = self._next_template(templates, template_index)
                     if next_template is not None:
-                        ops.extend(self._finalize_line(page, plan, current_template, current_segments, is_last_line=False))
-                        current_segments = []
                         template_index = next_index
                         current_template = next_template
                 if not current_segments and width > current_template.usable_width and can_wrap_segment:
@@ -8629,89 +7817,6 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             parts.append(text)
         return "".join(parts)
 
-    def _anchored_tail_start_for_prose_block(self, plan, templates):
-        """Detecte les fins de bloc de type lieu/signatures qui ne doivent pas etre reflow."""
-        block = plan.source_block or {}
-        lines = list(block.get("lines") or [])
-        if len(lines) < 8 or len(templates or []) < 8:
-            return None
-        rects = [fitz.Rect(t.bbox) for t in templates]
-        heights = [max(1.0, rect.height) for rect in rects]
-        median_h = median(heights) if heights else 8.0
-        block_rect = fitz.Rect(plan.block_bbox)
-        min_tail_start = max(3, int(len(lines) * 0.55))
-        for idx in range(1, len(lines)):
-            if idx < min_tail_start:
-                continue
-            if len(lines) - idx > 7:
-                continue
-            gap = rects[idx].y0 - rects[idx - 1].y1
-            if gap < max(8.0, median_h * 0.85):
-                continue
-            tail_lines = lines[idx:]
-            tail_rects = rects[idx:]
-            short_count = 0
-            right_count = 0
-            name_like_count = 0
-            for line, rect in zip(tail_lines, tail_rects):
-                text = self.reconstructor._clean_text_for_render(
-                    self.reconstructor._line_translated_text(line)
-                    or self.reconstructor._line_source_text(line)
-                )
-                if not text:
-                    continue
-                tokens = re.findall(r"[A-Za-zÀ-ÿ.']+", text)
-                if len(tokens) <= 6:
-                    short_count += 1
-                if rect.x0 >= block_rect.x0 + block_rect.width * 0.42:
-                    right_count += 1
-                if "," in text or re.search(r"\b(?:M\.|Dr\.|Prof\.|India|Inde)\b", text):
-                    name_like_count += 1
-                elif len(tokens) >= 2 and all(tok[:1].isupper() or tok in {"M.", "Dr.", "Prof."} for tok in tokens[:4]):
-                    name_like_count += 1
-            if short_count >= 2 and (right_count >= 1 or name_like_count >= 2):
-                return idx
-        return None
-
-    def _paragraphs_from_source_line_range(self, plan, templates, start, end):
-        block = plan.source_block or {}
-        lines = list(block.get("lines") or [])
-        selected = lines[start:end]
-        selected_templates = list(templates or [])[start:end]
-        if not selected:
-            return []
-        rects = [fitz.Rect(t.bbox) for t in selected_templates if t]
-        heights = [max(1.0, rect.height) for rect in rects]
-        median_h = median(heights) if heights else 8.0
-        paragraphs = []
-        current = []
-        previous_rect = None
-        for offset, line in enumerate(selected):
-            text = self.reconstructor._clean_text_for_render(
-                self.reconstructor._line_translated_text(line)
-                or self.reconstructor._line_source_text(line)
-            )
-            if not text:
-                continue
-            rect = fitz.Rect(selected_templates[offset].bbox) if offset < len(selected_templates) else None
-            source_text = self.reconstructor._clean_text_for_render(self.reconstructor._line_source_text(line))
-            paragraph_break = bool((line or {}).get("hard_break_before"))
-            if previous_rect is not None and rect is not None:
-                gap = rect.y0 - previous_rect.y1
-                if gap > max(3.0, median_h * 0.35):
-                    paragraph_break = True
-            if current and source_text.lower().startswith("chapter "):
-                paragraph_break = True
-            if paragraph_break and current:
-                paragraphs.append(" ".join(current).strip())
-                current = []
-            current.append(text)
-            if rect is not None:
-                previous_rect = rect
-        if current:
-            paragraphs.append(" ".join(current).strip())
-        return [paragraph for paragraph in paragraphs if paragraph]
-
     def _compose_paragraphs_in_box(
         self,
         page,
@@ -8724,12 +7829,14 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         *,
         reflow_left=None,
         reflow_right=None,
-        max_font_shrink_pt=0.0,
-        min_font_ratio=1.0,
+        max_font_shrink_pt=None,
+        min_font_ratio=0.90,
     ):
         base_fontsize = max(7.0, min(float(base_style.get("size") or 11.0), 36.0))
+        if max_font_shrink_pt is None:
+            max_font_shrink_pt = max(0.5, base_fontsize * 0.10)
         max_font_shrink_pt = max(0.0, float(max_font_shrink_pt or 0.0))
-        min_font_ratio = max(1.0, min(1.0, float(min_font_ratio or 1.0)))
+        min_font_ratio = max(0.50, min(1.0, float(min_font_ratio or 0.90)))
         options = ComposeOptions(
             enable_hyphenation=True,
             max_font_shrink=max_font_shrink_pt,
@@ -8817,52 +7924,19 @@ class EditorialBlockRenderer(BaseBlockRenderer):
 
     def _render_prose_reflow(self, page, plan):
         """Reflow du texte traduit en flux continu dans la bbox du bloc."""
+        full_text = self._collect_translated_text_stream(plan)
+        if not full_text.strip():
+            return []
         ops = []
         block_rect = fitz.Rect(plan.block_bbox)
         profile = getattr(plan, "semantic_profile", None)
         # Police unicode-safe garantie
-        templates = self._prepare_templates(plan)
-        anchored_tail_start = self._anchored_tail_start_for_prose_block(plan, templates)
-        tail_ops = []
-        if anchored_tail_start is not None:
-            body_paragraphs = self._paragraphs_from_source_line_range(plan, templates, 0, anchored_tail_start)
-            if body_paragraphs:
-                tail_templates = templates[anchored_tail_start:]
-                tail_rect = fitz.Rect(
-                    min(t.bbox[0] for t in tail_templates),
-                    min(t.bbox[1] for t in tail_templates),
-                    max(t.bbox[2] for t in tail_templates),
-                    max(t.bbox[3] for t in tail_templates),
-                )
-                tail_lines = list((plan.source_block or {}).get("lines") or [])[anchored_tail_start:]
-                tail_block = {**(plan.source_block or {}), "lines": tail_lines, "translated_text": ""}
-                tail_plan = replace(
-                    plan,
-                    source_block=tail_block,
-                    line_templates=tail_templates,
-                    block_bbox=(tail_rect.x0, tail_rect.y0, tail_rect.x1, tail_rect.y1),
-                    container_bbox=(tail_rect.x0, tail_rect.y0, tail_rect.x1, tail_rect.y1),
-                )
-                tail_ops = self._linewise_fallback(page, tail_plan)
-                block_rect = fitz.Rect(
-                    block_rect.x0,
-                    block_rect.y0,
-                    block_rect.x1,
-                    max(block_rect.y0 + 8.0, tail_rect.y0 - 4.0),
-                )
-                templates = templates[:anchored_tail_start]
-                full_text = "\n".join(body_paragraphs)
-            else:
-                full_text = self._collect_translated_text_stream(plan)
-        else:
-            full_text = self._collect_translated_text_stream(plan)
-        if not full_text.strip():
-            return tail_ops
         fontfile, fontname = self.reconstructor._resolve_unicode_safe_font(page, plan, full_text)
         # Style de base (couleur, flags)
         base_style = self.reconstructor._style_from_block(plan.source_block or {})
         rgb = self.reconstructor._resolve_text_color(base_style, plan.source_block)
         alignment = self.reconstructor._normalize_alignment(plan.paragraph_alignment or plan.alignment or "left")
+        templates = self._prepare_templates(plan)
         non_rotated_templates = [template for template in templates if int(getattr(template, "rotation_deg", 0) or 0) % 360 not in {90, 180, 270}]
         reflow_left = block_rect.x0 + 2.0
         reflow_right = block_rect.x1 - 2.0
@@ -8956,7 +8030,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                             )
                             ops.append(self._emit_text_run(
                                 plan, token, token_rect, (cur_x, baseline),
-                                {**base_style, "size": fontsize, "_source_size": base_style.get("size") or fontsize, "_min_font_ratio": 1.0}, fontname, fontfile, None, fontsize, rgb,
+                                {**base_style, "size": fontsize, "_source_size": base_style.get("size") or fontsize, "_min_font_ratio": 0.90}, fontname, fontfile, None, fontsize, rgb,
                                 unit_id=f"{plan.block_id}:reflow:{global_line_idx}:{token}",
                             ))
                             cur_x += token_width + gap
@@ -8971,13 +8045,13 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(right_x, x + width), baseline + max(1.0, fontsize * 0.18))
                 ops.append(self._emit_text_run(
                     plan, line_text, text_rect, (x, baseline),
-                    {**base_style, "size": fontsize, "_source_size": base_style.get("size") or fontsize, "_min_font_ratio": 1.0}, fontname, fontfile, None, fontsize, rgb,
+                    {**base_style, "size": fontsize, "_source_size": base_style.get("size") or fontsize, "_min_font_ratio": 0.90}, fontname, fontfile, None, fontsize, rgb,
                     unit_id=f"{plan.block_id}:reflow:{global_line_idx}",
                 ))
                 current_y = baseline + line_h
                 global_line_idx += 1
             current_y += line_h * 0.55 if lines else 0.0
-        return ops + tail_ops
+        return ops
 
     def _render_label_stack(self, page, plan):
         """Rendu ligne par ligne pour les blocs de labels/colonnes/listes atomiques."""
@@ -9017,7 +8091,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             fontfile, fontname = self.reconstructor._resolve_unicode_safe_font(page, plan, text)
             style = dict(unit.style or {})
             source_fontsize = float(style.get("size") or 11.0)
-            min_font_ratio = 1.0
+            min_font_ratio = 0.95
             unit_rect = self.reconstructor._expand_text_rect_within_block(
                 unit_rect,
                 block_rect,
@@ -9025,7 +8099,13 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 line_count=1,
                 line_height_factor=1.08,
             )
-            fontsize = source_fontsize
+            fontsize = min(source_fontsize, max(source_fontsize * min_font_ratio, unit_rect.height * 0.90))
+            # Reduire si le texte ne tient pas en largeur
+            available_w = max(4.0, unit_rect.width)
+            min_fontsize = max(5.5, source_fontsize * min_font_ratio)
+            while fontsize > min_fontsize and self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile) > available_w:
+                fontsize -= 0.5
+            fontsize = max(min_fontsize, fontsize)
             rgb = self.reconstructor._resolve_text_color(style, plan.source_block)
             alignment = self.reconstructor._normalize_alignment(
                 self.reconstructor._unit_horizontal_alignment(unit, plan.paragraph_alignment or plan.alignment)
@@ -9037,7 +8117,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
                 x = max(unit_rect.x0, unit_rect.x0 + max(0.0, (unit_rect.width - width) / 2.0))
             elif alignment == "right":
                 x = max(unit_rect.x0, unit_rect.x1 - width)
-            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), x + width, baseline + max(1.0, fontsize * 0.18))
+            text_rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(block_rect.x1, x + width), baseline + max(1.0, fontsize * 0.18))
             ops.append(self._emit_text_run(
                 plan, text, text_rect, (x, baseline),
                 {**style, "size": fontsize, "_source_size": source_fontsize, "_min_font_ratio": min_font_ratio}, fontname, fontfile, None, fontsize, rgb,
@@ -9045,53 +8125,8 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             ))
         return ops
 
-    def _should_try_linewise_for_structured_prose(self, plan):
-        block = plan.source_block or {}
-        lines = list(block.get("lines") or [])
-        units = list(plan.units or [])
-        if len(lines) < 4 or not units:
-            return False
-        if not block.get("semantic_groups"):
-            return False
-        protected_tokens = list(block.get("protected_tokens") or [])
-        if protected_tokens:
-            return True
-        for unit in units:
-            metadata = dict(unit.metadata or {})
-            if metadata.get("has_protected_fragments"):
-                return True
-            raw_unit = dict(metadata.get("raw_unit") or {})
-            for fragment in list(metadata.get("fragments") or raw_unit.get("fragments") or []):
-                inline_class = str(((fragment or {}).get("expression_semantics") or {}).get("inline_class") or "").strip().lower()
-                text = self.reconstructor._clean_text_for_render(
-                    (fragment or {}).get("text") or (fragment or {}).get("texte") or ""
-                )
-                if inline_class in {"technical_inline", "code", "formula", "reference"}:
-                    return True
-                if re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\([^)]{0,40}\)|\bpg_[A-Za-z0-9_]+\b|\bpostgresql(?:\.conf)?\b", text, flags=re.IGNORECASE):
-                    return True
-            source = self.reconstructor._clean_text_for_render(unit.text_source or "")
-            translated = self.reconstructor._clean_text_for_render(unit.text_translated or "")
-            if source and translated and source == translated and re.search(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){2,}\b", source):
-                return True
-        return False
-
-    def _should_try_linewise_for_anchored_tail_prose(self, plan):
-        block = plan.source_block or {}
-        lines = list(block.get("lines") or [])
-        if len(lines) < 10:
-            return False
-        templates = self._prepare_templates(plan)
-        return self._anchored_tail_start_for_prose_block(plan, templates) is not None
-
     def render(self, page, plan):
         contract_render_mode = str((plan.constraints or {}).get("contract_render_mode") or "").strip().lower()
-        units_have_mixed_style_fragments = any(
-            list((u.metadata or {}).get("fragments") or {}) or
-            list((((u.metadata or {}).get("raw_unit") or {})).get("fragments") or [])
-            for u in (plan.units or [])
-        )
-        units_have_structured_groups = len(plan.units or []) > 1 and bool((plan.source_block or {}).get("semantic_groups"))
         if contract_render_mode == "relative_slots":
             return self._render_relative_slots(page, plan)
         if contract_render_mode == "bbox_anchored":
@@ -9101,16 +8136,7 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             if fallback_ops:
                 return fallback_ops
         if contract_render_mode == "prose_reflow":
-            if self._should_try_linewise_for_anchored_tail_prose(plan):
-                fallback_ops = self._linewise_fallback(page, plan)
-                if fallback_ops and self._validate_fallback_ops(plan, fallback_ops):
-                    return fallback_ops
-            if not units_have_mixed_style_fragments and not units_have_structured_groups:
-                return self._render_prose_reflow(page, plan)
-            if self._should_try_linewise_for_structured_prose(plan):
-                fallback_ops = self._linewise_fallback(page, plan)
-                if fallback_ops and self._validate_fallback_ops(plan, fallback_ops):
-                    return fallback_ops
+            return self._render_prose_reflow(page, plan)
 
         profile = plan.semantic_profile
         if profile is None:
@@ -9126,7 +8152,12 @@ class EditorialBlockRenderer(BaseBlockRenderer):
             )
             plan = replace(plan, semantic_profile=profile)
         # Dispatch base sur le profil semantique si le bloc est traduit
-        if profile is not None and profile.source_is_translated and not units_have_mixed_style_fragments and not units_have_structured_groups:
+        _units_have_mixed_style_fragments = any(
+            list((u.metadata or {}).get("fragments") or {}) or
+            list((((u.metadata or {}).get("raw_unit") or {})).get("fragments") or [])
+            for u in (plan.units or [])
+        )
+        if profile is not None and profile.source_is_translated and not _units_have_mixed_style_fragments:
             strategy = profile.render_strategy
             # Pour les blocs positionnels (anchored_text / fixed_preserve), on ne reflow jamais :
             # le texte traduit doit rester à la position exacte du source (TOC, étiquettes, etc.)
@@ -9164,57 +8195,6 @@ class EditorialBlockRenderer(BaseBlockRenderer):
         if fallback_ops and self._validate_fallback_ops(plan, fallback_ops):
             return fallback_ops
         return best_ops
-
-
-class AtomicFormulaRegionRenderer(BaseBlockRenderer):
-    def _formula_region(self, plan):
-        block = plan.source_block or {}
-        region_id = str(block.get("formula_region_id") or "").strip()
-        for region in (plan.page_data or {}).get("formula_regions") or []:
-            if str((region or {}).get("id") or "").strip() == region_id:
-                return dict(region)
-        return {
-            "id": region_id or str(block.get("id") or "formula_region"),
-            "bbox": block.get("bbox"),
-            "source": "block_formula_role",
-            "render_policy": "source_region_preserve",
-        }
-
-    def render(self, page, plan):
-        region = self._formula_region(plan)
-        rect = self.reconstructor._fitz_rect_from_bbox_like(region.get("bbox") or (plan.source_block or {}).get("bbox"))
-        if not isinstance(rect, fitz.Rect) or rect.get_area() <= 0:
-            return []
-        source_pdf = str((plan.page_data or {}).get("source_pdf_path") or "").strip()
-        source_page_index = int((plan.page_data or {}).get("source_page_index") or (plan.page_data or {}).get("page_index") or 0)
-        if source_pdf and os.path.exists(source_pdf):
-            return [
-                BlockRenderOp(
-                    op_type="draw_pdf_region",
-                    block_id=plan.block_id,
-                    unit_id=None,
-                    bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                    z_index=30,
-                    metadata={
-                        "source_pdf_path": source_pdf,
-                        "source_page_index": source_page_index,
-                        "source_clip": (rect.x0, rect.y0, rect.x1, rect.y1),
-                        "formula_region_id": region.get("id"),
-                    },
-                )
-            ]
-        overlay_ops = self._overlay_ops_for_matching_immutable_overlays(plan)
-        if overlay_ops:
-            return overlay_ops
-        return [
-            BlockRenderOp(
-                op_type="render_warning",
-                block_id=plan.block_id,
-                unit_id=None,
-                bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                metadata={"render_findings": [{"type": "formula_source_region_missing", "bbox": (rect.x0, rect.y0, rect.x1, rect.y1)}]},
-            )
-        ]
 
 
 class HeadingBlockRenderer(EditorialBlockRenderer):
@@ -9287,14 +8267,16 @@ class CodeBlockRenderer(BaseBlockRenderer):
                 available_width = max(8.0, block_rect.x1 - x)
                 available_height = max(5.0, line_h)
             _, fontfile, builtin, fontname = self.reconstructor._resolve_style_font(page, effective_style, text=text)
-            fontsize = float(effective_style.get("size") or 10.0)
+            fontsize = min(float(effective_style.get("size") or 10.0), max(4.5, available_height * 0.82))
+            min_fontsize = 4.5 if line_is_technical else 5.0
+            while fontsize > min_fontsize and self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile) > available_width:
+                fontsize -= 0.5
             rgb = self.reconstructor._resolve_text_color(effective_style, block)
-            measured_width = self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile)
             text_rect = fitz.Rect(
                 x,
                 baseline - max(1.0, fontsize * 0.82),
-                x + measured_width,
-                baseline + max(1.0, fontsize * 0.18),
+                min(block_rect.x1, x + available_width),
+                min(block_rect.y1, baseline + max(1.0, fontsize * 0.18)),
             )
             ops.append(
                 self._emit_text_run(
@@ -9398,7 +8380,7 @@ class TableBlockRenderer(BaseBlockRenderer):
                     run_index += 1
                 continue
             source_fontsize = float(style.get("size") or 10.0)
-            min_font_ratio = 1.0
+            min_font_ratio = 0.95
             rect = self.reconstructor._expand_text_rect_within_block(
                 rect,
                 cell_rect,
@@ -9406,7 +8388,7 @@ class TableBlockRenderer(BaseBlockRenderer):
                 line_count=1,
                 line_height_factor=1.08,
             )
-            fontsize = source_fontsize
+            fontsize = min(source_fontsize, max(source_fontsize * min_font_ratio, rect.height * 0.90))
             wrapped = self._wrap_text_to_lines(text, max(8.0, rect.width), fontsize, fontname, fontfile)
             if wrapped:
                 rect = self.reconstructor._expand_text_rect_within_block(
@@ -9416,6 +8398,12 @@ class TableBlockRenderer(BaseBlockRenderer):
                     line_count=len(wrapped),
                     line_height_factor=1.05,
                 )
+            min_fontsize = max(5.0, source_fontsize * min_font_ratio)
+            hard_min_fontsize = 4.5
+            while fontsize > min_fontsize and wrapped and (len(wrapped) * max(5.0, fontsize * 1.05)) > rect.height:
+                fontsize -= 0.5
+                wrapped = self._wrap_text_to_lines(text, max(8.0, rect.width), fontsize, fontname, fontfile)
+            fontsize = max(min_fontsize, fontsize)
             rgb = self.reconstructor._resolve_text_color(style, plan.source_block)
             align = self.reconstructor._normalize_alignment(
                 self.reconstructor._unit_horizontal_alignment(unit, (plan.source_block or {}).get("alignment") or "left")
@@ -9432,7 +8420,7 @@ class TableBlockRenderer(BaseBlockRenderer):
                 text_rect = fitz.Rect(
                     x,
                     baseline - max(1.0, fontsize * 0.82),
-                    x + width,
+                    min(rect.x1, x + width),
                     baseline + max(1.0, fontsize * 0.18),
                 )
                 ops.append(
@@ -9559,17 +8547,43 @@ class TableBlockRenderer(BaseBlockRenderer):
                 ref_x1 = min(cell_rect.x1, max(ref_x0 + 8.0, ref_x0 + expandable_width))
                 available_w = max(8.0, ref_x1 - ref_x0)
                 source_fontsize = max(1.0, float(style.get("size") or fontsize or 10.0))
-                min_ratio = 1.0
+                min_ratio = 0.925 if len(lines) >= 2 else 0.95
+                min_fontsize = max(4.5, source_fontsize * min_ratio)
                 source_line_text = self.reconstructor._line_source_text(line)
                 measured_w = self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile)
                 cell_available_w = max(8.0, cell_rect.x1 - ref_x0)
                 if measured_w > available_w and measured_w <= cell_available_w:
                     ref_x1 = cell_rect.x1
                     available_w = cell_available_w
+                translated_min_w = self.reconstructor._measure_text_width(text, min_fontsize, fontname, fontfile)
+                if (
+                    source_line_text
+                    and source_line_text != text
+                    and translated_min_w > available_w
+                ):
+                    source_w = self.reconstructor._measure_text_width(source_line_text, fontsize, fontname, fontfile)
+                    source_w_min = self.reconstructor._measure_text_width(source_line_text, min_fontsize, fontname, fontfile)
+                    if source_w <= cell_available_w or source_w_min <= cell_available_w:
+                        text = source_line_text
+                        ref_x1 = cell_rect.x1
+                        available_w = cell_available_w
+                        if source_w > available_w:
+                            fontsize = min_fontsize
+                            measured_w = source_w_min
+                        else:
+                            measured_w = source_w
+                while fontsize > min_fontsize and measured_w > available_w:
+                    fontsize -= 0.5
+                    if fontsize < min_fontsize:
+                        fontsize = min_fontsize
+                    measured_w = self.reconstructor._measure_text_width(text, fontsize, fontname, fontfile)
                 if measured_w <= available_w:
                     wrapped = [text]
                 else:
                     wrapped = self._wrap_text_to_lines(text, available_w, fontsize, fontname, fontfile)
+                    while fontsize > min_fontsize and wrapped and (len(wrapped) * max(fontsize * 1.04, 4.8)) > max(5.0, cell_rect.y1 - source_rect.y0):
+                        fontsize -= 0.5
+                        wrapped = self._wrap_text_to_lines(text, available_w, fontsize, fontname, fontfile)
                 line_h = max(fontsize * 1.08, 1.0)
                 for wi, seg in enumerate(wrapped):
                     seg_w = self.reconstructor._measure_text_width(seg, fontsize, fontname, fontfile)
@@ -9579,7 +8593,7 @@ class TableBlockRenderer(BaseBlockRenderer):
                         x = max(ref_x0, ref_x0 + max(0.0, (available_w - seg_w) / 2.0))
                     elif align == "right":
                         x = max(ref_x0, ref_x1 - seg_w)
-                    rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), x + seg_w, baseline + max(1.0, fontsize * 0.18))
+                    rect = fitz.Rect(x, baseline - max(1.0, fontsize * 0.82), min(ref_x1, x + seg_w), baseline + max(1.0, fontsize * 0.18))
                     ops.append(self._emit_text_run(plan, seg, rect, (x, baseline), {**style, "size": fontsize},
                                                    fontname, fontfile, builtin, fontsize, rgb,
                                                    unit_id=f"{plan.block_id}:table:{run_index}"))

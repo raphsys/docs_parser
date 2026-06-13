@@ -90,7 +90,7 @@ def _translation_plan(unit_map: dict[str, dict], semantic_system: dict, page_int
         if not source_text:
             errors.append(f"translation_segment_empty_text:{entry.get('translation_segment_id') or idx}")
             continue
-        render_target = entry.get("render_target") or _render_target(sample, source_ids, idx)
+        render_target = entry.get("render_target") or _render_target_for_segment(entry, unit_map, source_ids, idx, role)
         protected_tokens = [
             token for token in list(dict.fromkeys((entry.get("protected_tokens") or entry.get("protected") or []) + (policy.get("protected_tokens") or [])))
             if token and token in source_text
@@ -262,14 +262,21 @@ def _reconstruction_plan(units: list[dict], translation_plan: list[dict], preser
     consumed: set[str] = set()
     for idx, item in enumerate(translation_plan, start=1):
         consumed.update(item.get("source_unit_ids") or [])
+        rt = item.get("render_target") or {}
         output.append({
-            "reconstruction_unit_id": item["render_target"]["reconstruction_unit_id"],
+            "reconstruction_unit_id": rt.get("reconstruction_unit_id"),
+            "translation_unit_id": item.get("translation_unit_id"),
+            "unit_id": item.get("unit_id"),
             "source_unit_ids": item.get("source_unit_ids") or [],
             "role": item.get("role"),
             "object_type": item.get("object_type"),
             "semantic_kind": item.get("semantic_kind"),
-            "bbox": (item.get("render_target") or {}).get("bbox"),
-            "style_source_unit_id": (item.get("render_target") or {}).get("style_source_unit_id"),
+            "bbox": rt.get("bbox"),
+            "layout_bbox": rt.get("layout_bbox") or rt.get("bbox"),
+            "patch_bbox": rt.get("patch_bbox"),
+            "coverage_bbox": rt.get("coverage_bbox"),
+            "anchor_bbox": rt.get("anchor_bbox"),
+            "style_source_unit_id": rt.get("style_source_unit_id"),
             "render_contract": {"mode": "translated_text", "strategy": item.get("translation_strategy")},
             "text_source": "translation_plan",
             "consume_source_unit_ids": item.get("source_unit_ids") or [],
@@ -319,7 +326,47 @@ def _exclusion_plan(units: list[dict], logical_structures: dict | None = None) -
     return output
 
 
-def _render_target(unit: dict, source_ids: list[str], idx: int) -> dict:
+_FLOW_ROLES = {"body_paragraph", "paragraph", "body", "list_item", "author_bio", "index_subentry"}
+
+
+def _bbox_union(boxes) -> list | None:
+    boxes = [b for b in boxes if isinstance(b, (list, tuple)) and len(b) == 4]
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _best_style_source_id(unit_map: dict, source_ids: list[str]) -> str | None:
+    for sid in source_ids:
+        u = unit_map.get(sid)
+        style = ((u or {}).get("visual") or {}).get("style") or {}
+        if any(v is not None for k, v in style.items() if k not in {"flags", "font_size_unit", "font_size_px"}):
+            return sid
+    return source_ids[0] if source_ids else None
+
+
+def _render_target_for_segment(entry: dict, unit_map: dict, source_ids: list[str], idx: int, role: str | None) -> dict:
+    """Segment-aware render target: layout = logical block (never first line)."""
+    source_boxes = [bbox_of(unit_map[sid]) for sid in source_ids if sid in unit_map]
+    coverage = _bbox_union(source_boxes)
+    logical = entry.get("bbox") or coverage
+    anchor = bbox_of(unit_map[source_ids[0]]) if source_ids and source_ids[0] in unit_map else logical
+    layout = logical  # flow text lays out in the full logical block
+    patch = coverage or logical
+    return {
+        "reconstruction_unit_id": f"ru_{idx:04d}",
+        "bbox": layout,
+        "layout_bbox": layout,
+        "patch_bbox": patch,
+        "coverage_bbox": coverage,
+        "anchor_bbox": anchor,
+        "style_source_unit_id": _best_style_source_id(unit_map, source_ids),
+        "consume_source_unit_ids": source_ids,
+    }
+
+
+def _render_target(unit: dict, source_ids: list[str], idx: int) -> dict:  # legacy/back-compat
     return {
         "reconstruction_unit_id": f"ru_{idx:04d}",
         "bbox": bbox_of(unit),

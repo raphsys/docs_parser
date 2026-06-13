@@ -149,18 +149,21 @@ def compile_page_render_plan(translated_input_data: dict) -> PageRenderPlan:
                              "translation_unit_id": item.get("translation_unit_id")})
             continue
         rt = item.get("render_target") or {}
-        bbox = rt.get("bbox") or item.get("bbox")
+        bbox = item.get("layout_bbox") or rt.get("layout_bbox") or rt.get("bbox") or item.get("bbox")
+        anchor_line = item.get("anchor_bbox") or rt.get("anchor_bbox")
         budget = item.get("layout_budget") or {}
         plan_item = _plan_for(item)
         # Role: most specific available (reconstruction_plan > translation unit).
         role = (plan_item or {}).get("role") or item.get("role")
-        coverage = _coverage_bbox(sids, unit_index, bbox)
-        style = resolve_style(item, plan_item, unit_index, style_system, role=role, line_bbox=bbox)
+        coverage = item.get("coverage_bbox") or rt.get("coverage_bbox") or _coverage_bbox(sids, unit_index, bbox)
+        # Font size uses the single-line anchor height (not the full block).
+        style = resolve_style(item, plan_item, unit_index, style_system, role=role, line_bbox=anchor_line or bbox)
         if style.get("confidence", 0) <= 0.2:
             findings.append({"type": "unresolved_style", "translation_unit_id": item.get("translation_unit_id"),
                              "severity": "review"})
         # ABSOLUTE PRIORITY fix: flow text must lay out in the full block, not one line.
         layout_bbox, patch_bbox, _anchor, lb_findings = resolve_layout(role, bbox, coverage)
+        patch_bbox = item.get("patch_bbox") or rt.get("patch_bbox") or patch_bbox
         for f in lb_findings:
             findings.append({**f, "translation_unit_id": item.get("translation_unit_id")})
         translated_text.append(TranslatedTextUnit(

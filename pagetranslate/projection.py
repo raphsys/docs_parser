@@ -148,12 +148,19 @@ def _style_from_source_ids(source_unit_ids, unit_map: dict[str, dict]) -> tuple[
 
 def _semantic_reconstruction_unit(item: dict, unit_map: dict[str, dict] | None = None) -> dict:
     render_target = item.get("render_target") or {}
-    bbox = render_target.get("bbox") or item.get("bbox")
     context = item.get("context") or {}
+    # Separate bboxes: never let a (possibly first-line) render_target.bbox shrink the layout.
+    logical_bbox = item.get("bbox")
+    layout_bbox = render_target.get("layout_bbox") or logical_bbox or render_target.get("bbox")
+    patch_bbox = render_target.get("patch_bbox") or render_target.get("coverage_bbox") or logical_bbox or render_target.get("bbox")
+    coverage_bbox = render_target.get("coverage_bbox") or logical_bbox or render_target.get("bbox")
+    anchor_bbox = render_target.get("anchor_bbox") or layout_bbox
+    bbox = layout_bbox
     style, style_source_unit_id = _style_from_source_ids(item.get("source_unit_ids") or [], unit_map or {})
     return {
         "style": style,
         "style_source_unit_id": render_target.get("style_source_unit_id") or style_source_unit_id,
+        "reconstruction_unit_id": render_target.get("reconstruction_unit_id"),
         "unit_id": item.get("unit_id"),
         "translation_unit_id": item.get("translation_unit_id"),
         "logical_unit_id": item.get("logical_unit_id"),
@@ -167,6 +174,10 @@ def _semantic_reconstruction_unit(item: dict, unit_map: dict[str, dict] | None =
         "text": item.get("source_text"),
         "translated_text": item.get("translated_text"),
         "bbox": bbox,
+        "layout_bbox": layout_bbox,
+        "patch_bbox": patch_bbox,
+        "coverage_bbox": coverage_bbox,
+        "anchor_bbox": anchor_bbox,
         "source_unit_ids": item.get("source_unit_ids") or [],
         "consume_source_units": True,
         "source_units_consumed": True,

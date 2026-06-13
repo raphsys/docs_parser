@@ -7,6 +7,18 @@ import re
 from .text_utils import normalize_spaces, word_count
 from .terminology import check_terminology_consistency
 
+try:
+    from pageprint.text_postprocessors import ends_with_break_hyphen, has_repeated_ngram, looks_like_truncated_fragment
+except Exception:  # pragma: no cover - pageprint always available in this repo
+    def ends_with_break_hyphen(_text):
+        return None
+
+    def has_repeated_ngram(_text, **_kwargs):
+        return False
+
+    def looks_like_truncated_fragment(_text):
+        return False
+
 
 NUMBER_RE = re.compile(r"(?<![\w./-])\d+(?:[.,]\d+)?(?![\w./-])")
 UNIT_RE = re.compile(r"\b(?:%|kg|g|mg|µg|ug|cm|mm|m|m²|m³|km|km/h|mol/L|mg/dL|mmHg|bpm|UI|MB|GB|GHz|Hz|ms|s|h|°C|°F|K|px|pt|FCFA|XOF|USD|EUR)\b", re.IGNORECASE)
@@ -41,6 +53,9 @@ def unit_quality(source_text: str, translated_text: str, item: dict, profile: di
     protected_mismatch = bool(missing_protections or placeholders_left)
     unchanged_problem = _unchanged_problem(unchanged, item, profile)
     terminology = check_terminology_consistency(source_text, translated_text, profile)
+    repeated_output = has_repeated_ngram(translated_text)
+    source_fragment = looks_like_truncated_fragment(source_text)
+    dehyphenation_needed = bool(ends_with_break_hyphen(source_text))
     needs_review = any([
         empty,
         unchanged_problem,
@@ -50,7 +65,32 @@ def unit_quality(source_text: str, translated_text: str, item: dict, profile: di
         source_leak,
         terminology["terminology_issue"],
         overflow_risk == "high",
+        repeated_output,
+        source_fragment,
     ])
+    qa_reasons = []
+    if empty:
+        qa_reasons.append("empty_translation")
+    if dehyphenation_needed:
+        qa_reasons.append("dehyphenation_needed")
+    if source_fragment:
+        qa_reasons.append("source_fragment")
+    if repeated_output:
+        qa_reasons.append("repeated_output")
+    if number_mismatch:
+        qa_reasons.append("number_mismatch")
+    if unit_mismatch:
+        qa_reasons.append("unit_mismatch")
+    if protected_mismatch:
+        qa_reasons.append("protected_token_mismatch")
+    if source_leak:
+        qa_reasons.append("source_leak")
+    if unchanged_problem:
+        qa_reasons.append("unchanged_suspect")
+    if terminology["terminology_issue"]:
+        qa_reasons.append("terminology_issue")
+    if overflow_risk == "high":
+        qa_reasons.append("overflow_risk")
     return {
         "source_word_count": source_words,
         "translated_word_count": translated_words,
@@ -69,6 +109,10 @@ def unit_quality(source_text: str, translated_text: str, item: dict, profile: di
         "source_language_leak": source_leak,
         "terminology": terminology,
         "wysiwyg_overflow_risk": overflow_risk,
+        "repeated_output": repeated_output,
+        "source_fragment": source_fragment,
+        "dehyphenation_needed": dehyphenation_needed,
+        "qa_reasons": qa_reasons,
         "needs_review": needs_review,
         "checks": {
             "numbers": {"source": source_numbers, "translated": translated_numbers},

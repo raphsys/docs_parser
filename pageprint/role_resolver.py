@@ -14,8 +14,8 @@ PATH_RE = re.compile(r"(?:[A-Za-z]:\\|/[\w.-]+/|\.{1,2}/)[^\s]+")
 URL_RE = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 COMMAND_RE = re.compile(r"^(?:copy|dir|del|findstr|mkdir|rmdir|cd|ls|cat|grep|sudo|docker|npm|pip|python|git)\b", re.IGNORECASE)
-PUBLISHER_RE = re.compile(r"\b(?:ebook|publisher|manning|copyright|©|all rights reserved)\b", re.IGNORECASE)
-WATERMARK_RE = re.compile(r"\b(?:watermark|draft|sample|preview|confidential)\b", re.IGNORECASE)
+# Shared publisher/watermark patterns (single source of truth).
+from .structure_builders.publisher_mark_builder import PUBLISHER_RE, WATERMARK_RE
 
 
 ROLE_TO_OBJECT = {
@@ -109,6 +109,32 @@ def resolve_roles(
         "role_counts": role_counts,
         "unresolved_unit_ids": unresolved,
     }
+
+
+def infer_page_role(role_counts: dict | None, logical_structures: dict | None = None, *, current: str | None = None) -> str | None:
+    """Promote a generic page_role to index/toc/table_page from dominant content.
+
+    Uses logical structures first (reliable), then resolved role counts.
+    Only overrides a generic page_role (None/unknown/body).
+    """
+    current_l = str(current or "").lower()
+    if current_l not in {"", "none", "unknown", "body", "body_text", "body_text_two_column"}:
+        return current
+    rc = role_counts or {}
+    ls = logical_structures or {}
+    index_n = max(len(ls.get("index_entries") or []), rc.get("index_entry", 0) + rc.get("index_head_term", 0))
+    toc_n = max(len(ls.get("toc_entries") or []), rc.get("toc_entry", 0) + rc.get("toc_entry_title", 0))
+    table_cells = sum(len(t.get("cells") or []) for t in ls.get("tables") or [])
+    table_cells = max(table_cells, rc.get("table_body_cell", 0) + rc.get("table_header_cell", 0))
+    named = index_n + toc_n + table_cells + rc.get("body_paragraph", 0) + rc.get("list_item", 0)
+    named = named or 1
+    if index_n >= 10 and index_n / named > 0.4:
+        return "index"
+    if toc_n >= 10 and toc_n / named > 0.4:
+        return "toc"
+    if table_cells >= 10 and table_cells / named > 0.5:
+        return "table_page"
+    return current
 
 
 def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: dict) -> tuple[str, str, float]:

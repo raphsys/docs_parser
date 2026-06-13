@@ -39,7 +39,7 @@ from .policy_compiler import compile_policies
 from .provenance import build_provenance, build_replay
 from .quality_assessor import assess
 from .region_index import attach_region_memberships, build_regions
-from .role_resolver import resolve_roles
+from .role_resolver import infer_page_role, resolve_roles
 from .schema import PAGEPRINT_SCHEMA_VERSION, empty_input_data
 from .semantic_builder import build_semantic_system
 from .preservation_compiler import compile_preservation
@@ -250,6 +250,18 @@ class PagePrintBuilder:
             units,
             page_intelligence=input_data["page_intelligence"],
         )
+
+        # --- page_role promotion (index/toc/table_page) from dominant content ---
+        promoted_role = infer_page_role(
+            (input_data.get("role_resolution") or {}).get("role_counts"),
+            input_data["logical_structures"],
+            current=input_data["page_intelligence"].get("page_role"),
+        )
+        if promoted_role and promoted_role != input_data["page_intelligence"].get("page_role"):
+            input_data["page_intelligence"]["page_role"] = promoted_role
+            input_data["page_intelligence"]["page_role_source"] = "inferred_from_content"
+            if isinstance(input_data.get("page"), dict):
+                input_data["page"]["page_role"] = promoted_role
 
         # --- style_system / semantic_system ---
         input_data["style_system"] = {

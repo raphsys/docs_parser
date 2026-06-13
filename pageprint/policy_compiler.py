@@ -81,6 +81,10 @@ def compile_unit_policy(unit: dict, *, decision_context: dict) -> dict:
         })
         return compiled
 
+    role = str(understanding.get("role") or "").lower()
+    if role in {"publisher_mark", "watermark"}:
+        return _with_source({**existing, **_artifact_policy("exclude_as_artifact")}, f"role:{role}_artifact", unit)
+
     if preservation_mode == "exclude_as_artifact":
         return _with_source({**existing, **_artifact_policy(preservation_mode)}, "preservation:exclude_as_artifact", unit)
     if preservation_mode in {"preserve_text_exactly", "preserve_as_visual_overlay"}:

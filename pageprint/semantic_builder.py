@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 
 from .structure_builders.common import bbox_of, eligible_text_units, role_of, text_of
+from .structure_builders.publisher_mark_builder import PUBLISHER_RE, WATERMARK_RE
+from .text_postprocessors import merge_hyphenated_segments, repair_hyphenation
 
 
 TRANSLATABLE_ROLES = {
@@ -64,6 +66,7 @@ def build_semantic_system(
                 "protected_tokens": phrase.get("protected") or [],
                 "bbox": phrase.get("bbox"),
             })
+    translation_segments = merge_hyphenated_segments(translation_segments)
     return {
         "schema_version": "pageprint.semantic_system.v2",
         "semantic_phrases": semantic_phrases,
@@ -94,9 +97,13 @@ def _build_translation_segments_from_logical_structures(logical_structures: dict
 
     def add_segment(**kwargs) -> None:
         nonlocal counter
-        source_text = str(kwargs.get("source_text") or "").strip()
+        raw_text = str(kwargs.get("source_text") or "").strip()
+        source_text = repair_hyphenation(raw_text)
         source_unit_ids = [sid for sid in kwargs.get("source_unit_ids") or [] if sid]
         if not source_text or not source_unit_ids:
+            return
+        # Never send publisher/scan artefacts to the engine.
+        if PUBLISHER_RE.search(source_text) or WATERMARK_RE.search(source_text):
             return
         protected = list(dict.fromkeys([
             token for token in [
@@ -110,6 +117,7 @@ def _build_translation_segments_from_logical_structures(logical_structures: dict
             "logical_unit_id": kwargs.get("logical_unit_id"),
             "source_unit_ids": source_unit_ids,
             "source_text": source_text,
+            "source_text_raw": raw_text,
             "text": source_text,
             "role": kwargs.get("role"),
             "object_type": kwargs.get("object_type") or "natural_text",
@@ -239,7 +247,7 @@ def _build_translation_segments_from_logical_structures(logical_structures: dict
             bbox=entry.get("bbox"),
         )
 
-    return segments
+    return merge_hyphenated_segments(segments)
 
 
 def _segment_source(logical_structures: dict, segments: list[dict]) -> str:
@@ -302,6 +310,7 @@ def _build_semantic_phrases(units: list[dict]) -> list[dict]:
         text = text_of(unit)
         if not text:
             continue
+        text = repair_hyphenation(text)
         output.append({
             "unit_id": f"semantic_phrase_{idx:04d}",
             "semantic_level": "semantic_phrase",

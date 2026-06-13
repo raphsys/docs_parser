@@ -23,7 +23,7 @@ def project_translations(translated_input: dict, translated_units: list[dict]) -
         else:
             projected_ids = _project_to_source_units(unit_map, target_ids, item)
             _project_to_semantic_system(translated_input, item)
-            reconstruction_unit = _semantic_reconstruction_unit(item)
+            reconstruction_unit = _semantic_reconstruction_unit(item, unit_map)
 
         projections.append({
             "unit_id": item.get("unit_id"),
@@ -134,11 +134,26 @@ def _aggregate_parent_translations(unit_map: dict[str, dict]) -> None:
             unit.setdefault("content", {})["translated_text"] = normalize_spaces(" ".join(translated_children))
 
 
-def _semantic_reconstruction_unit(item: dict) -> dict:
+def _style_from_source_ids(source_unit_ids, unit_map: dict[str, dict]) -> tuple[dict, str | None]:
+    """Dominant typographic style resolved from the consumed source units."""
+    for sid in source_unit_ids or []:
+        unit = (unit_map or {}).get(sid)
+        if not unit:
+            continue
+        style = _dominant_style(unit, unit_map)
+        if _style_has_real_values(style):
+            return style, sid
+    return {}, None
+
+
+def _semantic_reconstruction_unit(item: dict, unit_map: dict[str, dict] | None = None) -> dict:
     render_target = item.get("render_target") or {}
     bbox = render_target.get("bbox") or item.get("bbox")
     context = item.get("context") or {}
+    style, style_source_unit_id = _style_from_source_ids(item.get("source_unit_ids") or [], unit_map or {})
     return {
+        "style": style,
+        "style_source_unit_id": render_target.get("style_source_unit_id") or style_source_unit_id,
         "unit_id": item.get("unit_id"),
         "translation_unit_id": item.get("translation_unit_id"),
         "logical_unit_id": item.get("logical_unit_id"),
@@ -191,7 +206,7 @@ def _reconstruction_units(translated_input: dict, translated_units: list[dict]) 
         if not normalize_spaces(item.get("translated_text")):
             continue
         if item.get("level") in {"semantic_phrase", "semantic_group"}:
-            output.append(_semantic_reconstruction_unit(item))
+            output.append(_semantic_reconstruction_unit(item, unit_map))
             continue
         unit = unit_map.get(item.get("unit_id"))
         if not unit:

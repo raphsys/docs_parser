@@ -92,3 +92,4 @@ datasets/terminology_sources/
 *.h5
 *.tflite
 *.npz
+*.zip

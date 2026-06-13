@@ -40,6 +40,16 @@ LIVE_DIR = ROOT / "ocr_results" / "dashboard_live"
 
 CAT_TAG = {"texte": "🟩 texte", "texte_exclu": "🟥 exclu", "formule": "🟨 formule",
            "code": "🟧 code", "table": "🟦 table", "figure": "🟪 figure", "region": "⬜ région"}
+CAT_COLOR = {"texte": "#E8F5E9", "texte_exclu": "#FDECEA", "formule": "#FFF8E1",
+             "code": "#FFF0E6", "table": "#E7F0FB", "figure": "#F3E8FB", "region": "#F1F1F1"}
+_TAG_COLOR = {CAT_TAG[k]: CAT_COLOR[k] for k in CAT_TAG}
+
+
+def _style_view(view):
+    def color_row(row):
+        bg = _TAG_COLOR.get(row.get("cat"), "#FFFFFF")
+        return [f"background-color: {bg}"] * len(row)
+    return view.style.apply(color_row, axis=1)
 ROLE_OPTIONS = [
     "", "title", "section_heading", "subsection_heading", "body_paragraph", "list_item",
     "figure_caption", "table_caption", "table_header_cell", "table_body_cell",
@@ -280,35 +290,34 @@ def _containing_block(units, bbox, levels):
 
 
 def render_element_on_blank(input_data: dict, source_img, row) -> Image.Image:
-    """Show the parent block (real page crop) with the selected element highlighted."""
+    """Full-page canvas: the parent block at its real position + element highlighted.
+
+    The page-sized canvas keeps every element at its true scale (no zoom): the
+    block is pasted where it really sits, and the selected element is outlined.
+    """
     sx, sy = _geom_scale(input_data)
+    geom = (input_data.get("page") or {}).get("geometry") or {}
+    W = int(geom.get("render_width_px") or (source_img.width if source_img else 850))
+    H = int(geom.get("render_height_px") or (source_img.height if source_img else 1100))
+    canvas = Image.new("RGB", (W, H), (255, 255, 255))
     bbox = _parse_bbox(row.get("bbox"))
-    if not bbox or source_img is None:
-        blank = Image.new("RGB", (700, 120), (255, 255, 255))
-        d = ImageDraw.Draw(blank)
-        d.text((15, 50), "(position inconnue — pas de bbox ou d'image)", fill=(160, 0, 0))
-        return blank
-    # Block context: a table/region for zones & tables, else the enclosing text block.
-    if row.get("category") in {"table", "figure", "formule", "code", "region"}:
-        levels = {"table", "region", "block"}
-    else:
-        levels = {"block"}
-    block = _containing_block(input_data.get("units") or [], bbox, levels) or [
-        bbox[0] - 14, bbox[1] - 14, bbox[2] + 14, bbox[3] + 14
-    ]
-    crop = crop_region(source_img, block, sx, sy)
-    if crop is None:
-        crop = crop_region(source_img, bbox, sx, sy) or Image.new("RGB", (300, 80), (255, 255, 255))
-        return crop
-    # Highlight the element inside the block crop (coords relative to the block).
-    draw = ImageDraw.Draw(crop, "RGBA")
-    ex0 = (bbox[0] - block[0]) * sx - 2
-    ey0 = (bbox[1] - block[1]) * sy - 2
-    ex1 = (bbox[2] - block[0]) * sx + 2
-    ey1 = (bbox[3] - block[1]) * sy + 2
-    draw.rectangle([ex0, ey0, ex1, ey1], outline=(220, 20, 60), width=3)
-    draw.rectangle([ex0, ey0, ex1, ey1], fill=(255, 215, 0, 60))
-    return crop
+    if not bbox:
+        ImageDraw.Draw(canvas).text((20, 20), "(position inconnue — pas de bbox)", fill=(160, 0, 0))
+        return canvas
+    levels = {"table", "region", "block"} if row.get("category") in {"table", "figure", "formule", "code", "region"} else {"block"}
+    block = _containing_block(input_data.get("units") or [], bbox, levels) or bbox
+    # Paste the block content from the source page at its real position.
+    if source_img is not None:
+        crop = crop_region(source_img, block, sx, sy)
+        if crop is not None:
+            canvas.paste(crop, (int(max(0, block[0] * sx)), int(max(0, block[1] * sy))))
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    bx = [block[0] * sx, block[1] * sy, block[2] * sx, block[3] * sy]
+    draw.rectangle(bx, outline=(150, 150, 150), width=1)
+    ex = [bbox[0] * sx - 2, bbox[1] * sy - 2, bbox[2] * sx + 2, bbox[3] * sy + 2]
+    draw.rectangle(ex, fill=(255, 215, 0, 80))
+    draw.rectangle(ex, outline=(220, 20, 60), width=3)
+    return canvas
 
 
 def trans_map(df: pd.DataFrame) -> dict:
@@ -474,27 +483,58 @@ def main() -> None:
         view_df = view_df[view_df["needs_review"]]
 
     left, right = st.columns([5, 3], gap="medium")
-    with right:
-        st.caption("Page")
-        # Element selector for the "aperçu" tab.
-        opts = {int(r["ord"]): f"#{int(r['ord'])} · {CAT_TAG.get(r['category'], r['category'])} · {str(r['source_text'])[:34]}"
-                for _, r in view_df.iterrows()}
-        sel_ord = st.selectbox("Élément (pour l'aperçu)", list(opts), format_func=lambda o: opts[o]) if opts else None
+    view = to_view(view_df)
+    selected_rid = None
 
+    with left:
+        tab_table, tab_zones = st.tabs(["📋 Tableau des éléments", "🧩 Zones & Tables"])
+        with tab_table:
+            st.caption(f"{len(view_df)} ligne(s) — clique une ligne pour la sélectionner (aperçu + édition)")
+            event = st.dataframe(
+                _style_view(view.drop(columns=["id"])), width="stretch", hide_index=True, height=560,
+                on_select="rerun", selection_mode="single-row", key=f"tbl_{page_tag}",
+                column_config={
+                    "source": st.column_config.TextColumn("source (PAGEPRINT)", width="large"),
+                    "traduction": st.column_config.TextColumn("traduction (PAGETRANSLATE)", width="large"),
+                },
+            )
+            rows = event.selection.rows if event and event.selection else []
+            if rows:
+                selected_rid = int(view.iloc[rows[0]]["id"])
+            st.download_button("⬇️ CSV", view.to_csv(index=False).encode("utf-8"),
+                               file_name=f"{page_tag}.csv", mime="text/csv")
+            # Edit panel for the selected element.
+            if selected_rid is not None:
+                srow = df[df["id"] == selected_rid].iloc[0]
+                role_options = sorted(set(ROLE_OPTIONS) | {str(srow["role"] or "")})
+                with st.container(border=True):
+                    st.markdown(f"**Édition #{int(srow['ord'])}** · {CAT_TAG.get(srow['category'], srow['category'])}")
+                    e1, e2 = st.columns([1, 3])
+                    new_tr = e1.checkbox("traduisible", value=bool(srow["translatable"]), key=f"e_tr_{selected_rid}")
+                    new_role = e1.selectbox("rôle", role_options,
+                                            index=role_options.index(str(srow["role"] or "")), key=f"e_role_{selected_rid}")
+                    new_trad = e2.text_area("traduction", value=str(srow["translation"] or ""), key=f"e_trad_{selected_rid}", height=90)
+                    e2.caption(f"source: {str(srow['source_text'])[:160]}")
+                    if e1.button("💾 Enregistrer", type="primary", key=f"e_save_{selected_rid}"):
+                        update_element(db, selected_rid, new_tr, new_trad, new_role)
+                        st.success("enregistré.")
+                        st.rerun()
+        with tab_zones:
+            render_zones_and_tables(prow, df)
+
+    with right:
         tabs = st.tabs(["aperçu", "bboxes", "source", "fond"])
         with tabs[0]:
-            if sel_ord is None:
-                st.info("aucun élément")
+            if selected_rid is None:
+                st.info("Clique une ligne du tableau pour voir l'élément dans son bloc, à sa position réelle.")
             else:
-                row = df[df["ord"] == sel_ord].iloc[0]
+                row = df[df["id"] == selected_rid].iloc[0]
                 ip = prow["input_data_path"] if "input_data_path" in prow.index else None
                 data = load_input_data(ip) if ip and Path(str(ip)).is_file() else {}
                 simg = prow["source_image"]
                 src_img = Image.open(simg).convert("RGB") if simg and Path(simg).is_file() else None
-                preview = render_element_on_blank(data, src_img, row)
-                st.image(preview, width="stretch")
-                st.caption(f"#{sel_ord} · {row['category']} · rôle {row['role']} · "
-                           f"{'traduit' if str(row['translation']).strip() else 'préservé/non traduit'} — sur fond vierge à sa position")
+                st.image(render_element_on_blank(data, src_img, row), width="stretch")
+                st.caption(f"#{int(row['ord'])} · {row['category']} · bloc + élément surligné (taille réelle)")
         for tab, col, label in zip(tabs[1:], ["bboxes_image", "source_image", "background_image"], ["", "", "trame (texte masqué)"]):
             with tab:
                 p = prow[col]
@@ -505,43 +545,6 @@ def main() -> None:
                 else:
                     st.info("indisponible")
         st.caption("qa: 🔁 répétition · ✂️ fragment/césure · 🔢 nombre · 🔒 token protégé · 🅰️ non traduit · ∅ vide")
-
-    with left:
-        tab_table, tab_zones = st.tabs(["📋 Tableau des éléments", "🧩 Zones & Tables"])
-        with tab_table:
-            bar = st.columns([2, 1, 1])
-            bar[0].markdown(f"**{len(view_df)} ligne(s)**")
-            view = to_view(view_df)
-            role_options = sorted(set(ROLE_OPTIONS) | set(view["rôle"].dropna().astype(str)))
-            edited = st.data_editor(
-                view, width="stretch", hide_index=True, height=620,
-                disabled=["id", "#", "cat", "gran", "type", "source", "statut", "Δ", "qa", "✏️", "bbox"],
-                column_config={
-                    "id": None,
-                    "#": st.column_config.NumberColumn("#", width="small"),
-                    "cat": st.column_config.TextColumn("catégorie", width="small"),
-                    "gran": st.column_config.TextColumn("granularité", width="small"),
-                    "traduisible": st.column_config.CheckboxColumn("trad✓", width="small"),
-                    "rôle": st.column_config.SelectboxColumn("rôle", options=role_options, width="medium"),
-                    "type": st.column_config.TextColumn("type", width="small"),
-                    "source": st.column_config.TextColumn("source (PAGEPRINT)", width="large"),
-                    "traduction": st.column_config.TextColumn("traduction (PAGETRANSLATE)", width="large"),
-                    "statut": st.column_config.TextColumn("statut", width="small"),
-                    "Δ": st.column_config.NumberColumn("Δ", help="ratio longueur trad/source", width="small"),
-                    "qa": st.column_config.TextColumn("qa", width="small"),
-                    "✏️": st.column_config.CheckboxColumn("✏️", help="modifié manuellement", width="small"),
-                    "bbox": st.column_config.TextColumn("bbox", width="small"),
-                },
-                key=f"editor_{page_tag}",
-            )
-            if bar[1].button("💾 Enregistrer", type="primary"):
-                n = save_changes(db, df, from_view(edited, df))
-                st.success(f"{n} modification(s) enregistrée(s).")
-                st.rerun()
-            bar[2].download_button("⬇️ CSV", view.to_csv(index=False).encode("utf-8"),
-                                   file_name=f"{page_tag}.csv", mime="text/csv")
-        with tab_zones:
-            render_zones_and_tables(prow, df)
 
 
 if __name__ == "__main__":

@@ -13,51 +13,79 @@ semantic graph, visual attachment graph — fusionnés en nodes + edges.
 from __future__ import annotations
 
 
-# Niveaux structurels représentés dans le graphe. Les niveaux fins
-# (line/phrase/span) n'y figurent pas : leur containment est déjà porté
-# par parent_id/children_ids, leur appartenance aux régions par
-# region_memberships et leur flux par previous/next_unit_id — le graphe
-# ne duplique pas ce qui est dérivable des unités.
-GRAPH_LEVELS = {"region", "block", "table", "image", "drawing", "overlay"}
+# Le moteur expose le graphe complet, mais word/char ne sont pas la vue de
+# compréhension documentaire principale. Ils sont des tokens auxiliaires
+# d'audit, d'ancrage et d'alignement.
+GRAPH_LEVELS = {
+    "page", "region", "block", "line", "phrase", "span", "word", "char",
+    "image", "drawing", "table", "cell", "formula", "code", "overlay",
+}
+AUXILIARY_TOKEN_LEVELS = {"word", "char"}
 
 
 def build_graph(units: list[dict], regions: list[dict],
                 page_structure: dict | None = None, *,
                 page_node_id: str = "page") -> dict:
-    """Construit {"nodes": [], "edges": []} au niveau structurel.
+    """Construit {"nodes": [], "edges": []} au niveau documentaire complet.
 
-    Nœuds : page, régions et unités de niveau GRAPH_LEVELS.
-    Arêtes : containment/appartenance/flux au niveau bloc + toutes les
-    arêtes sémantiques (element_relations), qui elles ne sont pas
-    dérivables des unités.
+    Nœuds : régions indexées + toutes les unités canoniques.
+    Arêtes : containment hiérarchique, appartenance aux régions, flux de
+    lecture par niveau, matérialisation région→unité et relations
+    sémantiques amont.
     """
-    nodes = [{"id": page_node_id, "type": "page"}]
+    nodes: list[dict] = []
     edges: list[dict] = []
-    known_ids = {page_node_id}
+    known_ids: set[str] = set()
     legacy_to_unit: dict[str, str] = {}
+    region_to_materialized_unit: dict[str, str] = {}
 
     for region in regions:
-        nodes.append({"id": region["region_id"], "type": region["region_type"]})
-        known_ids.add(region["region_id"])
+        region_id = region["region_id"]
+        nodes.append({"id": region_id, "type": region["region_type"], "kind": "region_index"})
+        known_ids.add(region_id)
         edges.append({
             "source": page_node_id,
-            "target": region["region_id"],
+            "target": region_id,
             "relation": "contains",
         })
 
-    structural_units = [u for u in units if u["level"] in GRAPH_LEVELS]
+    graph_units = [u for u in units if u["level"] in GRAPH_LEVELS]
 
     for unit in units:
         legacy_id = unit.get("legacy_id")
         if legacy_id is not None:
             legacy_to_unit[str(legacy_id)] = unit["unit_id"]
+        parent_region_id = (unit.get("relations") or {}).get("parent_region_id")
+        if unit.get("level") in {"region", "table", "cell", "formula", "code"} and parent_region_id:
+            region_to_materialized_unit[str(parent_region_id)] = unit["unit_id"]
 
-    for unit in structural_units:
-        nodes.append({"id": unit["unit_id"], "type": unit["level"]})
+    for unit in graph_units:
+        nodes.append({
+            "id": unit["unit_id"],
+            "type": unit["level"],
+            "kind": "canonical_unit",
+            "view": "auxiliary_token" if unit["level"] in AUXILIARY_TOKEN_LEVELS else "document",
+            "role": (unit.get("understanding") or {}).get("role"),
+            "object_type": (unit.get("understanding") or {}).get("object_type"),
+        })
         known_ids.add(unit["unit_id"])
 
-    for unit in structural_units:
-        # Containment au niveau structurel.
+    if page_node_id not in known_ids:
+        nodes.insert(0, {"id": page_node_id, "type": "page", "kind": "canonical_unit"})
+        known_ids.add(page_node_id)
+
+    for region_id, unit_id in region_to_materialized_unit.items():
+        if region_id in known_ids and unit_id in known_ids:
+            edges.append({
+                "source": region_id,
+                "target": unit_id,
+                "relation": "materializes",
+            })
+
+    for unit in graph_units:
+        if unit["unit_id"] == page_node_id:
+            continue
+        # Containment hiérarchique complet.
         parent_id = unit.get("parent_id")
         edges.append({
             "source": parent_id if parent_id in known_ids else page_node_id,
@@ -76,19 +104,21 @@ def build_graph(units: list[dict], regions: list[dict],
                     "overlap_ratio": membership.get("overlap_ratio"),
                 })
 
-    # Flux de lecture bloc à bloc.
-    ordered_blocks = sorted(
-        (u for u in structural_units
-         if u["level"] == "block"
-         and (u.get("geometry") or {}).get("reading_order_index") is not None),
-        key=lambda u: u["geometry"]["reading_order_index"],
-    )
-    for prev, nxt in zip(ordered_blocks, ordered_blocks[1:]):
-        edges.append({
-            "source": prev["unit_id"],
-            "target": nxt["unit_id"],
-            "relation": "flows_to",
-        })
+    # Flux de lecture par niveau.
+    for level in GRAPH_LEVELS - {"page"}:
+        ordered = sorted(
+            (u for u in graph_units
+             if u["level"] == level
+             and (u.get("geometry") or {}).get("reading_order_index") is not None),
+            key=lambda u: u["geometry"]["reading_order_index"],
+        )
+        for prev, nxt in zip(ordered, ordered[1:]):
+            edges.append({
+                "source": prev["unit_id"],
+                "target": nxt["unit_id"],
+                "relation": "flows_to",
+                "level": level,
+            })
 
     # Semantic graph : reprendre les relations element_relations si présentes.
     payload = (page_structure or {}).get("element_relations") or {}
@@ -118,20 +148,29 @@ def build_graph(units: list[dict], regions: list[dict],
 
 def build_relations(units: list[dict], graph: dict,
                     page_structure: dict | None = None) -> dict:
-    """Construit la couche relations (ordre de lecture + arêtes sémantiques)."""
+    """Construit la couche relations (ordres de lecture + arêtes sémantiques)."""
     ordered = sorted(
         (u for u in units
          if (u.get("geometry") or {}).get("reading_order_index") is not None),
         key=lambda u: u["geometry"]["reading_order_index"],
     )
     reading_order = [u["unit_id"] for u in ordered if u["level"] == "block"]
+    reading_order_by_level: dict[str, list[str]] = {}
+    primary_reading_order_by_level: dict[str, list[str]] = {}
+    for unit in ordered:
+        reading_order_by_level.setdefault(unit["level"], []).append(unit["unit_id"])
+        if unit["level"] not in AUXILIARY_TOKEN_LEVELS:
+            primary_reading_order_by_level.setdefault(unit["level"], []).append(unit["unit_id"])
     semantic_edges = [
         e for e in graph.get("edges", [])
-        if e.get("relation") not in {"contains", "belongs_to", "flows_to"}
+        if e.get("relation") not in {"contains", "belongs_to", "flows_to", "materializes"}
         or e.get("source_module") == "element_relations"
     ]
     return {
         "schema_version": "relations.v1",
         "reading_order": reading_order,
+        "reading_order_by_level": reading_order_by_level,
+        "primary_reading_order_by_level": primary_reading_order_by_level,
+        "auxiliary_token_levels": sorted(AUXILIARY_TOKEN_LEVELS),
         "edges": semantic_edges,
     }

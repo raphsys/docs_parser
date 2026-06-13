@@ -20,6 +20,7 @@ SPECIAL_REGION_OVERLAP_THRESHOLD = 0.65
 SPECIAL_REGION_CLAIMS = {
     "formula": "formula",
     "code": "code",
+    "protected_visual_region": "protected_visual",
     "table_cell": "table_cell",
     "chart_tick": "chart_tick_label",
 }

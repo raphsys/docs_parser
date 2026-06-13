@@ -17,7 +17,7 @@ EN_FR_EXPANSION_RATIO = 1.22
 
 
 def _is_fixed(policy: dict) -> bool:
-    return policy.get("render_policy") == "fixed_preserve"
+    return policy.get("render_policy") in {"fixed_preserve", "background_only", "preserve_overlay", "skip_artifact"} or bool(policy.get("protected_visual"))
 
 
 def _is_table_cell(policy: dict) -> bool:
@@ -27,9 +27,17 @@ def _is_table_cell(policy: dict) -> bool:
 def _is_prose(unit: dict, policy: dict) -> bool:
     if _is_fixed(policy) or _is_table_cell(policy):
         return False
-    return (unit.get("understanding") or {}).get("role") in {
-        "body", "paragraph", None
-    } and bool(policy.get("translatable"))
+    understanding = unit.get("understanding") or {}
+    role = understanding.get("role")
+    page_role = understanding.get("page_role")
+    layout_type = understanding.get("layout_type")
+    if role not in {"body_paragraph", "paragraph", "body"}:
+        return False
+    if page_role in {"toc", "index", "cover"}:
+        return False
+    if layout_type in {"image_dominant", "annotated_page", "table_dominant"}:
+        return False
+    return bool(policy.get("translatable"))
 
 
 def compile_unit_constraints(unit: dict) -> dict:
@@ -100,7 +108,7 @@ def compile_unit_constraints(unit: dict) -> dict:
 
     render_contract = {
         "mode": "paragraph_flow" if prose else (policy.get("render_policy") or "anchored_text"),
-        "target_layer": "overlay_layer" if constraints["preserve_visual"] else "text_layer",
+        "target_layer": "background_layer" if policy.get("render_policy") == "background_only" else ("overlay_layer" if constraints["preserve_visual"] else "text_layer"),
         "background_handling": "preserve" if constraints["preserve_visual"] else "erase_and_redraw",
         "text_box": {
             "bbox": (unit.get("geometry") or {}).get("bbox"),

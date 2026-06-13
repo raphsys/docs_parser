@@ -7,8 +7,8 @@ Puis calcule les appartenances :
     unit → region
     region → unit
 
-C'est ainsi que les régions influencent vraiment le pipeline : la région
-devient plus forte que le simple texte.
+C'est ainsi que les régions influencent le pipeline : elles deviennent des
+observations spatiales/claims. Les politiques finales sont compilées plus tard.
 """
 
 from __future__ import annotations
@@ -19,7 +19,32 @@ from .schema import CANONICAL_UNIT, MIN_VISUAL_AREA_PT2, MIN_VISUAL_DIM_PT
 MEMBERSHIP_OVERLAP_THRESHOLD = 0.5
 
 # Régions purement visuelles soumises au filtre des traits décoratifs.
-VISUAL_REGION_TYPES = {"image_region", "drawing_region", "non_text_zone"}
+VISUAL_REGION_TYPES = {
+    "image_region",
+    "drawing_region",
+    "non_text_zone",
+    "formula_candidate_region",
+    "code_candidate_region",
+    "visual_candidate_region",
+}
+PROTECTED_VISUAL_TYPES = {
+    "formula",
+    "formula_region",
+    "equation",
+    "math_expression",
+    "chemical_formula",
+    "symbolic_expression",
+    "code",
+    "code_region",
+    "code_block",
+    "inline_code",
+    "algorithm_block",
+    "special_notation",
+    "table_formula_cell",
+    "diagram_label_non_linguistic",
+    "protected_visual",
+    "protected_visual_region",
+}
 
 
 def _bbox_area(bbox) -> float:
@@ -43,10 +68,26 @@ def _overlap_ratio(unit_bbox, region_bbox) -> float:
 
 def _normalize_region_type(raw_type: str | None) -> str:
     mapping = {
-        "formula": "formula",
-        "formula_region": "formula",
-        "code": "code",
-        "code_region": "code",
+        "formula": "formula_candidate_region",
+        "formula_region": "formula_candidate_region",
+        "formula_candidate_region": "formula_candidate_region",
+        "equation": "formula_candidate_region",
+        "math_expression": "formula_candidate_region",
+        "chemical_formula": "formula_candidate_region",
+        "symbolic_expression": "formula_candidate_region",
+        "code": "code_candidate_region",
+        "code_region": "code_candidate_region",
+        "code_candidate_region": "code_candidate_region",
+        "code_block": "code_candidate_region",
+        "inline_code": "code_candidate_region",
+        "algorithm_block": "code_candidate_region",
+        "special_notation": "formula_candidate_region",
+        "table_formula_cell": "formula_candidate_region",
+        "diagram_label_non_linguistic": "diagram_region",
+        "protected_visual": "visual_candidate_region",
+        "protected_visual_region": "visual_candidate_region",
+        "visual_candidate_region": "visual_candidate_region",
+        "table_candidate_region": "table_candidate_region",
         "table": "table_region",
         "table_region": "table_region",
         "table_cell": "table_cell",
@@ -62,6 +103,8 @@ def _normalize_region_type(raw_type: str | None) -> str:
         "annotation": "annotation_region",
         "header": "header_region",
         "footer": "footer_region",
+        "text": "body_region",
+        "body": "body_region",
     }
     if not raw_type:
         return "body_region"
@@ -69,7 +112,19 @@ def _normalize_region_type(raw_type: str | None) -> str:
 
 
 def _region_policy(region_type: str) -> dict:
-    if region_type in {"formula", "image_region", "drawing_region", "non_text_zone"}:
+    if region_type in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
+        return {
+            "unit_type": region_type,
+            "object_type": region_type.replace("_region", ""),
+            "translatable": None,
+            "translation_strategy": "claim_pending",
+            "render_policy": "candidate_region",
+            "coverage_required": "strict",
+            "policy_pending": True,
+            "must_preserve_visual": False,
+            "must_exclude_from_translation_flow": False,
+        }
+    if region_type in {"image_region", "drawing_region", "non_text_zone"}:
         return {
             "translatable": False,
             "translation_strategy": "exact_preserve",
@@ -77,7 +132,7 @@ def _region_policy(region_type: str) -> dict:
             "must_preserve_visual": True,
             "must_exclude_from_translation_flow": True,
         }
-    if region_type in {"code", "chart_tick"}:
+    if region_type in {"chart_tick"}:
         return {
             "translatable": False,
             "translation_strategy": "exact_preserve",
@@ -103,10 +158,10 @@ def _region_policy(region_type: str) -> dict:
 
 
 def _region_constraints(region_type: str) -> dict:
-    fixed = region_type in {"formula", "image_region", "drawing_region", "non_text_zone", "chart_tick"}
+    fixed = region_type in {"image_region", "drawing_region", "non_text_zone", "chart_tick"}
     return {
         "preserve_bbox": fixed,
-        "preserve_as_overlay": region_type in {"formula", "image_region", "drawing_region"},
+        "preserve_as_overlay": region_type in {"image_region", "drawing_region"},
         "allow_reflow": not fixed and region_type not in {"table_cell", "code"},
     }
 
@@ -171,6 +226,7 @@ def build_regions(page_structure: dict, *, page_index: int = 0,
     for raw, source in collected:
         region_type = _normalize_region_type(
             raw.get("region_type") or raw.get("type") or raw.get("kind")
+            or raw.get("special_class")
         )
         bbox_pt, bbox_px = normalize_bbox_to_pt(
             raw.get("bbox"), raw.get("bbox_unit") or raw.get("bbox_source_unit"), sx, sy
@@ -211,6 +267,18 @@ def build_regions(page_structure: dict, *, page_index: int = 0,
             "policy": _region_policy(region_type),
             "constraints": _region_constraints(region_type),
         }
+        if region_type in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
+            raw_type = raw.get("region_type") or raw.get("type") or raw.get("kind") or raw.get("special_class")
+            object_type = raw.get("object_type") or raw.get("object_class") or raw_type or region_type
+            region.update({
+                "object_type": str(object_type),
+                "object_class": raw.get("object_class") or raw.get("subtype") or str(object_type),
+                "claim_type": raw.get("claim_type") or ("formula_candidate" if region_type == "formula_candidate_region" else "code_candidate" if region_type == "code_candidate_region" else "visual_candidate"),
+                "policy_pending": True,
+                "observation_only": True,
+                "reason": raw.get("reason") or "candidate_region_observation",
+                "detection_source": raw.get("detection_source") or raw.get("source") or source,
+            })
         if raw.get("subtype"):
             region["subtype"] = raw.get("subtype")
         regions.append(region)
@@ -230,20 +298,31 @@ def attach_region_memberships(units: list[dict], regions: list[dict], *,
         "line": "line_ids",
         "phrase": "phrase_ids",
         "span": "span_ids",
+        "word": "word_ids",
+        "char": "char_ids",
     }
+    for region in regions:
+        members = region.setdefault("members", {})
+        members.setdefault("word_ids", [])
+        members.setdefault("char_ids", [])
     for unit in units:
         bbox = (unit.get("geometry") or {}).get("bbox")
         if not bbox:
             continue
         memberships = []
         for region in regions:
+            local_threshold = _membership_threshold(unit.get("level"), region.get("region_type"), threshold)
             ratio = _overlap_ratio(bbox, region["bbox"])
-            if ratio >= threshold:
+            if ratio >= local_threshold:
+                coverage_mode = _coverage_mode(unit.get("level"), ratio)
                 memberships.append({
                     "region_id": region["region_id"],
                     "region_type": region["region_type"],
                     "overlap_ratio": round(ratio, 3),
-                    "membership_role": "inside" if ratio >= 0.9 else "partial",
+                    "coverage_mode": coverage_mode,
+                    "membership_role": "inside" if coverage_mode == "full_coverage" else coverage_mode,
+                    "action_hint": _action_hint(region.get("region_type"), coverage_mode),
+                    "confidence": region.get("confidence"),
                 })
                 key = member_keys.get(unit.get("level"))
                 if key:
@@ -259,3 +338,44 @@ def unit_has_region(unit: dict, region_type: str) -> bool:
         if membership.get("region_type") == region_type:
             return True
     return False
+
+
+def unit_has_protected_visual_region(unit: dict) -> bool:
+    return unit_has_region(unit, "protected_visual_region")
+
+
+def _membership_threshold(level: str | None, region_type: str | None, default: float) -> float:
+    if region_type not in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
+        return default
+    if level in {"block", "line"}:
+        return 0.10
+    return 0.55
+
+
+def _coverage_mode(level: str | None, overlap_ratio: float) -> str:
+    if overlap_ratio <= 0.0:
+        return "none"
+    if overlap_ratio < 0.10:
+        return "incidental_overlap"
+    thresholds = {
+        "block": 0.90,
+        "line": 0.85,
+        "phrase": 0.80,
+        "span": 0.75,
+        "word": 0.75,
+        "char": 0.75,
+    }
+    full_threshold = thresholds.get(level or "", 0.85)
+    if overlap_ratio >= full_threshold:
+        return "full_coverage"
+    if overlap_ratio >= 0.10:
+        return "partial_inline" if level in {"line", "phrase", "span", "word", "char"} else "dominant_overlap" if overlap_ratio >= 0.50 else "partial_inline"
+    return "incidental_overlap"
+
+
+def _action_hint(region_type: str | None, coverage_mode: str) -> str:
+    if coverage_mode == "full_coverage":
+        return "resolve_policy_for_unit"
+    if region_type in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
+        return "protect_inline_token_not_parent"
+    return "contextual_region_membership"

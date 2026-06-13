@@ -14,6 +14,58 @@ from __future__ import annotations
 OCR_NATIVE_OVERLAP_SKIP = 0.5
 
 
+def _text_preview(node: dict, limit: int = 160) -> str:
+    text = (
+        node.get("text")
+        or node.get("line_text")
+        or node.get("label")
+        or " ".join(
+            str(line.get("line_text") or line.get("text") or "").strip()
+            for line in (node.get("lines") or [])
+            if isinstance(line, dict)
+        )
+    )
+    return str(text or "").strip()[:limit]
+
+
+def _bbox(node):
+    if isinstance(node, dict):
+        value = node.get("bbox_pt") or node.get("bbox")
+    else:
+        value = node
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return [round(float(v), 3) for v in value]
+    except Exception:
+        return None
+
+
+def _source_summary(items: list, *, kind: str, include_text: bool = False) -> list[dict]:
+    out = []
+    for idx, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            item = {"bbox": item}
+        entry = {
+            "index": idx,
+            "kind": kind,
+            "id": item.get("id"),
+            "source": item.get("source") or item.get("source_kind"),
+            "source_kind": item.get("source_kind"),
+            "bbox": _bbox(item),
+            "bbox_unit": "pt" if item.get("bbox_pt") is not None or item.get("bbox_unit") == "pt" else "px",
+            "confidence": item.get("confidence") or item.get("score"),
+            "role": item.get("role"),
+            "object_type": item.get("object_type"),
+            "object_class": item.get("object_class"),
+        }
+        if include_text:
+            entry["text_preview"] = _text_preview(item)
+            entry["line_count"] = len(item.get("lines") or [])
+        out.append(entry)
+    return out
+
+
 def _bbox_overlap_ratio(a, b) -> float:
     ax0, ay0, ax1, ay1 = [float(v) for v in a]
     bx0, by0, bx1, by1 = [float(v) for v in b]
@@ -100,6 +152,12 @@ class RawExtractors:
                 "images": len(images),
                 "drawings": len(drawings),
                 "non_text_zones": len(non_text_zones),
+            },
+            "raw_source_details": {
+                "blocks": _source_summary(blocks, kind="text_block", include_text=True),
+                "images": _source_summary(images, kind="image"),
+                "drawings": _source_summary(drawings, kind="drawing"),
+                "non_text_zones": _source_summary(non_text_zones, kind="non_text_zone"),
             },
             "trace": trace,
         }

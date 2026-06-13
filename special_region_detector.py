@@ -73,6 +73,18 @@ NATURAL_SHORT_WORDS = {
 }
 MATH_SYMBOL_PATTERN = re.compile(r"[∂∑∏∫√∞≈≠≤≥±×÷−∆Ω∗·δµμ=<>*/^_{}()[\]\\|¬→←↔⇒⇔∈∉⊂⊃⊆⊇∧∨∩∪]|[α-ωΑ-Ω]")
 CONTROL_FORMULA_CHARS = {"\x02", "\x03", "\x04", "\x05", "\x06", "\x07"}
+LIST_MARKER_TEXTS = {
+    "■",
+    "•",
+    "▪",
+    "◦",
+    "‣",
+    "⁃",
+    "·",
+    "◆",
+    "▶",
+    "▷",
+}
 PROSE_MARKERS = {
     "above",
     "calculated",
@@ -171,6 +183,11 @@ def _is_formula_symbol(char):
     return _is_symbol_category(char) and char not in {"©", "®", "™"}
 
 
+def _is_list_marker_text(text):
+    s = re.sub(r"\s+", "", str(text or ""))
+    return len(s) == 1 and s in LIST_MARKER_TEXTS
+
+
 def _is_natural_word(text):
     return bool(re.fullmatch(r"[A-Za-zÀ-ÿ]{3,}(?:['-][A-Za-zÀ-ÿ]{2,})?", text or ""))
 
@@ -185,6 +202,8 @@ def _is_alpha_slash_word(text):
 def _token_formula_compatible(token):
     text = re.sub(r"\s+", "", str((token or {}).get("text") or ""))
     if not text:
+        return False
+    if _is_list_marker_text(text):
         return False
     low = text.lower()
     if low in NATURAL_SHORT_WORDS:
@@ -214,6 +233,8 @@ def _token_formula_compatible(token):
 
 def _token_is_anchor(token):
     text = str((token or {}).get("text") or "")
+    if _is_list_marker_text(text):
+        return False
     if _is_alpha_slash_word(text):
         return False
     if (token or {}).get("has_symbol") or (token or {}).get("has_control"):
@@ -766,6 +787,9 @@ def _pdf_formula_candidates(pdf_page, sx=1.0, sy=1.0):
                 run_tokens = tokens[left : right + 1]
                 run_text = "".join(token.get("text") or "" for token in run_tokens)
                 natural_words = [word for word in re.findall(r"[A-Za-zÀ-ÿ]{3,}", run_text or "") if word.lower() not in FORMULA_WORDS]
+                if any(_is_list_marker_text(token.get("text")) for token in run_tokens):
+                    if not re.search(r"[∂δ∑∏∫√=]", run_text or ""):
+                        continue
                 if len(natural_words) > 2 and not re.search(r"∂|δ|∑|∏|∫|√|=", run_text or ""):
                     continue
                 rect = run_tokens[0]["rect"]
@@ -1119,7 +1143,10 @@ def detect_special_regions(page_data, page_image=None, pdf_page=None, sx=1.0, sy
         special_regions.append(
             {
                 "id": f"special_region_{region_index}",
+                "region_type": special_class,
                 "special_class": special_class,
+                "object_type": special_class,
+                "object_class": special_class,
                 "visual_bbox": _bbox_from_rect(visual_rect),
                 "bbox": _bbox_from_rect(visual_rect),
                 "preserve_subregions": preserve_subregions,
@@ -1129,6 +1156,10 @@ def detect_special_regions(page_data, page_image=None, pdf_page=None, sx=1.0, sy
                 "text_subregions": [],
                 "render_policy": "preserve_source_region",
                 "translation_policy": "preserve_visual_region",
+                "protected_visual": True,
+                "preserve_original_pixels": True,
+                "skip_translation": True,
+                "skip_text_reconstruction": True,
                 "detection_source": "+".join(sorted(s for s in sources if s)) or "cpu_heuristic",
                 "confidence": round(confidence, 3),
             }

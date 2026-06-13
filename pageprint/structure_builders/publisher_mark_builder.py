@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import re
+
+from .common import bbox_of, eligible_text_units, reading_order, role_of, text_of
+
+
+PAGE_NUMBER_RE = re.compile(r"^\s*(?:\d+|[ivxlcdm]+)\s*$", re.IGNORECASE)
+PUBLISHER_RE = re.compile(r"\b(?:ebook|publisher|manning|copyright|©|all rights reserved)\b", re.IGNORECASE)
+WATERMARK_RE = re.compile(r"\b(?:watermark|draft|sample|preview|confidential)\b", re.IGNORECASE)
+
+
+def build_artifacts(units: list[dict], *, page_intelligence: dict | None = None) -> dict:
+    page_intelligence = page_intelligence or {}
+    publisher_marks: list[dict] = []
+    watermarks: list[dict] = []
+    page_numbers: list[dict] = []
+    for idx, unit in enumerate(eligible_text_units(units), start=1):
+        role = role_of(unit)
+        text = text_of(unit)
+        bbox = bbox_of(unit)
+        location = _vertical_location(bbox, page_intelligence)
+        if role == "publisher_mark" or PUBLISHER_RE.search(text):
+            publisher_marks.append(_artifact("publisher_mark", idx, unit, "exclude_as_artifact", location))
+        elif role == "watermark" or WATERMARK_RE.search(text):
+            watermarks.append(_artifact("watermark", idx, unit, "exclude_as_artifact", location))
+        elif role in {"page_reference", "page_number", "toc_page_reference"} or (
+            PAGE_NUMBER_RE.fullmatch(text) and location in {"top_margin", "bottom_margin"}
+        ):
+            page_numbers.append(_artifact("page_number", idx, unit, "preserve_text_exactly", location))
+    return {
+        "publisher_marks": publisher_marks,
+        "watermarks": watermarks,
+        "page_numbers": page_numbers,
+    }
+
+
+def _artifact(kind: str, idx: int, unit: dict, preservation_mode: str, location: str) -> dict:
+    return {
+        "logical_unit_id": f"{kind}_{idx:04d}",
+        "type": kind,
+        "text": text_of(unit),
+        "source_unit_ids": [unit["unit_id"]],
+        "bbox": bbox_of(unit),
+        "role": kind,
+        "preservation_mode": preservation_mode,
+        "location": location,
+        "reading_order_index": reading_order(unit),
+    }
+
+
+def _vertical_location(bbox, page_intelligence: dict) -> str:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return "unknown"
+    page_geometry = page_intelligence.get("page_geometry") or {}
+    height = float(page_geometry.get("height") or 0.0)
+    dpi = float(page_geometry.get("render_dpi") or 72.0)
+    if height and dpi:
+        height = height * 72.0 / dpi
+    if not height:
+        return "unknown"
+    y0 = float(bbox[1])
+    y1 = float(bbox[3])
+    if y1 < height * 0.12:
+        return "top_margin"
+    if y0 > height * 0.88:
+        return "bottom_margin"
+    return "body_area"

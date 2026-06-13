@@ -8,8 +8,11 @@ chaque unité portant les trois couches séparées :
 
 from __future__ import annotations
 
+import re
+
 from .normalizer import (
     clamp_confidence,
+    bbox_pt_to_px,
     normalize_bbox_to_pt,
     normalize_style,
 )
@@ -19,6 +22,22 @@ from .schema import (
     MIN_VISUAL_DIM_PT,
     empty_unit,
 )
+
+TOC_BULLET_MARKERS = {
+    "■",
+    "•",
+    "▪",
+    "◦",
+    "‣",
+    "⁃",
+    "·",
+    "◆",
+    "▶",
+    "▷",
+}
+TOC_TITLE_RE = re.compile(r"^(?:contents?|table of contents|sommaire)$", re.IGNORECASE)
+TOC_SECTION_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)*[a-z]?$")
+TOC_PAGE_REFERENCE_RE = re.compile(r"^(?:\d{1,4}|[ivxlcdm]{1,8})$", re.IGNORECASE)
 
 
 def _span_style_signature(span: dict) -> tuple:
@@ -47,6 +66,38 @@ def _union_bbox(a, b):
         max(float(a[2]), float(b[2])),
         max(float(a[3]), float(b[3])),
     ]
+
+
+def _page_bbox_pt(page_structure: dict, sx: float, sy: float) -> list[float] | None:
+    dimensions = page_structure.get("dimensions") or {}
+    if dimensions.get("unit") == CANONICAL_UNIT and dimensions.get("width") and dimensions.get("height"):
+        return [0.0, 0.0, round(float(dimensions["width"]), 3), round(float(dimensions["height"]), 3)]
+    if dimensions.get("width_pt") and dimensions.get("height_pt"):
+        return [0.0, 0.0, round(float(dimensions["width_pt"]), 3), round(float(dimensions["height_pt"]), 3)]
+    if dimensions.get("width") and dimensions.get("height"):
+        return [
+            0.0,
+            0.0,
+            round(float(dimensions["width"]) / max(1e-9, sx), 3),
+            round(float(dimensions["height"]) / max(1e-9, sy), 3),
+        ]
+    return None
+
+
+def _set_bbox_from_pt(unit: dict, bbox_pt, sx: float, sy: float, dpi: float,
+                      reading_index: int | None = None) -> None:
+    if not (isinstance(bbox_pt, (list, tuple)) and len(bbox_pt) == 4):
+        return
+    bbox = [round(float(v), 3) for v in bbox_pt]
+    unit["geometry"].update({
+        "bbox": bbox,
+        "bbox_unit": CANONICAL_UNIT,
+        "bbox_px": bbox_pt_to_px(bbox, sx, sy),
+        "bbox_px_dpi": dpi,
+    })
+    if reading_index is not None:
+        unit["geometry"]["reading_order_index"] = reading_index
+        unit["geometry"]["render_order_index"] = reading_index
 
 
 def _span_text(span: dict) -> str:
@@ -82,6 +133,7 @@ def merge_phrase_spans(spans: list) -> list:
             acc["text"] = prev_text + separator + text
             acc.pop("texte", None)
             acc["bbox"] = _union_bbox(acc.get("bbox"), span.get("bbox"))
+            acc["bbox_pt"] = _union_bbox(acc.get("bbox_pt"), span.get("bbox_pt"))
             acc.setdefault("merged_from", [acc.get("id")])
             acc["merged_from"].append(span.get("id"))
             scores = [s for s in (acc.get("score"), span.get("score")) if s is not None]
@@ -123,7 +175,10 @@ def is_significant_visual(node: dict, sx: float, sy: float) -> bool:
 def _unit_geometry(unit: dict, node: dict, sx: float, sy: float, dpi: float,
                    reading_index: int) -> None:
     bbox_pt, bbox_px = normalize_bbox_to_pt(
-        node.get("bbox"), node.get("bbox_unit") or node.get("bbox_source_unit"), sx, sy
+        node.get("bbox_pt") or node.get("bbox"),
+        node.get("bbox_unit") or node.get("bbox_source_unit")
+        or ("pt" if node.get("bbox_pt") is not None else None),
+        sx, sy
     )
     geo = unit["geometry"]
     geo["bbox"] = bbox_pt
@@ -168,6 +223,163 @@ def _unit_content(unit: dict, node: dict, language: str | None) -> None:
     })
 
 
+def _token_semantic_kind(text: str, level: str) -> str:
+    token = str(text or "")
+    if not token.strip():
+        return "space"
+    if level == "char":
+        if token.isspace():
+            return "space"
+        if token.isdigit():
+            return "digit"
+        if token.isalpha():
+            return "letter"
+        return "symbol"
+    if re.fullmatch(r"\d+([.,]\d+)*", token):
+        return "number"
+    if re.fullmatch(r"[\[\(]?\d+[\]\)]?", token):
+        return "reference_marker"
+    if re.fullmatch(r"[A-Z]{2,}([-/][A-Z0-9]+)*", token):
+        return "acronym"
+    if re.search(r"[=∑∫√≤≥±×÷∞∂λµπσΔαβγ]", token):
+        return "math_token"
+    if re.fullmatch(r"\W+", token):
+        return "symbol"
+    return "word"
+
+
+def _toc_unit_role(text: str, level: str) -> tuple[str | None, str | None, bool | None]:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return None, None, None
+    if normalized in TOC_BULLET_MARKERS:
+        return "toc_bullet_marker", "marker", False
+    if TOC_TITLE_RE.fullmatch(normalized):
+        return "toc_title", "title", True
+    if "." in normalized and TOC_SECTION_NUMBER_RE.fullmatch(normalized):
+        return "toc_section_number", "section_number", False
+    if TOC_PAGE_REFERENCE_RE.fullmatch(normalized):
+        return "toc_page_reference", "page_reference", False
+    if level in {"block", "line", "phrase", "span"} and re.search(r"[A-Za-zÀ-ÿ]", normalized):
+        return "toc_entry", "entry", True
+    return None, None, None
+
+
+def _split_words(text: str) -> list[tuple[str, int, int]]:
+    return [(m.group(0), m.start(), m.end()) for m in re.finditer(r"\S+", str(text or ""))]
+
+
+def _slice_bbox_pt(bbox_pt, start: int, end: int, total: int):
+    if not (isinstance(bbox_pt, (list, tuple)) and len(bbox_pt) == 4 and total > 0):
+        return None
+    x0, y0, x1, y1 = [float(v) for v in bbox_pt]
+    width = max(0.001, x1 - x0)
+    left = x0 + width * max(0.0, min(1.0, start / total))
+    right = x0 + width * max(0.0, min(1.0, end / total))
+    if right <= left:
+        right = left + max(0.25, width / max(1, total))
+    return [round(left, 3), round(y0, 3), round(right, 3), round(y1, 3)]
+
+
+def _char_text(char: dict) -> str:
+    return str(char.get("c") or char.get("text") or "")
+
+
+def _char_bbox_pt(char: dict):
+    bbox_pt = char.get("bbox_pt")
+    if isinstance(bbox_pt, (list, tuple)) and len(bbox_pt) == 4:
+        return [float(v) for v in bbox_pt]
+    return None
+
+
+def _char_center_in_bbox(char: dict, bbox_pt, tolerance_pt: float = 1.0) -> bool:
+    char_bbox = _char_bbox_pt(char)
+    if not (
+        isinstance(char_bbox, (list, tuple)) and len(char_bbox) == 4
+        and isinstance(bbox_pt, (list, tuple)) and len(bbox_pt) == 4
+    ):
+        return False
+    cx = (float(char_bbox[0]) + float(char_bbox[2])) / 2.0
+    cy = (float(char_bbox[1]) + float(char_bbox[3])) / 2.0
+    return (
+        float(bbox_pt[0]) - tolerance_pt <= cx <= float(bbox_pt[2]) + tolerance_pt
+        and float(bbox_pt[1]) - tolerance_pt <= cy <= float(bbox_pt[3]) + tolerance_pt
+    )
+
+
+def _chars_for_span(span: dict, line_chars: list[dict]) -> list[dict]:
+    """Retourne les caractères natifs qui appartiennent au span courant."""
+    if not line_chars:
+        return []
+    span_bbox = span.get("bbox_pt")
+    chars = [ch for ch in line_chars if isinstance(ch, dict) and _char_center_in_bbox(ch, span_bbox)]
+    if not chars:
+        return []
+    chars.sort(key=lambda ch: (
+        (_char_bbox_pt(ch) or [0, 0, 0, 0])[1],
+        (_char_bbox_pt(ch) or [0, 0, 0, 0])[0],
+    ))
+    span_text = _span_text(span)
+    chars_text = "".join(_char_text(ch) for ch in chars)
+    if span_text and chars_text and chars_text != span_text:
+        # Les offsets word/char sont indexés dans span_text. Si la chaîne des
+        # chars natifs diverge, utiliser ces bboxes produirait un audit faux.
+        return []
+    return chars
+
+
+def _bbox_from_native_chars(chars: list[dict], start: int, end: int):
+    selected = []
+    for ch in chars[start:end]:
+        if not isinstance(ch, dict) or not _char_text(ch).strip():
+            continue
+        bbox = _char_bbox_pt(ch)
+        if bbox is not None:
+            selected.append(bbox)
+    if not selected:
+        return None
+    bbox = selected[0]
+    for other in selected[1:]:
+        bbox = _union_bbox(bbox, other)
+    return [round(float(v), 3) for v in bbox]
+
+
+def _native_char_bbox(chars: list[dict], offset: int):
+    if 0 <= offset < len(chars):
+        bbox = _char_bbox_pt(chars[offset])
+        if bbox is not None:
+            return [round(float(v), 3) for v in bbox]
+    return None
+
+
+def _make_text_child_unit(*, unit_id: str, level: str, parent_id: str, text: str,
+                          bbox_pt, source_node: dict, sx: float, sy: float,
+                          dpi: float, reading_index: int, page_context: dict,
+                          language: str | None, created_by: str,
+                          source_default: str | None) -> dict:
+    node = dict(source_node or {})
+    node["text"] = text
+    node["bbox"] = bbox_pt
+    node["bbox_pt"] = bbox_pt
+    node["bbox_unit"] = CANONICAL_UNIT
+    node["semantic_kind"] = _token_semantic_kind(text, level)
+    unit = _make_unit(
+        unit_id=unit_id, level=level, parent_id=parent_id, node=node,
+        sx=sx, sy=sy, dpi=dpi, reading_index=reading_index,
+        page_context=page_context, language=language,
+        created_by=created_by, source_default=source_default,
+    )
+    unit["understanding"]["semantic_kind"] = node["semantic_kind"]
+    unit["policy"].update({
+        "translatable": False,
+        "translation_strategy": "lexical_context",
+        "render_policy": "inherit_parent",
+        "coverage_required": "normal",
+        "non_translatable_reason": f"{level}_granularity_context",
+    })
+    return unit
+
+
 def _unit_extraction(unit: dict, node: dict, default_source: str | None) -> None:
     unit["extraction"].update({
         "source": node.get("source") or node.get("source_kind") or default_source,
@@ -184,16 +396,39 @@ def _unit_extraction(unit: dict, node: dict, default_source: str | None) -> None
 
 
 def _unit_understanding(unit: dict, node: dict, page_context: dict) -> None:
+    role = node.get("role")
+    object_type = node.get("object_type") or node.get("unit_type")
+    object_class = node.get("object_class")
+    semantic_kind = node.get("phrase_semantics") or node.get("semantic_kind")
+    text = unit.get("content", {}).get("text")
+    page_role = page_context.get("page_role")
+
+    if page_role == "toc":
+        toc_role, toc_kind, translatable = _toc_unit_role(text, unit.get("level") or "")
+        if toc_role:
+            role = toc_role
+            object_type = toc_role
+            object_class = toc_role
+            semantic_kind = toc_kind or semantic_kind
+            if translatable is False:
+                unit["policy"].update({
+                    "translatable": False,
+                    "translation_strategy": "exact_preserve",
+                    "coverage_required": "strict",
+                    "render_policy": "anchored_text",
+                })
+
     unit["understanding"].update({
-        "role": node.get("role"),
-        "object_type": node.get("object_type") or node.get("unit_type"),
-        "object_class": node.get("object_class"),
+        "role": role,
+        "object_type": object_type,
+        "object_class": object_class,
         "page_family": page_context.get("page_family"),
         "layout_type": page_context.get("layout_type"),
         "document_type": page_context.get("document_type"),
+        "page_role": page_role,
         "region_memberships": list(node.get("region_memberships") or []),
         "structure_hints": dict(node.get("structure_hints") or {}),
-        "semantic_kind": node.get("phrase_semantics") or node.get("semantic_kind"),
+        "semantic_kind": semantic_kind,
     })
 
 
@@ -217,6 +452,35 @@ def _unit_policy(unit: dict, node: dict) -> None:
         unit["policy"]["unit_type"] = node.get("unit_type") or contract.get("unit_type")
 
 
+def _apply_toc_policy(unit: dict, page_context: dict) -> None:
+    if page_context.get("page_role") != "toc":
+        return
+    toc_role, toc_kind, translatable = _toc_unit_role(
+        unit.get("content", {}).get("text") or "",
+        unit.get("level") or "",
+    )
+    if not toc_role:
+        return
+    if toc_role == "toc_entry" and translatable is True:
+        text = str(unit.get("content", {}).get("text") or "")
+        stripped = re.sub(r"^[■•▪◦‣⁃·◆▶▷]\s*", "", text)
+        if stripped != text and re.search(r"[A-Za-zÀ-ÿ]", stripped):
+            unit["content"]["text"] = stripped
+            unit["content"]["normalized_text"] = stripped
+    unit["understanding"]["role"] = toc_role
+    unit["understanding"]["object_type"] = toc_role
+    unit["understanding"]["object_class"] = toc_role
+    unit["understanding"]["semantic_kind"] = toc_kind or unit["understanding"].get("semantic_kind")
+    unit["policy"]["unit_type"] = toc_role
+    if translatable is False:
+        unit["policy"].update({
+            "translatable": False,
+            "translation_strategy": "exact_preserve",
+            "coverage_required": "strict",
+            "render_policy": "anchored_text",
+        })
+
+
 def _make_unit(*, unit_id: str, level: str, parent_id: str | None, node: dict,
                sx: float, sy: float, dpi: float, reading_index: int,
                page_context: dict, language: str | None,
@@ -233,6 +497,7 @@ def _make_unit(*, unit_id: str, level: str, parent_id: str | None, node: dict,
     _unit_extraction(unit, node, source_default)
     _unit_understanding(unit, node, page_context)
     _unit_policy(unit, node)
+    _apply_toc_policy(unit, page_context)
     unit["provenance"]["created_by"] = created_by
     unit["lifecycle"]["created_at_stage"] = created_by
     if node.get("merged_from"):
@@ -243,6 +508,106 @@ def _make_unit(*, unit_id: str, level: str, parent_id: str | None, node: dict,
     return unit
 
 
+def _region_level(region_type: str) -> str:
+    mapping = {
+        "formula": "region",
+        "formula_region": "region",
+        "formula_candidate_region": "region",
+        "code": "region",
+        "code_region": "region",
+        "code_candidate_region": "region",
+        "visual_candidate_region": "region",
+        "protected_visual_region": "region",
+        "table_region": "table",
+        "table_cell": "cell",
+    }
+    return mapping.get(str(region_type or ""), "region")
+
+
+def build_region_units(regions: list[dict], *, page_unit_id: str,
+                       page_index: int = 0, sx: float = 1.0, sy: float = 1.0,
+                       dpi: float = 150, language: str | None = None,
+                       start_index: int = 0, page_context: dict | None = None) -> list[dict]:
+    """Matérialise les régions/zones détectées comme unités canoniques.
+
+    Les régions ne sont pas seulement des annotations spatiales : formules,
+    code, tableaux, cellules, figures et zones non textuelles deviennent des
+    unités de premier rang consommables par traduction/reconstruction/QA.
+    """
+    page_context = page_context or {}
+    units: list[dict] = []
+    counter = start_index
+    for idx, region in enumerate(regions or []):
+        if not isinstance(region, dict):
+            continue
+        region_type = region.get("region_type") or "body_region"
+        level = _region_level(region_type)
+        unit_id = f"{region.get('region_id') or f'p{page_index + 1:03d}_region_{idx + 1:03d}'}_unit"
+        node = {
+            "id": region.get("region_id"),
+            "bbox": region.get("bbox"),
+            "bbox_unit": CANONICAL_UNIT,
+            "source": region.get("source"),
+            "source_kind": "pageprint_region",
+            "confidence": region.get("confidence"),
+            "role": region.get("role") or region_type,
+            "object_type": region.get("object_type") or region_type,
+            "object_class": region.get("object_class") or level,
+            "structure_hints": {
+                "region_type": region_type,
+                "region_id": region.get("region_id"),
+                "materialized_from_region": True,
+                "policy_pending": bool(region.get("policy_pending")),
+                "observation_only": bool(region.get("observation_only")),
+            },
+        }
+        region_policy = dict(region.get("policy") or {})
+        node.update({
+            "translatable": region_policy.get("translatable"),
+            "translation_strategy": region_policy.get("translation_strategy"),
+            "render_policy": region_policy.get("render_policy"),
+            "coverage_required": "strict",
+            "preserve_visual": region_policy.get("must_preserve_visual"),
+            "preserve_original_pixels": region_policy.get("preserve_original_pixels"),
+            "policy_pending": region_policy.get("policy_pending"),
+        })
+        unit = _make_unit(
+            unit_id=unit_id,
+            level=level,
+            parent_id=page_unit_id,
+            node=node,
+            sx=sx,
+            sy=sy,
+            dpi=dpi,
+            reading_index=counter,
+            page_context=page_context,
+            language=language,
+            created_by="pageprint.region_materializer",
+            source_default=region.get("source"),
+        )
+        unit["relations"]["parent_region_id"] = region.get("region_id")
+        unit["understanding"]["region_memberships"] = [{
+            "region_id": region.get("region_id"),
+            "region_type": region_type,
+            "overlap_ratio": 1.0,
+            "membership_role": "materialized_region",
+            "confidence": region.get("confidence"),
+        }]
+        unit["evidence"] = {
+            "sources": [{
+                "source": region.get("source") or "region_index",
+                "claim": region_type,
+                "confidence": region.get("confidence"),
+            }],
+            "resolved_as": level,
+            "resolution_rule": "region_materialized_as_canonical_unit",
+            "confidence": region.get("confidence"),
+        }
+        units.append(unit)
+        counter += 1
+    return units
+
+
 def build_units(page_structure: dict, *, page_index: int = 0,
                 sx: float = 1.0, sy: float = 1.0,
                 dpi: float = 150, language: str | None = None,
@@ -250,20 +615,23 @@ def build_units(page_structure: dict, *, page_index: int = 0,
                 stats: dict | None = None) -> list[dict]:
     """Construit la liste canonique d'unités depuis la structure legacy.
 
-    Hiérarchie produite : block → line → phrase → span, plus les unités
-    image/drawing signifiantes (les traits décoratifs sont filtrés et
-    comptés dans `stats`). Les spans consécutifs de style identique sont
-    fusionnés (merge_spans=True).
+    Hiérarchie produite : page → block → line → phrase → span → word → char,
+    plus les unités image/drawing signifiantes. Les spans consécutifs de
+    style identique sont fusionnés (merge_spans=True), puis les mots et
+    caractères sont synthétisés pour garantir la granularité fine du contrat.
     """
     if stats is not None:
         stats.setdefault("spans_before_merge", 0)
         stats.setdefault("spans_after_merge", 0)
+        stats.setdefault("words_created", 0)
+        stats.setdefault("chars_created", 0)
         stats.setdefault("visuals_total", 0)
         stats.setdefault("visuals_filtered_decorative", 0)
     page_context = {
         "page_family": page_structure.get("page_family"),
         "layout_type": page_structure.get("layout_type"),
         "document_type": page_structure.get("document_type"),
+        "page_role": page_structure.get("page_role"),
     }
     prefix = f"p{page_index + 1:03d}"
     units: list[dict] = []
@@ -273,16 +641,54 @@ def build_units(page_structure: dict, *, page_index: int = 0,
         counter["i"] += 1
         return counter["i"] - 1
 
+    page_unit_id = f"{prefix}_page"
+    page_unit = empty_unit(page_unit_id, "page", None)
+    page_unit["content"].update({
+        "text": None,
+        "raw_text": None,
+        "normalized_text": None,
+        "language": language,
+    })
+    _set_bbox_from_pt(page_unit, _page_bbox_pt(page_structure, sx, sy), sx, sy, dpi, next_index())
+    page_unit["understanding"].update({
+        "role": page_structure.get("page_role") or "page",
+        "object_type": "page",
+        "object_class": "page",
+        "page_family": page_context.get("page_family"),
+        "layout_type": page_context.get("layout_type"),
+        "document_type": page_context.get("document_type"),
+        "structure_hints": {
+            "page_role": page_structure.get("page_role"),
+            "format_probable": page_structure.get("format_probable"),
+        },
+    })
+    page_unit["policy"].update({
+        "translatable": False,
+        "translation_strategy": "page_container",
+        "render_policy": "page_container",
+        "coverage_required": "normal",
+        "non_translatable_reason": "page_container",
+    })
+    page_unit["extraction"].update({
+        "source": "pageprint",
+        "source_kind": "page_container",
+        "confidence": 1.0,
+    })
+    page_unit["provenance"]["created_by"] = "pageprint.unit_factory"
+    page_unit["lifecycle"]["created_at_stage"] = "pageprint.unit_factory"
+    units.append(page_unit)
+
     for b_idx, block in enumerate(page_structure.get("blocks") or []):
         if not isinstance(block, dict):
             continue
         block_id = f"{prefix}_block_{b_idx + 1:03d}"
         block_unit = _make_unit(
-            unit_id=block_id, level="block", parent_id=None, node=block,
+            unit_id=block_id, level="block", parent_id=page_unit_id, node=block,
             sx=sx, sy=sy, dpi=dpi, reading_index=next_index(),
             page_context=page_context, language=language,
             created_by="pageprint.unit_factory", source_default=block.get("source_kind"),
         )
+        page_unit["children_ids"].append(block_id)
         units.append(block_unit)
 
         for l_idx, line in enumerate(block.get("lines") or []):
@@ -320,6 +726,10 @@ def build_units(page_structure: dict, *, page_index: int = 0,
                     raw_spans = merge_phrase_spans(raw_spans)
                 if stats is not None:
                     stats["spans_after_merge"] += len(raw_spans)
+                line_chars = [
+                    ch for ch in (line.get("chars") or [])
+                    if isinstance(ch, dict) and _char_bbox_pt(ch) is not None
+                ]
 
                 for s_idx, span in enumerate(raw_spans):
                     if not isinstance(span, dict):
@@ -334,6 +744,53 @@ def build_units(page_structure: dict, *, page_index: int = 0,
                     )
                     phrase_unit["children_ids"].append(span_id)
                     units.append(span_unit)
+
+                    span_text = _span_text(span)
+                    span_bbox_pt = span_unit["geometry"].get("bbox")
+                    span_chars = _chars_for_span(span, line_chars)
+                    words = _split_words(span_text)
+                    total_len = max(1, len(span_text))
+                    for w_idx, (word_text, start, end) in enumerate(words):
+                        word_id = f"{span_id}_word_{w_idx + 1:03d}"
+                        word_bbox = _bbox_from_native_chars(span_chars, start, end)
+                        if word_bbox is None:
+                            word_bbox = _slice_bbox_pt(span_bbox_pt, start, end, total_len)
+                        word_unit = _make_text_child_unit(
+                            unit_id=word_id, level="word", parent_id=span_id,
+                            text=word_text, bbox_pt=word_bbox, source_node=span,
+                            sx=sx, sy=sy, dpi=dpi, reading_index=next_index(),
+                            page_context=page_context, language=language,
+                            created_by="pageprint.tokenizer",
+                            source_default=block.get("source_kind"),
+                        )
+                        span_unit["children_ids"].append(word_id)
+                        units.append(word_unit)
+                        if stats is not None:
+                            stats["words_created"] += 1
+
+                        rel_start = start
+                        for c_idx, char_offset in enumerate(range(start, end)):
+                            char_text = span_text[char_offset]
+                            char_id = f"{word_id}_char_{c_idx + 1:03d}"
+                            char_bbox = _native_char_bbox(span_chars, char_offset)
+                            if char_bbox is None:
+                                char_bbox = _slice_bbox_pt(
+                                    span_bbox_pt, char_offset, char_offset + 1, total_len
+                                )
+                            char_unit = _make_text_child_unit(
+                                unit_id=char_id, level="char", parent_id=word_id,
+                                text=char_text, bbox_pt=char_bbox, source_node=span,
+                                sx=sx, sy=sy, dpi=dpi, reading_index=next_index(),
+                                page_context=page_context, language=language,
+                                created_by="pageprint.tokenizer",
+                                source_default=block.get("source_kind"),
+                            )
+                            char_unit["relations"]["char_offset_in_span"] = char_offset
+                            char_unit["relations"]["char_offset_in_word"] = char_offset - rel_start
+                            word_unit["children_ids"].append(char_id)
+                            units.append(char_unit)
+                            if stats is not None:
+                                stats["chars_created"] += 1
 
     # Unités visuelles signifiantes (images / drawings) ; les traits
     # décoratifs (filets, règles) sont filtrés.
@@ -350,7 +807,7 @@ def build_units(page_structure: dict, *, page_index: int = 0,
                 stats["visuals_filtered_decorative"] += 1
             continue
         unit = _make_unit(
-            unit_id=f"{prefix}_image_{i_idx + 1:03d}", level="image", parent_id=None,
+            unit_id=f"{prefix}_image_{i_idx + 1:03d}", level="image", parent_id=page_unit_id,
             node=image, sx=sx, sy=sy, dpi=dpi, reading_index=next_index(),
             page_context=page_context, language=language,
             created_by="pageprint.unit_factory", source_default="native_pdf",
@@ -362,6 +819,7 @@ def build_units(page_structure: dict, *, page_index: int = 0,
             "coverage_required": "strict",
             "preserve_visual": True,
         })
+        page_unit["children_ids"].append(unit["unit_id"])
         units.append(unit)
 
     for d_idx, drawing in enumerate(drawings):
@@ -372,7 +830,7 @@ def build_units(page_structure: dict, *, page_index: int = 0,
                 stats["visuals_filtered_decorative"] += 1
             continue
         unit = _make_unit(
-            unit_id=f"{prefix}_drawing_{d_idx + 1:03d}", level="drawing", parent_id=None,
+            unit_id=f"{prefix}_drawing_{d_idx + 1:03d}", level="drawing", parent_id=page_unit_id,
             node=drawing, sx=sx, sy=sy, dpi=dpi, reading_index=next_index(),
             page_context=page_context, language=language,
             created_by="pageprint.unit_factory", source_default="native_pdf",
@@ -384,6 +842,7 @@ def build_units(page_structure: dict, *, page_index: int = 0,
             "coverage_required": "strict",
             "preserve_visual": True,
         })
+        page_unit["children_ids"].append(unit["unit_id"])
         units.append(unit)
 
     # Chaînage previous/next dans l'ordre de lecture.

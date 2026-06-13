@@ -91,12 +91,14 @@ UNIT_LEVELS = {
     "cell",
     "formula",
     "code",
+    "protected_visual",
     "overlay",
 }
 
 # Relations essentielles du graphe documentaire.
 RELATION_TYPES = {
     "contains",
+    "materializes",
     "belongs_to",
     "flows_to",
     "continues",
@@ -127,7 +129,13 @@ REGION_TYPES = {
     "chart_region",
     "chart_tick",
     "formula_region",
+    "formula_candidate_region",
     "code_region",
+    "code_candidate_region",
+    "table_candidate_region",
+    "visual_candidate_region",
+    "diagram_region",
+    "protected_visual_region",
     "caption_region",
     "annotation_region",
     "toc_region",
@@ -169,8 +177,10 @@ def empty_input_data() -> dict:
         "relations": {},
 
         "page_intelligence": {},
+        "document_comprehension": {},
         "style_system": {},
         "semantic_system": {},
+        "indexes": {},
 
         "policies": {},
         "constraints": {},

@@ -3,7 +3,7 @@
 Vérifie sur une page synthétique legacy (pixels 150 DPI) que :
 - le contrat INPUT_DATA_V1_REQUIRED est respecté ;
 - les unités respectent UNIT_REQUIRED avec bbox canonique en points ;
-- les régions priment sur le texte (formula → exact_preserve/fixed_preserve) ;
+- les régions priment sur le texte (formula → protected_visual/background_only) ;
 - la validation passe ;
 - la compatibilité legacy est conservée.
 """
@@ -32,6 +32,7 @@ from pageprint.normalizer import (
     normalize_style,
     scale_from_dimensions,
 )
+from special_region_detector import _is_list_marker_text, _token_formula_compatible, _token_is_anchor
 
 # Page A4 rendue à 150 DPI : 1240 × 1754 px ≈ 595.2 × 841.92 pt.
 PAGE_DIMENSIONS = {"width": 1240, "height": 1754, "render_dpi": 150}
@@ -212,37 +213,221 @@ class TestUnits:
 
 
 class TestRegionsAndPolicies:
+    def test_page_region_detect_runs_mandatorily(self):
+        input_data = build()
+        detect = input_data["debug"]["page_region_detect"]
+
+        assert detect["schema_version"] == "pageprint.region_detect.v1"
+        assert "detectors" in detect
+        assert "region_detection_disabled" not in detect.get("warnings", [])
+
+    def test_page_region_detect_creates_protected_visual_without_preexisting_region(self):
+        page_structure = make_page_structure()
+        page_structure["special_regions"] = []
+
+        input_data = build_pageprint_input_data(
+            page_structure=page_structure,
+            source_context={
+                "document_id": "doc-test",
+                "source_path": "/tmp/doc.pdf",
+                "file_name": "doc.pdf",
+                "file_type": "pdf",
+                "page_count": 1,
+                "language": {"source_lang": "en", "target_lang": "fr"},
+            },
+            extraction_result={"pipeline": "legacy"},
+            page_index=0,
+        )
+
+        assert any(region["region_type"] == "protected_visual_region" for region in input_data["regions"])
+        formula_block = next(
+            unit for unit in input_data["units"]
+            if unit["level"] == "block" and (unit["content"]["text"] or "").startswith("E = mc")
+        )
+        assert formula_block["policy"]["translation_strategy"] == "background_only"
+
+    def test_special_class_only_region_is_normalized(self):
+        page_structure = make_page_structure()
+        page_structure["special_regions"] = [
+            {
+                "special_class": "formula",
+                "bbox": [400, 800, 700, 900],
+                "confidence": 0.91,
+            }
+        ]
+
+        input_data = build_pageprint_input_data(
+            page_structure=page_structure,
+            source_context={
+                "document_id": "doc-test",
+                "source_path": "/tmp/doc.pdf",
+                "file_name": "doc.pdf",
+                "file_type": "pdf",
+                "page_count": 1,
+                "language": {"source_lang": "en", "target_lang": "fr"},
+            },
+            extraction_result={"pipeline": "legacy"},
+            page_index=0,
+        )
+
+        protected = [region for region in input_data["regions"] if region["region_type"] == "protected_visual_region"]
+        assert protected
+        assert protected[0]["object_type"] == "formula"
+
+    def test_toc_page_assigns_toc_roles_and_preserves_page_references(self):
+        page_structure = make_page_structure()
+        page_structure.update({
+            "page_role": "toc",
+            "page_family": "toc",
+            "layout_type": "toc_page",
+            "document_type": "book_page",
+            "blocks": [
+                {
+                    "id": "toc_title",
+                    "bbox": [80, 40, 420, 90],
+                    "role": "body",
+                    "source_kind": "native",
+                    "lines": [
+                        {
+                            "id": "toc_title_l1",
+                            "bbox": [80, 40, 420, 90],
+                            "line_text": "CONTENTS",
+                            "phrases": [
+                                {
+                                    "id": "toc_title_p1",
+                                    "bbox": [80, 40, 420, 90],
+                                    "texte": "CONTENTS",
+                                    "spans": [{"id": "toc_title_s1", "bbox": [80, 40, 420, 90], "text": "CONTENTS"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "id": "toc_entry",
+                    "bbox": [80, 100, 600, 180],
+                    "role": "body",
+                    "source_kind": "native",
+                    "lines": [
+                        {
+                            "id": "toc_entry_l1",
+                            "bbox": [80, 100, 200, 130],
+                            "line_text": "3.1",
+                            "phrases": [
+                                {
+                                    "id": "toc_entry_p1",
+                                    "bbox": [80, 100, 200, 130],
+                                    "texte": "3.1",
+                                    "spans": [{"id": "toc_entry_s1", "bbox": [80, 100, 200, 130], "text": "3.1"}],
+                                }
+                            ],
+                        },
+                        {
+                            "id": "toc_entry_l2",
+                            "bbox": [210, 100, 540, 130],
+                            "line_text": "Image classification using MLP",
+                            "phrases": [
+                                {
+                                    "id": "toc_entry_p2",
+                                    "bbox": [210, 100, 540, 130],
+                                    "texte": "Image classification using MLP",
+                                    "spans": [{"id": "toc_entry_s2", "bbox": [210, 100, 540, 130], "text": "Image classification using MLP"}],
+                                }
+                            ],
+                        },
+                        {
+                            "id": "toc_entry_l3",
+                            "bbox": [550, 100, 600, 130],
+                            "line_text": "93",
+                            "phrases": [
+                                {
+                                    "id": "toc_entry_p3",
+                                    "bbox": [550, 100, 600, 130],
+                                    "texte": "93",
+                                    "spans": [{"id": "toc_entry_s3", "bbox": [550, 100, 600, 130], "text": "93"}],
+                                }
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
+
+        input_data = build_pageprint_input_data(
+            page_structure=page_structure,
+            source_context={
+                "document_id": "doc-test",
+                "source_path": "/tmp/doc.pdf",
+                "file_name": "doc.pdf",
+                "file_type": "pdf",
+                "page_count": 1,
+                "language": {"source_lang": "en", "target_lang": "fr"},
+            },
+            extraction_result={"pipeline": "legacy"},
+            page_index=0,
+        )
+
+        roles = {
+            unit["understanding"]["role"]
+            for unit in input_data["units"]
+            if unit["level"] in {"block", "line", "phrase", "span"}
+        }
+        assert "toc_title" in roles
+        assert "toc_entry" in roles
+
+        numeric_phrase = next(
+            unit for unit in input_data["units"]
+            if unit["level"] == "phrase" and (unit["content"]["text"] or "") == "3.1"
+        )
+        page_ref_phrase = next(
+            unit for unit in input_data["units"]
+            if unit["level"] == "phrase" and (unit["content"]["text"] or "") == "93"
+        )
+        assert numeric_phrase["policy"]["translatable"] is False
+        assert numeric_phrase["policy"]["translation_strategy"] == "exact_preserve"
+        assert page_ref_phrase["policy"]["translatable"] is False
+        assert page_ref_phrase["understanding"]["role"] == "toc_page_reference"
+
+    def test_toc_bullet_markers_are_not_formula_candidates(self):
+        assert _is_list_marker_text("■")
+        assert not _token_formula_compatible({"text": "■", "has_symbol": True, "has_math_font": False, "has_control": False})
+        assert not _token_is_anchor({"text": "■", "has_symbol": True, "has_math_font": False, "has_control": False})
+
     def test_formula_region_built(self):
         input_data = build()
-        formulas = [r for r in input_data["regions"] if r["region_type"] == "formula"]
+        formulas = [r for r in input_data["regions"] if r["region_type"] == "protected_visual_region"]
         assert len(formulas) == 1
         assert formulas[0]["bbox_unit"] == "pt"
         assert formulas[0]["policy"]["translatable"] is False
+        assert formulas[0]["policy"]["translation_strategy"] == "background_only"
+        assert formulas[0]["protected_visual"] is True
 
     def test_region_stronger_than_text(self):
-        """La région formule doit imposer exact_preserve/fixed_preserve au bloc inclus."""
+        """La région formule doit imposer protected_visual/background_only au bloc inclus."""
         input_data = build()
         formula_block = next(
             u for u in input_data["units"]
             if u["level"] == "block" and (u["content"]["text"] or "").startswith("E = mc")
         )
         memberships = formula_block["understanding"]["region_memberships"]
-        assert any(m["region_type"] == "formula" for m in memberships)
+        assert any(m["region_type"] == "protected_visual_region" for m in memberships)
         policy = formula_block["policy"]
         assert policy["translatable"] is False
-        assert policy["translation_strategy"] == "exact_preserve"
-        assert policy["render_policy"] == "fixed_preserve"
-        assert policy["policy_source"] == "region:formula"
+        assert policy["translation_strategy"] == "background_only"
+        assert policy["render_policy"] == "background_only"
+        assert policy["policy_source"] == "region:protected_visual_region"
+        assert policy["skip_translation"] is True
+        assert policy["skip_text_reconstruction"] is True
 
     def test_evidence_resolution_rule(self):
         input_data = build()
         formula_block = next(
             u for u in input_data["units"]
-            if (u.get("policy") or {}).get("policy_source") == "region:formula"
+            if (u.get("policy") or {}).get("policy_source") == "region:protected_visual_region"
             and u["level"] == "block"
         )
         evidence = formula_block["evidence"]
-        assert evidence["resolved_as"] == "formula"
+        assert evidence["resolved_as"] in {"formula", "protected_visual"}
         assert evidence["resolution_rule"] == "special_region_over_text_when_overlap_gt_0.65"
 
     def test_prose_block_keeps_legacy_contract(self):
@@ -266,7 +451,7 @@ class TestRegionsAndPolicies:
         assert set(exceptions) <= all_ids
         formula_block = next(
             u for u in input_data["units"]
-            if (u.get("policy") or {}).get("policy_source") == "region:formula"
+            if (u.get("policy") or {}).get("policy_source") == "region:protected_visual_region"
             and u["level"] == "block"
         )
         assert formula_block["unit_id"] in exceptions
@@ -287,7 +472,7 @@ class TestConstraintsAndViews:
         input_data = build()
         formula_block = next(
             u for u in input_data["units"]
-            if (u.get("policy") or {}).get("policy_source") == "region:formula"
+            if (u.get("policy") or {}).get("policy_source") == "region:protected_visual_region"
             and u["level"] == "block"
         )
         assert formula_block["constraints"]["preserve_bbox"] is True
@@ -305,12 +490,63 @@ class TestConstraintsAndViews:
         views = input_data["views"]
         assert views["flat_units"]
         assert views["hierarchical"]["roots"]
+        assert views["document_units"]
+        assert views["fine_tokens"]
+        assert views["auxiliary_units"]
         assert all(tu["text"] for tu in views["translation_units"])
+        document_levels = {
+            next(u for u in input_data["units"] if u["unit_id"] == uid)["level"]
+            for uid in views["document_units"]
+        }
+        auxiliary_levels = {
+            next(u for u in input_data["units"] if u["unit_id"] == uid)["level"]
+            for uid in views["auxiliary_units"]
+        }
+        assert "word" not in document_levels
+        assert "char" not in document_levels
+        assert auxiliary_levels <= {"word", "char"}
         formula_ids = {
             u["unit_id"] for u in input_data["units"]
             if (u.get("policy") or {}).get("translatable") is False
         }
         assert formula_ids.isdisjoint({tu["unit_id"] for tu in views["translation_units"]})
+        assert "span" not in {tu["level"] for tu in views["translation_units"]}
+        assert views["protected_visual_units"]
+        assert all(item["skip_text_reconstruction"] for item in views["protected_visual_units"])
+        assert views["translation_candidates_debug"]
+        assert any(
+            item["reason"] in {"protected_visual", "constraints_skip_translation", "background_only_render_policy"}
+            for item in views["translation_candidates_debug"]
+        )
+
+    def test_semantic_system_exports_semantic_phrases(self):
+        page_structure = make_page_structure()
+        page_structure["blocks"][0]["semantic_phrases"] = [
+            {
+                "unit_id": "sem_p1",
+                "text": "The model learns features from data.",
+                "source_unit_ids": ["b1l1p1"],
+                "bbox": [100, 100, 1100, 160],
+            }
+        ]
+        input_data = build_pageprint_input_data(
+            page_structure=page_structure,
+            source_context={
+                "document_id": "doc-test",
+                "source_path": "/tmp/doc.pdf",
+                "file_name": "doc.pdf",
+                "file_type": "pdf",
+                "page_count": 1,
+                "language": {"source_lang": "en", "target_lang": "fr"},
+            },
+            extraction_result={"pipeline": "legacy"},
+            page_index=0,
+        )
+        semantic_phrase = input_data["semantic_system"]["semantic_phrases"][0]
+        assert semantic_phrase["unit_id"] == "sem_p1"
+        assert semantic_phrase["source_unit_ids"] == ["p001_block_001_line_001_phrase_001"]
+        assert semantic_phrase["structural_context"]["block_unit_id"] == "p001_block_001"
+        assert input_data["indexes"]["legacy_id_to_unit_ids"]["b1l1p1"] == ["p001_block_001_line_001_phrase_001"]
 
 
 class TestQualityProvenanceCompatibility:
@@ -344,6 +580,12 @@ class TestQualityProvenanceCompatibility:
         assert ctx["source_lang"] == "en"
         assert ctx["target_lang"] == "fr"
         assert ctx["non_translatable_units"]
+        by_id = {u["unit_id"]: u for u in input_data["units"]}
+        assert all(
+            by_id[unit_id]["level"] not in {"word", "char"}
+            for unit_id in ctx["non_translatable_units"]
+        )
+        assert ctx["unit_scope"]["fine_tokens_policy"] == "available_for_alignment_audit_not_translation_units"
 
 
 class TestNormalizer:
@@ -461,10 +703,21 @@ class TestSizeOptimizations:
         assert input_data["constraints"]["unit_constraints_location"] == "units[].constraints"
         for unit in input_data["units"]:
             assert "allow_reflow" in unit["constraints"]
-        # graph : niveaux fins absents (dérivables des unités).
+        # graph : le moteur complet expose aussi les niveaux fins, mais les
+        # marque comme auxiliaires.
         node_types = {n["type"] for n in input_data["graph"]["nodes"]}
-        assert node_types.isdisjoint({"line", "phrase", "span"})
-        assert "block" in node_types
+        assert {"page", "block", "line", "phrase", "span", "word", "char"} <= node_types
+        aux_nodes = [n for n in input_data["graph"]["nodes"] if n["type"] in {"word", "char"}]
+        assert aux_nodes
+        assert all(n["view"] == "auxiliary_token" for n in aux_nodes)
+        comprehension = input_data["document_comprehension"]
+        assert comprehension["understanding_focus"] == "document_structure"
+        assert comprehension["coverage"]["has_auxiliary_word_units"] is True
+        assert comprehension["coverage"]["has_auxiliary_char_units"] is True
+        assert "word" not in comprehension["counts"]["by_level"]
+        assert "char" not in comprehension["counts"]["by_level"]
+        assert comprehension["counts"]["by_auxiliary_level"]["word"] > 0
+        assert comprehension["counts"]["by_auxiliary_level"]["char"] > 0
         # debug_units : unités notables uniquement, avec raison.
         debug = input_data["views"]["debug_units"]
         assert len(debug) < len(input_data["units"])
@@ -485,7 +738,7 @@ class TestBuilderAPI:
         input_data = PagePrintBuilder().build(page_structure={})
         report = input_data["debug"]["validation"]
         assert report["valid"], report["errors"]
-        assert input_data["units"] == []
+        assert [u["level"] for u in input_data["units"]] == ["page"]
 
 
 if __name__ == "__main__":

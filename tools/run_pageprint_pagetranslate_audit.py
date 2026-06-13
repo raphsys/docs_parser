@@ -118,6 +118,97 @@ def render_bboxes(input_data: dict, image_path: Path, out_path: Path) -> bool:
     return True
 
 
+def render_background(input_data: dict, image_path, out_path: Path) -> bool:
+    """Synthesise a 'background trame' by masking text regions on the page.
+
+    Gives a visual of the page without its text (text bboxes whited out). It is
+    a preview, not a true inpainted background.
+    """
+    if not image_path or not Path(image_path).is_file():
+        return False
+    geom = (input_data.get("page") or {}).get("geometry") or {}
+    sx, sy = _scale(geom)
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    for unit in input_data.get("units") or []:
+        if unit.get("level") not in {"line", "phrase", "word"}:
+            continue
+        if not str((unit.get("content") or {}).get("text") or "").strip():
+            continue
+        bbox = (unit.get("geometry") or {}).get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            continue
+        x0, y0, x1, y1 = bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy
+        draw.rectangle([x0 - 1, y0 - 1, x1 + 1, y1 + 1], fill=(255, 255, 255))
+    img.save(out_path)
+    return True
+
+
+def run_page(orchestrator, engine, pdf: Path, page: int, out_dir: Path, *,
+             source_lang: str = "en", target_lang: str = "fr") -> dict:
+    """Run PAGEPRINT + PAGETRANSLATE on one page; write artefacts; return metrics.
+
+    Artefacts in out_dir: input_data_<tag>.json, pagetranslate_result_<tag>.json,
+    extraction_vs_translation_<tag>.md, pageprint_bboxes_<tag>.png,
+    background_<tag>.png. Returns a metrics dict (or {'error':...}).
+    """
+    pdf = Path(pdf)
+    tag = f"{pdf.stem[:24]}_p{page:04d}"
+    started = time.perf_counter()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "source_pages").mkdir(exist_ok=True)
+    try:
+        doc_result = orchestrator.run(str(pdf), pages=str(page),
+                                      language={"source_lang": source_lang, "target_lang": target_lang})
+        page_entries = [p for p in (doc_result.get("pages") or []) if p.get("status") == "ok"]
+        if not page_entries:
+            return {"tag": tag, "pdf": pdf.name, "page": page, "error": "extraction_failed"}
+        input_data = page_entries[0]["input_data"]
+        trial = build_page_translation(input_data, translator=engine,
+                                       target_lang=target_lang, source_lang=source_lang, allow_fallback=True)
+    except Exception as exc:
+        return {"tag": tag, "pdf": pdf.name, "page": page, "error": f"{type(exc).__name__}: {exc}"}
+
+    (out_dir / f"input_data_{tag}.json").write_text(json.dumps(input_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    units = trial.get("translation_units") or []
+    result_compact = {
+        "pdf": pdf.name, "page": page,
+        "statuses": {k: trial.get(k) for k in ("pipeline_status", "translation_runtime_status", "linguistic_quality_status", "publication_readiness_status")},
+        "debug": trial.get("debug"),
+        "units": [{
+            "unit_id": u.get("unit_id"), "role": u.get("role") or (u.get("understanding") or {}).get("role"),
+            "strategy": u.get("strategy") or u.get("translation_strategy"),
+            "status": u.get("status"), "needs_review": (u.get("quality") or {}).get("needs_review"),
+            "source_text": u.get("source_text") or u.get("text"),
+            "translated_text": u.get("translated_text"),
+            "protected": u.get("protected") or [],
+        } for u in units],
+    }
+    (out_dir / f"pagetranslate_result_{tag}.json").write_text(json.dumps(result_compact, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_side_by_side(units, out_dir / f"extraction_vs_translation_{tag}.md", f"{pdf.name} p{page}")
+    img_path = (input_data.get("assets") or {}).get("source_image_path")
+    render_bboxes(input_data, Path(img_path) if img_path else None, out_dir / f"pageprint_bboxes_{tag}.png")
+    render_background(input_data, Path(img_path) if img_path else None, out_dir / f"background_{tag}.png")
+
+    metrics = page_audit(input_data, trial)
+    metrics.update({"tag": tag, "pdf": pdf.name, "page": page, "duration_s": round(time.perf_counter() - started, 1)})
+    return metrics
+
+
+def make_orchestrator(save_render_dir: str, *, enable_ocr: bool = False):
+    return PipelineOrchestrator(
+        enable_ocr=enable_ocr, enable_understanding=True,
+        enable_postprocessors=True, enable_special_regions=True,
+        save_render_dir=save_render_dir,
+    )
+
+
+def make_engine(engine: str = "ct2", *, inventory: str = "ai_models/translation/model_inventory.json",
+                model: str = "opus_mt_tc_big_en_fr", source_lang: str = "en", target_lang: str = "fr"):
+    return create_translation_engine(engine, inventory_path=inventory, model_name=model,
+                                     source_lang=source_lang, target_lang=target_lang)
+
+
 def page_audit(input_data: dict, trial: dict) -> dict:
     units = trial.get("translation_units") or []
     role_none = sum(1 for u in units if not (u.get("role") or u.get("understanding", {}).get("role")))
@@ -249,64 +340,20 @@ def main() -> int:
     (out / "source_pages").mkdir(exist_ok=True)
 
     picks = collect_pages(Path(args.pdf_dir), args.count, args.seed, args.min_pages)
-    orchestrator = PipelineOrchestrator(
-        enable_ocr=args.enable_ocr, enable_understanding=True,
-        enable_postprocessors=True, enable_special_regions=True,
-        save_render_dir=str(out / "source_pages"),
-    )
-    engine = create_translation_engine(
-        args.engine, inventory_path=args.inventory, model_name=args.model,
-        source_lang=args.source_lang, target_lang=args.target_lang,
-    )
+    orchestrator = make_orchestrator(str(out / "source_pages"), enable_ocr=args.enable_ocr)
+    engine = make_engine(args.engine, inventory=args.inventory, model=args.model,
+                         source_lang=args.source_lang, target_lang=args.target_lang)
 
     per_page = []
     for idx, (pdf, page) in enumerate(picks, 1):
-        tag = f"{pdf.stem[:24]}_p{page:04d}"
-        started = time.perf_counter()
-        try:
-            doc_result = orchestrator.run(str(pdf), pages=str(page),
-                                          language={"source_lang": args.source_lang, "target_lang": args.target_lang})
-            page_entries = [p for p in (doc_result.get("pages") or []) if p.get("status") == "ok"]
-            if not page_entries:
-                per_page.append({"tag": tag, "pdf": pdf.name, "page": page, "error": "extraction_failed"})
-                print(f"[{idx}/{len(picks)}] {tag}: extraction KO", flush=True)
-                continue
-            input_data = page_entries[0]["input_data"]
-            trial = build_page_translation(
-                input_data, translator=engine,
-                target_lang=args.target_lang, source_lang=args.source_lang,
-                allow_fallback=True,
-            )
-        except Exception as exc:
-            per_page.append({"tag": tag, "pdf": pdf.name, "page": page, "error": f"{type(exc).__name__}: {exc}"})
-            print(f"[{idx}/{len(picks)}] {tag}: ERROR {exc}", flush=True)
-            continue
-
-        (out / f"input_data_{tag}.json").write_text(json.dumps(input_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        units = trial.get("translation_units") or []
-        result_compact = {
-            "pdf": pdf.name, "page": page,
-            "statuses": {k: trial.get(k) for k in ("pipeline_status", "translation_runtime_status", "linguistic_quality_status", "publication_readiness_status")},
-            "debug": trial.get("debug"),
-            "units": [{
-                "unit_id": u.get("unit_id"), "role": u.get("role") or (u.get("understanding") or {}).get("role"),
-                "strategy": u.get("strategy") or u.get("translation_strategy"),
-                "status": u.get("status"), "needs_review": (u.get("quality") or {}).get("needs_review"),
-                "source_text": u.get("source_text") or u.get("text"),
-                "translated_text": u.get("translated_text"),
-                "protected": u.get("protected") or [],
-            } for u in units],
-        }
-        (out / f"pagetranslate_result_{tag}.json").write_text(json.dumps(result_compact, ensure_ascii=False, indent=2), encoding="utf-8")
-        write_side_by_side(units, out / f"extraction_vs_translation_{tag}.md", f"{pdf.name} p{page}")
-        img_path = (input_data.get("assets") or {}).get("source_image_path")
-        render_bboxes(input_data, Path(img_path) if img_path else None, out / f"pageprint_bboxes_{tag}.png")
-
-        metrics = page_audit(input_data, trial)
-        metrics.update({"tag": tag, "pdf": pdf.name, "page": page, "duration_s": round(time.perf_counter() - started, 1)})
+        metrics = run_page(orchestrator, engine, pdf, page, out,
+                           source_lang=args.source_lang, target_lang=args.target_lang)
         per_page.append(metrics)
-        print(f"[{idx}/{len(picks)}] {tag}: units={metrics['translation_unit_count']} role_none={metrics['role_none']} "
-              f"sem_empty={metrics['semantic_system_empty']} review={metrics['needs_review']} ({metrics['duration_s']}s)", flush=True)
+        if "error" in metrics:
+            print(f"[{idx}/{len(picks)}] {metrics['tag']}: ERROR {metrics['error']}", flush=True)
+        else:
+            print(f"[{idx}/{len(picks)}] {metrics['tag']}: units={metrics['translation_unit_count']} role_none={metrics['role_none']} "
+                  f"sem_empty={metrics['semantic_system_empty']} review={metrics['needs_review']} ({metrics['duration_s']}s)", flush=True)
 
     ok_pages = [p for p in per_page if "error" not in p]
     def s(key):

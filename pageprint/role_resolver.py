@@ -114,25 +114,37 @@ def resolve_roles(
 def infer_page_role(role_counts: dict | None, logical_structures: dict | None = None, *, current: str | None = None) -> str | None:
     """Promote a generic page_role to index/toc/table_page from dominant content.
 
-    Uses logical structures first (reliable), then resolved role counts.
-    Only overrides a generic page_role (None/unknown/body).
+    Logical structures are the reliable signal and take precedence over resolved
+    role counts: a ``table_dominant`` layout makes role_resolver tag almost every
+    line ``table_body_cell``, which would otherwise drown index/toc pages. So we
+    count *real* table cells from detected tables, not the role tally, and let
+    index/toc win over table when their logical structures are present.
+
+    Only overrides a generic page_role (None/unknown/body…).
     """
     current_l = str(current or "").lower()
     if current_l not in {"", "none", "unknown", "body", "body_text", "body_text_two_column"}:
         return current
-    rc = role_counts or {}
     ls = logical_structures or {}
-    index_n = max(len(ls.get("index_entries") or []), rc.get("index_entry", 0) + rc.get("index_head_term", 0))
-    toc_n = max(len(ls.get("toc_entries") or []), rc.get("toc_entry", 0) + rc.get("toc_entry_title", 0))
+    index_n = len(ls.get("index_entries") or [])
+    toc_n = len(ls.get("toc_entries") or [])
     table_cells = sum(len(t.get("cells") or []) for t in ls.get("tables") or [])
-    table_cells = max(table_cells, rc.get("table_body_cell", 0) + rc.get("table_header_cell", 0))
-    named = index_n + toc_n + table_cells + rc.get("body_paragraph", 0) + rc.get("list_item", 0)
-    named = named or 1
-    if index_n >= 10 and index_n / named > 0.4:
+    body_n = len(ls.get("body_paragraphs") or [])
+
+    # Fall back to resolved role counts only when no logical structure exists.
+    if not (index_n or toc_n or table_cells or body_n):
+        rc = role_counts or {}
+        index_n = rc.get("index_entry", 0) + rc.get("index_head_term", 0)
+        toc_n = rc.get("toc_entry", 0) + rc.get("toc_entry_title", 0)
+        table_cells = rc.get("table_body_cell", 0) + rc.get("table_header_cell", 0)
+        body_n = rc.get("body_paragraph", 0)
+
+    # Index and TOC dominate table when their structures are present.
+    if index_n >= 10 and index_n >= toc_n and index_n > table_cells:
         return "index"
-    if toc_n >= 10 and toc_n / named > 0.4:
+    if toc_n >= 10 and toc_n > index_n and toc_n > table_cells:
         return "toc"
-    if table_cells >= 10 and table_cells / named > 0.5:
+    if table_cells >= 10 and table_cells > index_n and table_cells > toc_n:
         return "table_page"
     return current
 

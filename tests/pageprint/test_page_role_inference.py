@@ -23,3 +23,20 @@ def test_does_not_override_explicit_role():
 
 def test_body_page_stays_body_without_dominance():
     assert infer_page_role({"body_paragraph": 12, "list_item": 3}, current="body") == "body"
+
+
+def test_index_page_not_misclassified_as_table_despite_polluted_role_counts():
+    # table_dominant layout inflates table_body_cell on an index page; the real
+    # signal is index_entries (logical structures), with only 1 real table cell.
+    logical = {
+        "index_entries": [{"head_term": f"t{i}"} for i in range(30)],
+        "toc_entries": [{"title_text": f"e{i}"} for i in range(29)],
+        "tables": [{"cells": [{"text": "x"}]}],
+    }
+    role_counts = {"table_body_cell": 690, "index_entry": 89}
+    assert infer_page_role(role_counts, logical, current="body") == "index"
+
+
+def test_real_table_page_stays_table_page():
+    logical = {"tables": [{"cells": [{"text": "c"} for _ in range(50)]}], "index_entries": [], "toc_entries": []}
+    assert infer_page_role({"table_body_cell": 62}, logical, current="body") == "table_page"

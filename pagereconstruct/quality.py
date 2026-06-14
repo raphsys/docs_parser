@@ -17,7 +17,8 @@ def assess(plan: dict) -> dict:
     def count(*types):
         return sum(1 for f in findings if f.get("type") in types)
 
-    bg = (plan.get("background") or [{}])[0]
+    bg_list = (plan.get("layers") or {}).get("background") or plan.get("background") or [{}]
+    bg = bg_list[0] if bg_list else {}
     styled = sum(1 for t in tt if (t.get("style") or {}).get("font_size_pt"))
     return {
         "text_units": len(tt),

@@ -418,7 +418,8 @@ class PageTranslationBuilder:
         protected_mismatch = int(quality.get("protected_token_mismatch_count") or 0)
         terminology_warning = int(quality.get("terminology_warning_count") or 0)
         empty = int(quality.get("empty_count") or 0)
-        if protected_mismatch or number_mismatch or empty:
+        truncated = bool(quality.get("translation_truncated"))
+        if protected_mismatch or number_mismatch or empty or truncated:
             status = "ko"
         elif needs_review or terminology_warning:
             status = "review"
@@ -426,6 +427,8 @@ class PageTranslationBuilder:
             status = "ok"
         return {
             "status": status,
+            "translation_coverage_ratio": quality.get("translation_coverage_ratio"),
+            "translation_truncated": truncated,
             "needs_review_count": needs_review,
             "protected_token_mismatch_count": protected_mismatch,
             "number_mismatch_count": number_mismatch,
@@ -436,7 +439,7 @@ class PageTranslationBuilder:
 
     def _publication_readiness_status(self, quality: dict, translated_units: list[dict]) -> dict:
         overflow = sum(1 for unit in translated_units if (unit.get("quality") or {}).get("wysiwyg_overflow_risk") == "high")
-        if overflow:
+        if overflow or quality.get("translation_truncated"):
             status = "ko"
         elif int(quality.get("needs_review_count") or 0):
             status = "review"

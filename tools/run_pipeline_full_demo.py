@@ -101,14 +101,24 @@ def process(orchestrator, engine, pdf: Path, page: int, out: Path, source_lang: 
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     (out / f"pagereconstruct_plan_{tag}.json").write_text(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
+    plan_dict = plan.to_dict()
     img_path = (input_data.get("assets") or {}).get("source_image_path")
     if img_path and Path(img_path).is_file():
         Image.open(img_path).convert("RGB").save(out / f"source_{tag}.png")
         render_plan_overlay(input_data, plan, img_path, out / f"pagereconstruct_overlay_{tag}.png")
         from pagereconstruct.render_backend import reconstruct_to_png
-        reconstruct_to_png(plan.to_dict(), str(out / f"source_{tag}.png"), str(out / f"reconstructed_{tag}.png"))
+        reconstruct_to_png(plan_dict, str(out / f"source_{tag}.png"), str(out / f"reconstructed_{tag}.png"))
+    # Vector PDF output + validator audit.
+    from pagereconstruct import validate
+    from pagereconstruct.backends import pdf_vector
+    if pdf_vector.is_available():
+        pdf_vector.render(plan_dict, str(out / f"reconstructed_{tag}.pdf"))
+    audit = validate(plan_dict)
+    (out / f"audit_{tag}.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     summary = plan.summary()
     summary["tag"] = tag
+    summary["status"] = audit["status"]
+    summary["quality"] = audit["quality"]
     print(f"{tag}: translated={summary['translated_text_count']} protected={summary['protected_region_count']} "
           f"preserved={summary['preserved_overlay_count']+summary['preserved_underlay_count']} findings={summary['finding_count']}", flush=True)
     return summary

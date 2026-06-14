@@ -145,8 +145,19 @@ def assess_translation_quality(translated_units: list[dict]) -> dict:
         for u in translated_units
         if (u.get("quality") or {}).get("word_expansion_ratio") is not None
     ]
+    # Translation coverage: are translatable units actually translated (not truncated)?
+    src_chars = sum(len(str(u.get("source_text") or "")) for u in translated_units
+                    if u.get("status") in {"translated", "preserved", "unchanged_suspect"})
+    tr_chars = sum(len(str(u.get("translated_text") or "")) for u in translated_units
+                   if u.get("status") in {"translated", "preserved", "unchanged_suspect"})
+    coverage_ratio = round(tr_chars / src_chars, 3) if src_chars else 1.0
+    truncated = bool(src_chars > 300 and coverage_ratio < 0.85)
     return {
         "unit_count": total,
+        "source_chars": src_chars,
+        "translated_chars": tr_chars,
+        "translation_coverage_ratio": coverage_ratio,
+        "translation_truncated": truncated,
         "translated_count": sum(1 for u in translated_units if u.get("status") == "translated"),
         "preserved_count": sum(1 for u in translated_units if u.get("status") == "preserved"),
         "unchanged_suspect_count": sum(1 for u in translated_units if u.get("status") == "unchanged_suspect"),

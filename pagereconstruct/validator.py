@@ -13,6 +13,10 @@ from .quality import assess
 
 def validate(plan: dict) -> dict:
     q = assess(plan)
+    rp = plan.get("render_policy") or {}
+    if rp.get("publication_blocked"):
+        return {"status": "ko", "quality": q,
+                "findings": [{"type": "publication_blocked", "severity": "ko"}]}
     findings: list = []
     status = "ok"
 

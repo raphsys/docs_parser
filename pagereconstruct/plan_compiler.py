@@ -91,7 +91,7 @@ def _descendants(uid: str, children_map: dict) -> set:
     return out
 
 
-def compile_page_render_plan(translated_input_data: dict) -> PageRenderPlan:
+def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode: str = "debug") -> PageRenderPlan:
     normalized = PageReconstructInputAdapter().normalize(translated_input_data)
 
     units = normalized["units"]
@@ -211,12 +211,33 @@ def compile_page_render_plan(translated_input_data: dict) -> PageRenderPlan:
     background = resolve_background(normalized)
     findings.extend(background.get("findings") or [])
 
+    # Publication gate: incomplete/ko translations cannot be reconstructed as
+    # publication-ready (directive PR-Lot 1).
+    tr = normalized.get("translation_result") or {}
+    ling = tr.get("linguistic_quality_status")
+    coverage = (((tr.get("linguistic_quality_validation") or {}).get("translation_coverage_ratio"))
+                or (tr.get("quality") or {}).get("translation_coverage_ratio"))
+    publication_blocked = False
+    if reconstruction_mode == "publication":
+        reasons = []
+        if ling and ling != "ok":
+            reasons.append(f"linguistic_quality_status={ling}")
+        if coverage is not None and coverage < 0.98:
+            reasons.append(f"translation_coverage_ratio={coverage}")
+        if reasons:
+            publication_blocked = True
+            findings.append({"type": "publication_blocked", "severity": "ko", "reasons": reasons})
+    render_policy = dict(DEFAULT_RENDER_POLICY)
+    render_policy.update({"reconstruction_mode": reconstruction_mode,
+                          "publication_blocked": publication_blocked,
+                          "translation_coverage_ratio": coverage})
+
     return PageRenderPlan(
         page=page, translated_text=translated_text, background=[background],
         preserved_underlays=underlays, preserved_overlays=overlays, patches=patches,
         protected_regions=protected_index.regions,
         consumed_source_unit_ids=sorted(consumed), excluded_source_unit_ids=sorted(excluded),
-        render_policy=dict(DEFAULT_RENDER_POLICY), quality_expectations=dict(DEFAULT_QUALITY_EXPECTATIONS),
+        render_policy=render_policy, quality_expectations=dict(DEFAULT_QUALITY_EXPECTATIONS),
         findings=findings,
     )
 

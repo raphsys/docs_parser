@@ -25,6 +25,7 @@ from .schema import PAGETRANSLATE_SCHEMA_VERSION, PRIMARY_TEXT_LEVELS, SOURCE_SC
 from .selector import select_translation_units
 from .sentence_boundary import annotate_sentence_boundaries
 from .terminology import apply_post_translation_glossary, explicit_protected_terms
+from .technical_protection import is_technical_role, technical_tokens
 from .translation_plan_reader import read_translation_plan
 from .translator_bridge import TranslatorBridge
 from translation_engines.placeholder_policy import choose_placeholder_style
@@ -312,6 +313,9 @@ class PageTranslationBuilder:
             *explicit_protected_terms(translation_profile),
             *(item.get("protected") or []),
         ]
+        # Protect technical tokens (None/Conv2D/shapes/SQL/paths) in code/table cells.
+        if is_technical_role(item.get("role"), item.get("object_type")):
+            explicit_tokens.extend(technical_tokens(source_text))
         engine = self.bridge._translator()
         placeholder_style = choose_placeholder_style(engine_name=getattr(engine, "profile", None))
         protected_text, protections = protect_text(

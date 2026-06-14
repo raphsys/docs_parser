@@ -131,4 +131,12 @@ def _has_textual_child(text_units: list[dict]) -> dict[str, bool]:
 
 def _looks_like_toc_row(text: str) -> bool:
     parsed = parse_toc_row(text)
-    return bool(parsed.get("page_reference") and parsed.get("title_text"))
+    if not (parsed.get("page_reference") and parsed.get("title_text")):
+        return False
+    # Require a TOC-specific signal so index entries ("term, 27,") are not
+    # mistaken for TOC rows (directive PR-Lot 2).
+    if re.search(r"\.{2,}", text) or re.search(r"\s{2,}\S*\d", text):
+        return True
+    if re.match(r"^\s*\d+(?:\.\d+)*\s+\S", text):  # leading section number
+        return True
+    return False

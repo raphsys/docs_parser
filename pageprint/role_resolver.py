@@ -202,7 +202,9 @@ def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: 
         return "formula_expression", "resolved_formula_evidence", 0.78
     if resolved_object in {"code_line", "code"}:
         return "code_line", "resolved_code_evidence", 0.78
-    if level == "cell" or layout_type == "table_dominant":
+    # Only a real cell is a table cell. A table_dominant layout must NOT turn all
+    # editorial text into cells without grid evidence (directive PR-Lot 2).
+    if level == "cell":
         return "table_body_cell", "table_context", 0.72
     if level in {"block", "line", "phrase", "span"}:
         heading = _looks_like_heading(unit, text)

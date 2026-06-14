@@ -8,6 +8,7 @@ parent/child double rendering (directive §5, §6, §17.1).
 
 from __future__ import annotations
 
+from .background_resolver import resolve_background
 from .input_adapter import PageReconstructInputAdapter
 from .layout_box_resolver import resolve_layout
 from .patch_planner import plan_patches
@@ -207,8 +208,11 @@ def compile_page_render_plan(translated_input_data: dict) -> PageRenderPlan:
     patches, patch_findings = plan_patches(translated_text, protected_index)
     findings.extend(patch_findings)
 
+    background = resolve_background(normalized)
+    findings.extend(background.get("findings") or [])
+
     return PageRenderPlan(
-        page=page, translated_text=translated_text,
+        page=page, translated_text=translated_text, background=[background],
         preserved_underlays=underlays, preserved_overlays=overlays, patches=patches,
         protected_regions=protected_index.regions,
         consumed_source_unit_ids=sorted(consumed), excluded_source_unit_ids=sorted(excluded),

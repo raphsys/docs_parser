@@ -29,7 +29,8 @@ def plan_patches(translated_units, protected_index) -> tuple[list, list]:
             continue
         overlap = protected_index.overlap_ratio(bbox) if protected_index else 0.0
         bg = (t.style or {}).get("background_color")
-        method = "sampled_color_patch" if bg else "sampled_whiteout"
+        # Default to sampled color (backend samples at render); never a fixed white.
+        method = "sampled_color_patch"
         if overlap > 0.05:
             findings.append({"type": "patch_protected_overlap", "unit_id": t.id,
                              "overlap_ratio": round(overlap, 3), "severity": "review"})

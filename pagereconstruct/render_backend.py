@@ -40,6 +40,23 @@ def _hex_rgb(value, default=(20, 20, 20)):
     return default
 
 
+def _sample_bg_color(img, b, pad: int = 3):
+    """Median colour of the ring just outside the bbox = local background."""
+    W, H = img.size
+    x0, y0, x1, y1 = (int(v) for v in b)
+    pts = []
+    for rx0, ry0, rx1, ry1 in ((x0, y0 - pad, x1, y0), (x0, y1, x1, y1 + pad),
+                               (x0 - pad, y0, x0, y1), (x1, y0, x1 + pad, y1)):
+        rx0, ry0 = max(0, rx0), max(0, ry0)
+        rx1, ry1 = min(W, rx1), min(H, ry1)
+        if rx1 > rx0 and ry1 > ry0:
+            pts.extend(img.crop((rx0, ry0, rx1, ry1)).getdata())
+    if not pts:
+        return (255, 255, 255)
+    m = len(pts) // 2
+    return (sorted(p[0] for p in pts)[m], sorted(p[1] for p in pts)[m], sorted(p[2] for p in pts)[m])
+
+
 def _scale(page: dict):
     w_pt, h_pt = page.get("width_pt"), page.get("height_pt")
     rw, rh = page.get("render_width_px"), page.get("render_height_px")
@@ -92,8 +109,10 @@ def render_reconstructed_page(plan: dict, source_image_path: str) -> Image.Image
         b = p.get("bbox")
         if not (isinstance(b, (list, tuple)) and len(b) == 4):
             continue
-        color = _hex_rgb(p.get("background_color"), (255, 255, 255))
-        draw.rectangle([b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy], fill=color)
+        px = [b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy]
+        # Sampled background colour (never a fixed white on a coloured page).
+        color = _hex_rgb(p["background_color"]) if p.get("background_color") else _sample_bg_color(img, px)
+        draw.rectangle(px, fill=color)
 
     # 2. Draw translated text with the resolved style.
     for t in layers.get("translated_text") or []:

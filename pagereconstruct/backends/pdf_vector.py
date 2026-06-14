@@ -51,14 +51,14 @@ def render(plan: dict, output_path: str) -> dict:
     doc = fitz.open()
     pg = doc.new_page(width=w, height=h)
 
-    bg = (plan.get("background") or [{}])[0]
+    layers = plan.get("layers") or {}
+    bg = (layers.get("background") or plan.get("background") or [{}])[0]
     if bg.get("path"):
         try:
             pg.insert_image(pg.rect, filename=bg["path"])
         except Exception:
             findings.append({"type": "background_insert_failed"})
 
-    layers = plan.get("layers") or {}
     for p in layers.get("patches") or []:
         b = p.get("bbox")
         if not (isinstance(b, (list, tuple)) and len(b) == 4):
@@ -68,23 +68,24 @@ def render(plan: dict, output_path: str) -> dict:
         color = _rgb(p.get("background_color")) if p.get("background_color") else (1, 1, 1)
         pg.draw_rect(fitz.Rect(*b), color=None, fill=color)
 
+    # Same layout engine as the raster backend: dispatch -> measure (in pt space)
+    # -> insert each measured line, so PNG and PDF stay consistent.
+    from ..renderer_dispatcher import dispatch
     for t in layers.get("translated_text") or []:
-        text = (t.get("translated_text") or "").strip()
-        b = t.get("layout_bbox") or t.get("coverage_bbox") or t.get("bbox")
-        if not text or not (isinstance(b, (list, tuple)) and len(b) == 4):
+        renderer = dispatch(t.get("renderer"), t.get("role"))
+        rr = renderer.measure(t, 1.0, 1.0, page_w_px=w)
+        lay = getattr(rr, "_lay", None)
+        findings.extend(rr.findings)
+        if lay is None or not lay.get("lines"):
             continue
         style = t.get("style") or {}
-        size = float(style.get("font_size_pt") or 10.0)
-        rc = doc  # keep ref
-        try:
-            leftover = pg.insert_textbox(
-                fitz.Rect(*b), text, fontname=_fontname(style), fontsize=size,
-                color=_rgb(style.get("color")), align=_ALIGN.get(style.get("alignment", "left"), 0),
-            )
-            if leftover < 0:
-                findings.append({"type": "overflow_unresolved", "unit_id": t.get("id"), "severity": "review"})
-        except Exception as exc:
-            findings.append({"type": "text_render_failed", "unit_id": t.get("id"), "message": str(exc)})
+        size = float(lay.get("size") or style.get("font_size_pt") or 10.0)
+        fname, color = _fontname(style), _rgb(style.get("color"))
+        for ln, box in zip(lay["lines"], lay["line_boxes"]):
+            try:
+                pg.insert_text((box[0], box[1] + size), ln, fontname=fname, fontsize=size, color=color)
+            except Exception as exc:
+                findings.append({"type": "text_render_failed", "unit_id": t.get("id"), "message": str(exc)})
 
     doc.save(output_path)
     doc.close()

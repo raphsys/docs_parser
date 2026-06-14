@@ -12,6 +12,11 @@ from .schema import ProtectedRegion
 # object_type / reason that mark a hard visual protection
 _PROTECTED_OBJECTS = {"formula", "formula_expression", "equation", "image", "figure",
                       "code", "code_block", "table_grid", "logo", "watermark", "publisher_mark", "diagram"}
+# Confirmed visual objects (regions). Formula/code "candidate" regions are
+# observations only and must NOT hard-protect (they over-fire on citations and
+# single glyphs); real formulas are protected via unit roles below.
+_CONFIRMED_REGION_OBJECTS = {"image", "figure", "picture", "logo", "watermark",
+                             "table_grid", "diagram", "chart"}
 
 
 def _valid_bbox(b) -> bool:
@@ -80,6 +85,10 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
     for e in exclusion_plan or []:
         add("exclusion_plan", e.get("reason") or "excluded", e.get("bbox"))
     for u in (units or {}).values() if isinstance(units, dict) else (units or []):
+        # Sub-line fragments do not hard-protect: their block/line parent does,
+        # and protecting every span/word/char floods false collisions.
+        if u.get("level") in {"span", "word", "char"}:
+            continue
         policy = u.get("policy") or {}
         bbox = (u.get("geometry") or {}).get("bbox")
         role = (u.get("understanding") or {}).get("role")
@@ -90,7 +99,11 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
                 or str(ot or "").lower() in _PROTECTED_OBJECTS:
             add("unit_policy", role or ot or policy.get("render_policy"), bbox)
     for r in regions or []:
-        ot = str(r.get("object_type") or r.get("region_type") or "").lower()
-        if any(k in ot for k in _PROTECTED_OBJECTS):
+        rtype = str(r.get("region_type") or "").lower()
+        # Candidate / observation-only regions are not hard protections.
+        if "candidate" in rtype or r.get("observation_only") or r.get("policy_pending"):
+            continue
+        ot = str(r.get("object_type") or rtype).lower()
+        if any(k in ot for k in _CONFIRMED_REGION_OBJECTS):
             add("region", r.get("object_type") or r.get("region_type"), r.get("bbox"))
     return ProtectedRegionIndex(out)

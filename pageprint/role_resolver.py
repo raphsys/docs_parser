@@ -198,7 +198,7 @@ def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: 
         return "path", "path_pattern", 0.92
     if COMMAND_RE.match(text):
         return "command_name" if len(text.split()) == 1 else "code_line", "command_pattern", 0.86
-    if resolved_object == "formula_expression":
+    if resolved_object == "formula_expression" and _has_math_evidence(text):
         return "formula_expression", "resolved_formula_evidence", 0.78
     if resolved_object in {"code_line", "code"}:
         return "code_line", "resolved_code_evidence", 0.78
@@ -216,6 +216,18 @@ def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: 
 
 
 _HEADING_NUM_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+\S")
+_MATH_RE = re.compile(r"[=≈≠≤≥±×÷∑∫√∞∂∆∇∏λµπσαβγθΩ]|[A-Za-z0-9)]\s*[=+\-*/^]\s*[A-Za-z0-9(]")
+
+
+def _has_math_evidence(text: str) -> bool:
+    """Real formula needs math symbols/operators, not just citation glyphs/prose."""
+    s = str(text or "")
+    if not _MATH_RE.search(s):
+        return False
+    # Prose with many words and no dense math is not a formula.
+    words = re.findall(r"[A-Za-z]{3,}", s)
+    operators = len(re.findall(r"[=+\-*/^≈≠≤≥±×÷∑∫√]", s))
+    return not (len(words) >= 6 and operators < 2)
 
 
 def _looks_like_heading(unit: dict, text: str) -> str | None:

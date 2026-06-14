@@ -59,6 +59,25 @@ class PreservationOp:
 
 
 @dataclass
+class RenderResult:
+    unit_id: str
+    renderer: str
+    status: str = "ok"            # ok | review | ko
+    planned_bbox: list | None = None
+    actual_text_bbox: list | None = None
+    actual_line_boxes: list = field(default_factory=list)
+    line_count: int = 0
+    font_used: str | None = None
+    font_size_used: float | None = None
+    overflow: bool = False
+    clipping: bool = False
+    findings: list = field(default_factory=list)
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+
+@dataclass
 class Finding:
     severity: str
     code: str

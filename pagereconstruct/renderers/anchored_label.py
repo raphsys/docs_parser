@@ -1,4 +1,4 @@
-from .base import BaseRenderer, draw_block
+from .base import BaseRenderer
 
 
 class AnchoredLabelRenderer(BaseRenderer):
@@ -6,9 +6,8 @@ class AnchoredLabelRenderer(BaseRenderer):
 
     renderer_name = "anchored_label"
 
-    def draw(self, draw, unit, px, style, page_w_px=None) -> list:
-        return draw_block(draw, unit.get("translated_text") or "", px, style,
-                          align=style.get("alignment") or "left", min_ratio=0.70, allow_lines=2)
+    def layout_opts(self, style, page_w_px=None) -> dict:
+        return {"align": style.get("alignment") or "left", "min_ratio": 0.70, "allow_lines": 2}
 
 
 class AnchoredLabelReviewRenderer(AnchoredLabelRenderer):
@@ -16,7 +15,8 @@ class AnchoredLabelReviewRenderer(AnchoredLabelRenderer):
 
     renderer_name = "anchored_label_review"
 
-    def draw(self, draw, unit, px, style, page_w_px=None) -> list:
-        findings = super().draw(draw, unit, px, style, page_w_px)
-        findings.append({"type": "unknown_role_review", "role": unit.get("role"), "severity": "review"})
-        return findings
+    def measure(self, unit, sx, sy, page_w_px=None):
+        rr = super().measure(unit, sx, sy, page_w_px)
+        rr.status = "review"
+        rr.findings.append({"type": "unknown_role_review", "role": unit.get("role")})
+        return rr

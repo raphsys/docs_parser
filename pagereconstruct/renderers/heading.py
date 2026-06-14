@@ -1,4 +1,4 @@
-from .base import BaseRenderer, draw_block
+from .base import BaseRenderer
 
 
 class HeadingRenderer(BaseRenderer):
@@ -6,10 +6,6 @@ class HeadingRenderer(BaseRenderer):
 
     renderer_name = "heading"
 
-    def draw(self, draw, unit, px, style, page_w_px=None) -> list:
-        # Allow the heading to use up to ~90% of the page width so it does not
-        # stack one word per line in a narrow source box.
-        expand = (page_w_px * 0.92) if page_w_px else None
-        return draw_block(draw, unit.get("translated_text") or "", px, style,
-                          align=style.get("alignment") or "left",
-                          min_ratio=0.90, allow_lines=2, expand_width_to=expand)
+    def layout_opts(self, style, page_w_px=None) -> dict:
+        return {"align": style.get("alignment") or "left", "min_ratio": 0.90,
+                "allow_lines": 2, "expand_width_to": (page_w_px * 0.92) if page_w_px else None}

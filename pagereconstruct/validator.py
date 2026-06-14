@@ -16,7 +16,8 @@ def validate(plan: dict) -> dict:
     rp = plan.get("render_policy") or {}
     if rp.get("publication_blocked"):
         return {"status": "ko", "quality": q,
-                "findings": [{"type": "publication_blocked", "severity": "ko"}]}
+                "findings": [{"type": "publication_blocked", "severity": "ko"}],
+                "publication_ready": False, "publication_ready_score": 0.0, "visual_scores": {}}
     findings: list = []
     status = "ok"
 

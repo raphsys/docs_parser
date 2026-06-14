@@ -15,7 +15,8 @@ def build_body_paragraphs(units: list[dict], *, page_intelligence: dict | None =
         if unit.get("level") not in {"line", "phrase"}:
             continue
         role = role_of(unit)
-        if role not in {"body_paragraph", "paragraph", "body", "title", "section_heading"}:
+        # Headings/titles must not be absorbed into body paragraphs (directive 18.3).
+        if role not in {"body_paragraph", "paragraph", "body"}:
             continue
         parent_id = _block_parent(unit)
         by_parent.setdefault(parent_id or "__page__", []).append(unit)

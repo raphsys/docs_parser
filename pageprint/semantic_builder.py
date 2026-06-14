@@ -144,6 +144,18 @@ def _build_translation_segments_from_logical_structures(logical_structures: dict
             bbox=entry.get("bbox"),
         )
 
+    for heading in logical_structures.get("headings") or []:
+        add_segment(
+            logical_unit_id=heading.get("logical_unit_id"),
+            source_unit_ids=heading.get("source_unit_ids"),
+            source_text=heading.get("text"),
+            role=heading.get("role") or "section_heading",
+            object_type="natural_text",
+            semantic_kind="heading",
+            bbox=heading.get("bbox"),
+            translation_strategy="layout_constrained",
+        )
+
     for paragraph in logical_structures.get("body_paragraphs") or []:
         add_segment(
             logical_unit_id=paragraph.get("logical_unit_id"),

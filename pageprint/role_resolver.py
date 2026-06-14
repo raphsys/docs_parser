@@ -205,8 +205,36 @@ def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: 
     if level == "cell" or layout_type == "table_dominant":
         return "table_body_cell", "table_context", 0.72
     if level in {"block", "line", "phrase", "span"}:
-        return "body_paragraph" if len(text.split()) >= 4 else "title", "textual_default", 0.68
+        heading = _looks_like_heading(unit, text)
+        if heading:
+            return heading, "heading_style_evidence", 0.74
+        # A short line without heading evidence is a paragraph fragment, not a title.
+        return "body_paragraph", "textual_default", 0.68
     return "unknown", "no_role_rule_matched", 0.35
+
+
+_HEADING_NUM_RE = re.compile(r"^\s*\d+(?:\.\d+)*\.?\s+\S")
+
+
+def _looks_like_heading(unit: dict, text: str) -> str | None:
+    """A heading needs evidence (style/number/caps), not just a short length."""
+    words = text.split()
+    if not (1 <= len(words) <= 9):
+        return None
+    if text.rstrip()[-1:] in {".", ",", ";", ":", "?", "!"} and not _HEADING_NUM_RE.match(text):
+        return None
+    style = (unit.get("visual") or {}).get("style") or {}
+    flags = style.get("flags") or {}
+    size = style.get("font_size_pt")
+    bold = bool(flags.get("bold"))
+    upper = bool(flags.get("uppercase")) or (text.isupper() and len(text) > 3)
+    numbered = bool(_HEADING_NUM_RE.match(text))
+    larger = bool(size and size >= 12.0)
+    if numbered:
+        return "section_heading"
+    if bold or upper or larger:
+        return "section_heading" if len(words) <= 9 else "title"
+    return None
 
 
 def _normalize_legacy_role(role: str, text: str, page_role: str) -> str:

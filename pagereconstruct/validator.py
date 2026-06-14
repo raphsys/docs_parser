@@ -42,4 +42,22 @@ def validate(plan: dict) -> dict:
                 findings.append({"type": "source_text_leak_risk_high", "severity": "review"})
             status = "review"
 
-    return {"status": status, "quality": q, "findings": findings}
+    # Visual QA: scores + strict publication_ready gate.
+    from .visual_qa import assess as visual_assess
+    vqa = visual_assess(plan)
+    scores = vqa["scores"]
+    if vqa["collision_status"] == "ko":
+        status = "ko"
+    findings.extend(vqa["findings"])
+    publication_ready = (
+        status == "ok"
+        and scores["text_presence"] >= 1.0
+        and scores["overlap"] >= 0.99
+        and scores["typography"] >= 0.95
+        and scores["position"] >= 0.95
+        and q["source_text_leak_risk"] != "high"
+        and vqa["publication_ready_score"] >= 0.95
+    )
+    return {"status": status, "quality": q, "findings": findings,
+            "visual_scores": scores, "publication_ready_score": vqa["publication_ready_score"],
+            "publication_ready": publication_ready}

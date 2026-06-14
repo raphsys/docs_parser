@@ -6,9 +6,11 @@ from __future__ import annotations
 from .renderers import (
     AnchoredLabelRenderer,
     AnchoredLabelReviewRenderer,
+    BibliographyRenderer,
     CodeRenderer,
     FormulaRenderer,
     HeadingRenderer,
+    IndexRenderer,
     ListItemRenderer,
     ParagraphRenderer,
     PreservationRenderer,
@@ -24,12 +26,14 @@ _FORMULA = FormulaRenderer()
 _ANCHORED = AnchoredLabelRenderer()
 _REVIEW = AnchoredLabelReviewRenderer()
 _PRESERVE = PreservationRenderer()
+_INDEX = IndexRenderer()
+_BIBLIO = BibliographyRenderer()
 
 _BY_RENDERER = {
     "paragraph": _PARAGRAPH, "list_item": _LIST, "caption": _PARAGRAPH,
     "heading": _HEADING, "table": _TABLE, "code": _CODE, "formula": _FORMULA,
     "anchored_label": _ANCHORED, "anchored_label_review": _REVIEW,
-    "preservation": _PRESERVE,
+    "preservation": _PRESERVE, "index": _INDEX, "bibliography": _BIBLIO,
 }
 
 _BY_ROLE = {
@@ -42,7 +46,10 @@ _BY_ROLE = {
     "table_body_cell": _TABLE, "table_header_cell": _TABLE, "table_numeric_cell": _TABLE,
     "code_line": _CODE, "code_block": _CODE, "command_name": _CODE,
     "formula_expression": _FORMULA,
-    "toc_entry_title": _ANCHORED, "index_head_term": _ANCHORED,
+    "toc_entry_title": _ANCHORED,
+    "index_entry": _INDEX, "index_head_term": _INDEX, "index_subentry": _INDEX,
+    "index_page_reference": _INDEX,
+    "bibliography_entry": _BIBLIO,
     "diagram_label": _ANCHORED, "diagram_text_label": _ANCHORED,
     "axis_label": _ANCHORED, "legend_label": _ANCHORED,
     "publisher_mark": _PRESERVE, "page_number": _PRESERVE, "watermark": _PRESERVE,

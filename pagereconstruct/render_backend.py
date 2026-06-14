@@ -114,32 +114,13 @@ def render_reconstructed_page(plan: dict, source_image_path: str) -> Image.Image
         color = _hex_rgb(p["background_color"]) if p.get("background_color") else _sample_bg_color(img, px)
         draw.rectangle(px, fill=color)
 
-    # 2. Draw translated text with the resolved style.
+    # 2. Draw translated text via the role-specific renderer (dispatcher).
+    from .renderer_dispatcher import dispatch
     for t in layers.get("translated_text") or []:
-        text = (t.get("translated_text") or "").strip()
-        bbox = t.get("layout_bbox") or t.get("coverage_bbox") or t.get("bbox")
-        if not text or not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+        if not (t.get("translated_text") or "").strip() and t.get("renderer") not in {"code", "formula"}:
             continue
-        style = t.get("style") or {}
-        x0, y0, x1, y1 = bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy
-        w, h = max(4, x1 - x0), max(4, y1 - y0)
-        font_path = _font_path(style)
-        size_px = (style.get("font_size_pt") or 10.0) * sy
-        min_px = max(6, int(size_px * 0.86))
-        font, lines, lh = _fit(draw, text, w, h, font_path, size_px, min_px)
-        color = _hex_rgb(style.get("color"))
-        align = style.get("alignment") or "left"
-        y = y0
-        for ln in lines:
-            tw = draw.textlength(ln, font=font)
-            if align == "center":
-                x = x0 + max(0, (w - tw) / 2)
-            elif align == "right":
-                x = x0 + max(0, w - tw)
-            else:
-                x = x0
-            draw.text((x, y), ln, fill=color, font=font)
-            y += lh
+        renderer = dispatch(t.get("renderer"), t.get("role"))
+        renderer.render(draw, t, sx, sy, page_w_px=img.width)
     return img
 
 

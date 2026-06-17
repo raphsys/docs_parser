@@ -1,0 +1,14 @@
+{
+  "segment": {
+    "id": "seg-42",
+    "text": "Voir l'équation (3.1).",
+    "protected": false,
+    "translatable": true,
+    "lang_src": "fr",
+    "lang_tgt": "en"
+  },
+  "protection": {
+    "has_formula": true,
+    "has_citation": true
+  }
+}

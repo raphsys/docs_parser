@@ -1,6 +1,30 @@
 from __future__ import annotations
 
+import re
+
 from .common import bbox_of, bbox_union, eligible_text_units, reading_order, role_of, text_of
+
+_NATURAL_TEXT_RE = re.compile(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’\-]*")
+_STRONG_MATH_RE = re.compile(r"^[=×÷±∑∫√≈≠≤≥]|[=≈≠≤≥±×÷∑∫√].*[=≈≠≤≥±×÷∑∫√]")
+_CODE_SIGNAL_RE = re.compile(r"\b(?:SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|INSERT|UPDATE|DELETE|JOIN|WITH|VALUES|CREATE|ALTER|DROP)\b|[;{}]", re.IGNORECASE)
+
+
+def _looks_like_rescuable_prose(unit: dict) -> bool:
+    text = text_of(unit)
+    if not text:
+        return False
+    words = _NATURAL_TEXT_RE.findall(text)
+    if len(words) < 5:
+        return False
+    if _STRONG_MATH_RE.search(text) and len(words) <= 2:
+        return False
+    if _CODE_SIGNAL_RE.search(text):
+        return False
+    role = role_of(unit)
+    # A long sentence can be mislabeled as path/code/formula by upstream.  It is
+    # still a translation candidate; inline URLs/formulas are protected later.
+    return role in {"unknown", "path", "code_line", "code_block", "formula_expression", "section_heading", "table_body_cell", "table_header_cell"}
+
 
 
 def build_body_paragraphs(units: list[dict], *, page_intelligence: dict | None = None) -> list[dict]:
@@ -10,13 +34,21 @@ def build_body_paragraphs(units: list[dict], *, page_intelligence: dict | None =
     text_units = eligible_text_units(units)
     if any(unit.get("level") == "line" for unit in text_units):
         text_units = [unit for unit in text_units if unit.get("level") == "line"]
+    by_id = {u.get("unit_id"): u for u in units if isinstance(u, dict) and u.get("unit_id")}
     by_parent: dict[str, list[dict]] = {}
     for unit in text_units:
         if unit.get("level") not in {"line", "phrase"}:
             continue
+        if _has_heading_parent(unit, by_id) or _has_table_parent(unit, by_id):
+            # A section title often has child lines/phrases whose local style is
+            # too weak to be recognised as headings.  Do not also turn those
+            # children into a body paragraph.
+            continue
         role = role_of(unit)
-        # Headings/titles must not be absorbed into body paragraphs (directive 18.3).
-        if role not in {"body_paragraph", "paragraph", "body"}:
+        # Headings/titles must not be absorbed into body paragraphs, except when
+        # upstream clearly mislabeled a normal prose sentence (common near code,
+        # formulas and inline URLs).
+        if role not in {"body_paragraph", "paragraph", "body"} and not _looks_like_rescuable_prose(unit):
             continue
         parent_id = _block_parent(unit)
         by_parent.setdefault(parent_id or "__page__", []).append(unit)
@@ -41,6 +73,33 @@ def build_body_paragraphs(units: list[dict], *, page_intelligence: dict | None =
             })
             counter += 1
     return paragraphs
+
+
+def _has_heading_parent(unit: dict, by_id: dict[str, dict]) -> bool:
+    heading_roles = {"title", "subtitle", "section_heading", "subsection_heading", "chapter_heading"}
+    parent_id = unit.get("parent_id")
+    while parent_id:
+        parent = by_id.get(parent_id)
+        if parent is None:
+            return False
+        if role_of(parent) in heading_roles:
+            return True
+        parent_id = parent.get("parent_id")
+    return False
+
+
+def _has_table_parent(unit: dict, by_id: dict[str, dict]) -> bool:
+    parent_id = unit.get("parent_id")
+    while parent_id:
+        parent = by_id.get(parent_id)
+        if parent is None:
+            return False
+        if role_of(parent) in {"table", "table_body_cell", "table_header_cell"}:
+            return True
+        if parent.get("level") in {"table", "cell"}:
+            return True
+        parent_id = parent.get("parent_id")
+    return False
 
 
 def _block_parent(unit: dict) -> str | None:

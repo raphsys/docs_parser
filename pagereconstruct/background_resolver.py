@@ -19,8 +19,31 @@ def resolve_background(normalized: dict) -> dict:
     source = assets.get("source_image_path")
 
     if clean:
+        verified = bool(
+            visual_layers.get("clean_background_verified")
+            or assets.get("clean_background_verified")
+            or assets.get("background_clean_verified")
+        )
+        text_removed = bool(
+            visual_layers.get("text_removed")
+            or assets.get("text_removed")
+            or verified
+        )
+        # A cleanbg file can exist while still containing source text.  Treat it
+        # as safe only when the producer explicitly verified text removal.
+        # Otherwise patches remain mandatory and publication is blocked.
+        findings = []
+        risk = "low" if verified and text_removed else "high"
+        if has_translated_text and not (verified and text_removed):
+            findings.append({
+                "type": "clean_background_unverified",
+                "level": "high",
+                "message": "clean background file exists but source text removal is not verified; patches required",
+            })
         return {"mode": "clean_background", "path": clean,
-                "source_text_leak_risk": "low", "findings": []}
+                "clean_background_verified": verified,
+                "text_removed": text_removed and verified,
+                "source_text_leak_risk": risk, "findings": findings}
     if source:
         risk = "high" if has_translated_text else "none"
         findings = ([{"type": "source_text_leak_risk", "level": "high",

@@ -1,0 +1,321 @@
+rules:
+  - id: PP-COVER-001
+    title: Détecter une page de couverture visuelle
+    pipeline_unit: PAGE_CLASSIFICATION
+    secondary_units: [DOCUMENT_COMPREHENSION]
+    rule_type: classification
+    status: active
+    objective: Détecter les couvertures visuelles en première page.
+    understanding: >
+      Première page à forte densité visuelle, faible densité de texte et au
+      moins une image dominante : c'est une couverture.
+    risk_level: medium
+    when:
+      all:
+        - field: page.index
+          op: eq
+          value: 0
+        - field: page.visual_density
+          op: gte
+          value: 0.70
+        - field: page.text_density
+          op: lte
+          value: 0.20
+        - field: page.image_count
+          op: gte
+          value: 1
+    then:
+      set:
+        page.role: cover
+        page.family: image_dominant_cover
+    target:
+      file: pageprint/detection
+      function: classify_page
+    tests:
+      - tools/rule_studio/tests/test_simulator.py
+
+  - id: PP-ROLE-001
+    title: Marque éditeur sur couverture
+    pipeline_unit: SEMANTIC_ROLE_RESOLUTION
+    secondary_units: [PAGE_CLASSIFICATION]
+    rule_type: classification
+    status: active
+    objective: Un texte court en bas de couverture correspondant à un éditeur connu = publisher_mark.
+    risk_level: low
+    when:
+      all:
+        - field: page.role
+          op: eq
+          value: cover
+        - field: text.is_short
+          op: eq
+          value: true
+        - field: text.position
+          op: eq
+          value: bottom
+        - field: text.matches_publisher
+          op: eq
+          value: true
+    then:
+      set:
+        text.role: publisher_mark
+    target:
+      file: pageprint/role_resolver.py
+      function: resolve_role
+
+  - id: PP-ROLE-002
+    title: Nom d'auteur sur couverture
+    pipeline_unit: SEMANTIC_ROLE_RESOLUTION
+    rule_type: classification
+    status: active
+    objective: Un texte court de couverture ressemblant à « Prénom Nom » = author_name.
+    risk_level: low
+    when:
+      all:
+        - field: page.role
+          op: eq
+          value: cover
+        - field: text.is_short
+          op: eq
+          value: true
+        - field: text.looks_like_person_name
+          op: eq
+          value: true
+    then:
+      set:
+        text.role: author_name
+    target:
+      file: pageprint/role_resolver.py
+      function: resolve_role
+
+  - id: RC-MODE-001
+    title: Rôle inconnu ne devient pas paragraph_flow
+    pipeline_unit: CONSTRAINT_COMPILATION
+    secondary_units: [RECONSTRUCTION, INPUT_DATA]
+    rule_type: constraint
+    status: active
+    objective: Si role est inconnu, ne pas utiliser paragraph_flow ; ancrer par prudence.
+    understanding: >
+      Un rôle absent ne doit jamais retomber sur un flux de paragraphe par
+      défaut, qui casserait le layout. anchored_text est le repli sûr.
+    risk_level: high
+    when:
+      any:
+        - field: object.role
+          op: missing
+        - field: object.role
+          op: eq
+          value: null
+    then:
+      set:
+        object.render_mode: anchored_text
+      raise_warning: Rôle inconnu — repli anchored_text appliqué.
+    target:
+      file: pagereconstruct/plan_compiler.py
+      function: compile_plan
+
+  - id: RC-MODE-002
+    title: Layouts visuels gardent les textes ancrés
+    pipeline_unit: RECONSTRUCTION
+    secondary_units: [LAYOUT_SOLVER]
+    rule_type: layout
+    status: active
+    objective: Pour image_dominant / cover_visual, les textes restent ancrés.
+    risk_level: medium
+    when:
+      all:
+        - field: page.layout_type
+          op: in
+          value: [image_dominant, cover_visual]
+    then:
+      set:
+        page.text_render_mode: anchored_text
+    target:
+      file: pagereconstruct/plan_compiler.py
+      function: compile_plan
+
+  - id: PP-OCR-001
+    title: OCR ciblé sur grandes images en couverture
+    pipeline_unit: PAGE_DETECTION
+    secondary_units: [PAGE_CLASSIFICATION]
+    rule_type: heuristic
+    status: candidate
+    objective: Première page image-dominante à très peu de texte natif = lancer OCR ciblé.
+    risk_level: medium
+    when:
+      all:
+        - field: page.index
+          op: eq
+          value: 0
+        - field: page.image_dominant
+          op: eq
+          value: true
+        - field: page.native_text_chars
+          op: lt
+          value: 40
+    then:
+      set:
+        page.ocr_targeted: true
+      add_tag: [ocr_large_images]
+    target:
+      file: pipelines/orchestrator.py
+
+  - id: QA-BBOX-001
+    title: Bbox fratrie identiques = géométrie peu fiable
+    pipeline_unit: QA
+    secondary_units: [TYPOGRAPHY, LAYOUT_SOLVER]
+    rule_type: quality_score
+    status: active
+    objective: Plusieurs frères avec exactement la même bbox → fine_token_geometry non fiable, fallback span.
+    understanding: >
+      Quand l'OCR donne la même bbox à plusieurs tokens frères, la géométrie
+      fine est inexploitable ; on retombe sur la bbox du span.
+    risk_level: high
+    when:
+      all:
+        - field: tokens.siblings_same_bbox
+          op: eq
+          value: true
+    then:
+      set:
+        fine_token_geometry.reliable: false
+        geometry.fallback: span
+      raise_warning: Géométrie fine peu fiable — fallback span.
+    target:
+      file: pagereconstruct/text_measure.py
+    tests:
+      - tools/rule_studio/tests/test_simulator.py
+
+  # --- Règles fondamentales de gouvernance (directive §15) ---
+  - id: NO-DROP-001
+    title: Aucun élément original ne doit disparaître silencieusement
+    pipeline_unit: GLOBAL
+    secondary_units: [TRANSLATION, RECONSTRUCTION, QA]
+    rule_type: contract
+    status: active
+    source_type: managed
+    blocking: true
+    keep: true
+    active: true
+    requires_tests: true
+    risk_level: critical
+    lifecycle_status: candidate
+    natural_language_title: Aucun élément original ne doit disparaître silencieusement
+    natural_language_rule: >
+      Toute unité originale extraite par PAGEPRINT doit avoir une disposition
+      explicite dans la suite du pipeline : traduite, préservée, couverte par
+      parent/enfant, ou exclue avec une raison valide.
+    objective: Garantir que le rendu final ne perde aucun contenu du document original.
+    understanding: >
+      Contrat global du pipeline. À contrôler dans PAGETRANSLATE, PAGERECONSTRUCT
+      et PUBREADY. Doit être bloquant : une seule unité perdue invalide la page.
+    recommended_decision: keep
+    target:
+      file: pipelines/orchestrator.py
+    tests:
+      - tests/pagetranslate/test_projection_preserves_all_originals.py
+
+  - id: PT-COVERAGE-001
+    title: Couverture complète des textes PagePrint dans PageTranslate
+    pipeline_unit: TRANSLATION
+    rule_type: validator
+    status: active
+    source_type: managed
+    blocking: true
+    keep: true
+    active: true
+    requires_tests: true
+    risk_level: high
+    lifecycle_status: candidate
+    natural_language_rule: >
+      Chaque texte extrait par PAGEPRINT doit recevoir une décision PAGETRANSLATE :
+      translated, preserved, covered_by_parent, covered_by_children ou
+      excluded_with_valid_reason.
+    objective: Empêcher qu'un texte PagePrint disparaisse pendant la sélection/projection.
+    understanding: Contrôle de couverture en sortie de traduction.
+    recommended_decision: keep
+    target:
+      file: pagetranslate/functional_validator.py
+      function: audit_original_text_coverage
+
+  - id: PR-COVERAGE-001
+    title: Toute entrée texte de PageReconstruct doit produire une opération de rendu
+    pipeline_unit: RECONSTRUCTION
+    rule_type: validator
+    status: active
+    source_type: managed
+    blocking: true
+    keep: true
+    active: true
+    requires_tests: true
+    risk_level: high
+    lifecycle_status: candidate
+    natural_language_rule: >
+      Chaque unité textuelle entrant dans PAGERECONSTRUCT doit produire un TextOp
+      ou un PreservationOp, sauf exclusion explicite valide.
+    objective: Garantir que les textes transmis à la reconstruction sont effectivement rendus.
+    understanding: Pont entre décision de traduction et opération de rendu.
+    recommended_decision: keep
+    target:
+      file: pagereconstruct/source_text_lifecycle_ledger.py
+
+  - id: RENDER-COVERAGE-001
+    title: Tout texte attendu doit être visible dans le rendu final
+    pipeline_unit: QA
+    secondary_units: [RECONSTRUCTION]
+    rule_type: quality_score
+    status: active
+    source_type: managed
+    blocking: true
+    keep: true
+    active: true
+    requires_tests: true
+    risk_level: high
+    lifecycle_status: candidate
+    natural_language_rule: >
+      Un texte est correctement traité seulement s'il a une décision, une unité de
+      reconstruction, une opération de rendu et une vérification visuelle/contractuelle.
+    objective: Passer d'une couverture logique à une preuve de visibilité finale.
+    understanding: Branche SourceTextLifecycleLedger avec visual_image_audit.
+    recommended_decision: keep
+    target:
+      file: pubready/stages/visual_image_audit.py
+
+  - id: RULE-NL-001
+    title: Toute règle doit avoir une explication en langage naturel
+    pipeline_unit: GLOBAL
+    rule_type: policy
+    status: active
+    source_type: managed
+    keep: true
+    active: true
+    risk_level: medium
+    lifecycle_status: candidate
+    natural_language_rule: >
+      Toute règle extraite automatiquement doit être accompagnée d'un titre, d'un
+      objectif, d'une compréhension, d'un impact et d'une décision compréhensibles.
+    objective: Rendre la gouvernance des règles possible sans lire le code.
+    understanding: Implémentée par RuleInterpreterAgent.
+    recommended_decision: keep
+    target:
+      file: tools/rule_studio/agents/rule_interpreter_agent.py
+
+  - id: RULE-CODING-001
+    title: Toute modification de règle doit pouvoir générer un patch contrôlé
+    pipeline_unit: GLOBAL
+    rule_type: policy
+    status: active
+    source_type: managed
+    keep: true
+    active: true
+    requires_tests: true
+    risk_level: medium
+    lifecycle_status: candidate
+    natural_language_rule: >
+      Une modification en langage naturel doit pouvoir être traduite en patch
+      proposé, tests associés et rapport de validation, sans application silencieuse.
+    objective: Passer d'une décision humaine à une implémentation contrôlée.
+    understanding: Implémentée par RuleCodingAgent + application contrôlée (git_guard/patcher/test_runner).
+    recommended_decision: keep
+    target:
+      file: tools/rule_studio/agents/rule_coding_agent.py

@@ -1,0 +1,16 @@
+{
+  "page": {
+    "index": 3,
+    "layout_type": "image_dominant",
+    "text_render_mode": "paragraph_flow"
+  },
+  "object": {
+    "role": "caption",
+    "bbox": [120, 640, 380, 668],
+    "render_mode": "paragraph_flow",
+    "overflow": false
+  },
+  "tokens": {
+    "siblings_same_bbox": false
+  }
+}

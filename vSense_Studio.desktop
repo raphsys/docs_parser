@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=vSense Studio
+Comment=Studio local de diagnostic, traduction et reconstruction WYSIWYG
+Exec=bash -lc 'cd "/home/raphael/Mes_Projets/docs_parser" && bash "/home/raphael/Mes_Projets/docs_parser/cmd_bash/run_vsense_studio.sh"'
+Path=/home/raphael/Mes_Projets/docs_parser
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true

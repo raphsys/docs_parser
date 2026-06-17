@@ -18,6 +18,8 @@ def build_toc_entries(units: list[dict], *, page_intelligence: dict | None = Non
     prefers line rows when available, then phrase rows, then block rows.
     """
     page_role = str((page_intelligence or {}).get("page_role") or "").lower()
+    if page_role in {"table", "table_page", "index", "cover"}:
+        return []
     candidates = _toc_row_candidates(units, page_role=page_role)
     output = []
     for idx, unit in enumerate(candidates, start=1):

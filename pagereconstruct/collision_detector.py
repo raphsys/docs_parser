@@ -38,19 +38,40 @@ def detect_text_collisions(results, *, review=0.02, ko=0.10) -> dict:
     return {"status": status, "max_overlap": round(max_r, 3), "collisions": findings}
 
 
+_CODEFORMULA_REASONS = ("code", "formula", "equation")
+
+
 def detect_protected_collisions(results, protected_px, *, review=0.01, ko=0.10) -> dict:
-    findings, max_r = [], 0.0
+    findings, max_r, has_ko = [], 0.0, False
     for r in results:
         tb = getattr(r, "actual_text_bbox", None)
         if not (tb and len(tb) == 4):
             continue
+        renderer = str(getattr(r, "renderer", "") or "")
         for pr in protected_px or []:
-            ratio = _inter(tb, pr) / _area(tb)
-            if ratio > review:
+            # A protected entry is a plain box or {bbox, reason}.
+            if isinstance(pr, dict):
+                pbox, reason = pr.get("bbox"), str(pr.get("reason") or "")
+            else:
+                pbox, reason = pr, ""
+            if not (pbox and len(pbox) == 4):
+                continue
+            ratio = _inter(tb, pbox) / _area(tb)
+            if ratio <= review:
+                continue
+            # A text line hugging a code/formula block edge (caption above, an
+            # explanation below) is normal layout, not text painted over the
+            # block: tolerate up to 20% overlap with a code/formula zone before ko.
+            local_ko = 0.20 if any(k in reason for k in _CODEFORMULA_REASONS) else ko
+            severity = "ko" if ratio > local_ko else "review"
+            if severity == "ko":
+                has_ko = True
                 max_r = max(max_r, ratio)
-                findings.append({"type": "text_protected_overlap", "unit_id": r.unit_id,
-                                 "ratio": round(ratio, 3), "severity": "ko" if ratio > ko else "review"})
-    status = "ko" if max_r > ko else ("review" if max_r > review else "ok")
+            else:
+                max_r = max(max_r, min(ratio, ko))
+            findings.append({"type": "text_protected_overlap", "unit_id": r.unit_id,
+                             "ratio": round(ratio, 3), "severity": severity})
+    status = "ko" if has_ko else ("review" if findings else "ok")
     return {"status": status, "max_overlap": round(max_r, 3), "collisions": findings}
 
 

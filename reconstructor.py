@@ -5113,7 +5113,7 @@ class DocumentReconstructor:
             rect_pt.x1 / self.pixel_to_point,
             rect_pt.y1 / self.pixel_to_point,
         ]
-        out_dir = os.path.dirname(page_data.get("background_path", "")) or "ocr_results"
+        out_dir = os.path.dirname(page_data.get("background_path", "")) or "results"
         return inpainter.save_inpaint_overlay(
             source_image_path=source_img,
             crop_bbox=crop_bbox,

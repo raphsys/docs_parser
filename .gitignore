@@ -93,3 +93,9 @@ datasets/terminology_sources/
 *.tflite
 *.npz
 *.zip
+
+# Rule Studio — local SQLite registry (generated, not versioned)
+tools/rule_studio/data/rules.sqlite
+tools/rule_studio/data/*.sqlite
+tools/rule_studio/data/*.db
+tools/rule_studio/data/agent_runs/

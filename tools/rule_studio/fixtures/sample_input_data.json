@@ -1,0 +1,23 @@
+{
+  "page": {
+    "index": 0,
+    "visual_density": 0.82,
+    "text_density": 0.12,
+    "image_count": 2,
+    "image_dominant": true,
+    "native_text_chars": 18,
+    "layout_type": "cover_visual"
+  },
+  "text": {
+    "is_short": true,
+    "position": "bottom",
+    "matches_publisher": true,
+    "looks_like_person_name": false
+  },
+  "object": {
+    "role": null
+  },
+  "tokens": {
+    "siblings_same_bbox": true
+  }
+}

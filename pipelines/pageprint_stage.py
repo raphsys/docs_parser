@@ -23,7 +23,7 @@ class PagePrintStage:
 
     def build(self, *, page_structure: dict, source_context: dict,
               extraction_result: dict, assets: dict | None = None,
-              page_index: int = 0) -> dict:
+              page_index: int = 0, page_image=None, pdf_page=None) -> dict:
         # Le handle PyMuPDF ne doit pas fuiter dans INPUT_DATA.
         clean_source_context = {
             k: v for k, v in (source_context or {}).items() if k != "document"
@@ -33,5 +33,7 @@ class PagePrintStage:
             source_context=clean_source_context,
             extraction_result=extraction_result,
             assets=assets or {},
+            page_image=page_image,
+            pdf_page=pdf_page,
             page_index=page_index,
         )

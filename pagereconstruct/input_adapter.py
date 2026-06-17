@@ -27,6 +27,7 @@ class PageReconstructInputAdapter:
         return {
             "schema_version": data.get("schema_version"),
             "page": data.get("page") or {},
+            "page_intelligence": data.get("page_intelligence") or {},
             "document": data.get("document") or {},
             "assets": data.get("assets") or {},
             "visual_layers": data.get("visual_layers") or {},

@@ -62,6 +62,9 @@ TEXT_EXACT_ROLES = {
 
 VISUAL_OVERLAY_ROLES = {
     "formula_expression",
+    # A label baked inside a figure/chart belongs to the preserved figure pixels;
+    # keep it as a visual overlay (never translated, never repainted).
+    "diagram_label",
 }
 
 ARTIFACT_ROLES = {

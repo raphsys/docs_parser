@@ -11,7 +11,7 @@ def test_source_background_with_text_is_high_leak():
 
 
 def test_clean_background_low_risk():
-    bg = resolve_background({"assets": {"background_path": "/clean.png"}, "translated_units": [{"a": 1}]})
+    bg = resolve_background({"assets": {"background_path": "/clean.png", "clean_background_verified": True}, "translated_units": [{"a": 1}]})
     assert bg["mode"] == "clean_background"
     assert bg["source_text_leak_risk"] == "low"
 

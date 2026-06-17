@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .text_utils import normalize_spaces
+from .text_survival import append_uncovered_source_line_fallbacks
 
 
 def project_translations(translated_input: dict, translated_units: list[dict]) -> list[dict]:
@@ -221,9 +222,113 @@ def _reconstruction_units(translated_input: dict, translated_units: list[dict]) 
             continue
         unit = unit_map.get(item.get("unit_id"))
         if not unit:
+            # Atomic translation units may have synthetic ids such as
+            # seg_XXXX_line_YYY while their geometry/style source is the
+            # PAGEPRINT line id stored in source_unit_ids. In that case the
+            # translated text is valid and must be consumed, not replaced by an
+            # identity fallback.
+            for sid in item.get("source_unit_ids") or []:
+                unit = unit_map.get(sid)
+                if unit:
+                    break
+        if not unit:
             continue
         output.append(_direct_reconstruction_unit(unit, item, unit_map))
+    output.extend(_preserve_uncovered_original_units(translated_input, output, unit_map))
+    output = _dedupe_parent_child_units(output, translated_input)
     return output
+
+
+def _is_ancestor_id(anc: str, desc: str) -> bool:
+    """Convention de nommage pageprint : pXXX_block_NNN[_line_MMM[_phrase_KKK...]].
+    `anc` est ancêtre de `desc` si desc démarre par `anc` + séparateur."""
+    return bool(anc) and bool(desc) and desc != anc and desc.startswith(anc + "_")
+
+
+def _dedupe_parent_child_units(output: list[dict], translated_input: dict) -> list[dict]:
+    """UNE seule unité de sortie par texte source : interdit qu'un même texte
+    source alimente pagereconstruct par DEUX granularités (bloc parent + ses
+    phrases). Si une unité couvre un texte source dont un DESCENDANT est aussi
+    couvert par une autre unité, on supprime le PARENT (granularité fine
+    prioritaire). Détection par ascendance d'id (children_ids souvent vide)."""
+    def sources(u: dict) -> list[str]:
+        return [s for s in (u.get("source_unit_ids") or []) if s]
+
+    all_sources: list[str] = []
+    for v in output:
+        all_sources.extend(sources(v))
+
+    kept: list[dict] = []
+    for i, u in enumerate(output):
+        u_sources = sources(u)
+        others = [s for j, v in enumerate(output) if j != i for s in sources(v)]
+        # u est parent-doublon si un autre couvre un descendant d'une de ses sources
+        redundant = any(_is_ancestor_id(s, o) for s in u_sources for o in others)
+        if not redundant:
+            kept.append(u)
+    return kept
+
+
+def _preserve_uncovered_original_units(translated_input: dict, reconstruction_units: list[dict], unit_map: dict[str, dict]) -> list[dict]:
+    """Hard text survival fallback.
+
+    After atomic line splitting, this should normally add very few units.  If
+    PAGEPRINT has visible lines that never reached PAGETRANSLATE, they are
+    rendered as source text with an explicit identity_fallback translation id.
+    Silent disappearance is forbidden.
+    """
+    return append_uncovered_source_line_fallbacks(translated_input, reconstruction_units, unit_map)
+
+
+def _preserved_reconstruction_unit(unit: dict, unit_map: dict[str, dict]) -> dict:
+    understanding = unit.get("understanding") or {}
+    policy = unit.get("policy") or {}
+    bbox = (unit.get("geometry") or {}).get("bbox")
+    uid = unit.get("unit_id")
+    text = (unit.get("content") or {}).get("text")
+    reason = (
+        policy.get("non_translatable_reason")
+        or policy.get("preservation_reason")
+        or policy.get("translation_strategy")
+        or understanding.get("role")
+        or "not_selected_for_translation"
+    )
+    return {
+        "unit_id": uid,
+        "translation_unit_id": None,
+        "logical_unit_id": uid,
+        "level": unit.get("level"),
+        "render_level": unit.get("level"),
+        "role": understanding.get("role"),
+        "object_type": understanding.get("object_type") or policy.get("unit_type"),
+        "semantic_kind": understanding.get("semantic_kind"),
+        "page_role": understanding.get("page_role"),
+        "preservation_mode": "preserve_original",
+        "text": text,
+        "translated_text": text,
+        "bbox": bbox,
+        "layout_bbox": bbox,
+        "patch_bbox": None,
+        "coverage_bbox": bbox,
+        "anchor_bbox": bbox,
+        "source_unit_ids": [uid],
+        "consume_source_units": False,
+        "source_units_consumed": False,
+        "preferred_over_children": False,
+        "skip_original_units": False,
+        "render_as": unit.get("level"),
+        "overflow_policy": "preserve_original",
+        "line_break_policy": "source_layout",
+        "layout_budget": _layout_budget(bbox),
+        "style": _dominant_style(unit, unit_map),
+        "render_target": {"bbox": bbox, "layout_bbox": bbox, "coverage_bbox": bbox, "style_source_unit_id": uid},
+        "render_contract": {
+            "mode": "preserve_original",
+            "preservation_mode": "preserve_original",
+            "reason": reason,
+        },
+        "translation": {"status": "preserved", "reason": reason},
+    }
 
 
 def _direct_reconstruction_unit(unit: dict, item: dict, unit_map: dict[str, dict]) -> dict:
@@ -253,7 +358,11 @@ def _direct_reconstruction_unit(unit: dict, item: dict, unit_map: dict[str, dict
         "layout_budget": _layout_budget(bbox),
         "style": _dominant_style(unit, unit_map),
         "render_target": render_target,
-        "render_contract": unit.get("render_contract") or {},
+        "render_contract": {
+            **(unit.get("render_contract") or {}),
+            "mode": "translated_text",
+            "strategy": item.get("strategy"),
+        },
         "translation": item,
     }
 

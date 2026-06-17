@@ -130,6 +130,11 @@ def _region_policy(region_type: str) -> dict:
             "translation_strategy": "exact_preserve",
             "render_policy": "fixed_preserve",
             "must_preserve_visual": True,
+            "protected_visual": True,
+            "preserve_visual": True,
+            "preserve_original_pixels": True,
+            "skip_translation": True,
+            "skip_text_reconstruction": True,
             "must_exclude_from_translation_flow": True,
         }
     if region_type in {"chart_tick"}:
@@ -138,6 +143,10 @@ def _region_policy(region_type: str) -> dict:
             "translation_strategy": "exact_preserve",
             "render_policy": "anchored_text" if region_type == "code" else "fixed_preserve",
             "must_preserve_visual": region_type == "chart_tick",
+            "protected_visual": region_type == "chart_tick",
+            "preserve_original_pixels": region_type == "chart_tick",
+            "skip_translation": True,
+            "skip_text_reconstruction": region_type == "chart_tick",
             "must_exclude_from_translation_flow": True,
         }
     if region_type in {"table_region", "table_cell"}:

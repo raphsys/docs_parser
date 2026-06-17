@@ -1,0 +1,1 @@
+cmd_bash/run_vsense_studio.sh

@@ -33,6 +33,7 @@ class TranslatedTextUnit:
     kind: str            # translated_text
     renderer: str        # paragraph | heading | caption | table | code | formula | anchored_label | ...
     source_unit_ids: list
+    translation_unit_id: str | None
     source_text: str | None
     translated_text: str | None
     role: str | None
@@ -60,6 +61,7 @@ class PreservedUnit:
     bbox: list | None
     text: str | None
     preservation_mode: str | None
+    source_unit_ids: list = field(default_factory=list)
     z_policy: str = "over_text"
 
     def to_dict(self) -> dict:
@@ -95,6 +97,12 @@ class PageRenderPlan:
     render_policy: dict = field(default_factory=dict)
     quality_expectations: dict = field(default_factory=dict)
     findings: list = field(default_factory=list)
+    render_ops: list = field(default_factory=list)   # frozen RenderOps (contract-driven)
+    final_contract: dict = field(default_factory=dict)
+    text_removal_ledger: list = field(default_factory=list)
+    source_text_lifecycle_ledger: list = field(default_factory=list)
+    intrablock_compositions: list = field(default_factory=list)
+    page_level_contracts: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +121,12 @@ class PageRenderPlan:
             "render_policy": self.render_policy,
             "quality_expectations": self.quality_expectations,
             "findings": self.findings,
+            "render_ops": self.render_ops,
+            "final_contract": self.final_contract,
+            "text_removal_ledger": self.text_removal_ledger,
+            "source_text_lifecycle_ledger": self.source_text_lifecycle_ledger,
+            "intrablock_compositions": self.intrablock_compositions,
+            "page_level_contracts": self.page_level_contracts,
         }
 
     def summary(self) -> dict:

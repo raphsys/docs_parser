@@ -18,10 +18,15 @@ WATERMARK_RE = re.compile(r"\b(?:watermark|draft|sample|preview|confidential)\b"
 
 def build_artifacts(units: list[dict], *, page_intelligence: dict | None = None) -> dict:
     page_intelligence = page_intelligence or {}
+    by_id = {u.get("unit_id"): u for u in units if isinstance(u, dict) and u.get("unit_id")}
     publisher_marks: list[dict] = []
     watermarks: list[dict] = []
     page_numbers: list[dict] = []
     for idx, unit in enumerate(eligible_text_units(units), start=1):
+        # Prefer line/block level artifacts. Phrase/span copies of the same page
+        # number/header artifact cause duplicate overlays in reconstruction.
+        if unit.get("level") in {"phrase", "span", "word", "char"} and _has_artifact_parent(unit, by_id):
+            continue
         role = role_of(unit)
         text = text_of(unit)
         bbox = bbox_of(unit)
@@ -35,10 +40,52 @@ def build_artifacts(units: list[dict], *, page_intelligence: dict | None = None)
         ):
             page_numbers.append(_artifact("page_number", idx, unit, "preserve_text_exactly", location))
     return {
-        "publisher_marks": publisher_marks,
-        "watermarks": watermarks,
-        "page_numbers": page_numbers,
+        "publisher_marks": _dedupe_artifacts(publisher_marks),
+        "watermarks": _dedupe_artifacts(watermarks),
+        "page_numbers": _dedupe_artifacts(page_numbers),
     }
+
+
+def _has_artifact_parent(unit: dict, by_id: dict[str, dict]) -> bool:
+    cursor = unit
+    while cursor.get("parent_id") in by_id:
+        parent = by_id[cursor.get("parent_id")]
+        role = role_of(parent)
+        text = text_of(parent)
+        if role in {"publisher_mark", "watermark", "page_reference", "page_number", "toc_page_reference"}:
+            return True
+        if PUBLISHER_RE.search(text) or WATERMARK_RE.search(text) or PAGE_NUMBER_RE.fullmatch(text):
+            return True
+        cursor = parent
+    return False
+
+
+def _dedupe_artifacts(items: list[dict]) -> list[dict]:
+    output: list[dict] = []
+    for item in items:
+        text = re.sub(r"\s+", " ", str(item.get("text") or "").strip()).lower()
+        bbox = item.get("bbox") or []
+        duplicate = False
+        for kept in output:
+            kept_text = re.sub(r"\s+", " ", str(kept.get("text") or "").strip()).lower()
+            if text == kept_text and _bbox_overlap_ratio(bbox, kept.get("bbox") or []) >= 0.7:
+                duplicate = True
+                break
+        if not duplicate:
+            output.append(item)
+    return output
+
+
+def _bbox_overlap_ratio(a, b) -> float:
+    if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)) or len(a) != 4 or len(b) != 4:
+        return 0.0
+    ax0, ay0, ax1, ay1 = [float(v) for v in a]
+    bx0, by0, bx1, by1 = [float(v) for v in b]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    area = max(1.0, min(max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0), max(0.0, bx1 - bx0) * max(0.0, by1 - by0)))
+    return inter / area
 
 
 def _artifact(kind: str, idx: int, unit: dict, preservation_mode: str, location: str) -> dict:

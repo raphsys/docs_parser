@@ -11,6 +11,12 @@ PAGE_FAMILY_REGISTRY = {
         "translation_tone": "neutre",
         "description": "Texte courant générique.",
     },
+    "cover_visual_page": {
+        "group": "cover",
+        "translation_style": "professionnel",
+        "translation_tone": "neutre",
+        "description": "Page de couverture visuelle avec peu de texte et forte dominance image.",
+    },
     "body_text_two_column": {
         "group": "body_text",
         "translation_style": "professionnel",

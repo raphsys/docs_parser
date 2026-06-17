@@ -71,6 +71,22 @@ def compile_unit_policy(unit: dict, *, decision_context: dict) -> dict:
 
     if level in {"page", "region", "table", "cell", "overlay"} and not (text and str(text).strip()):
         compiled = {**existing}
+        if compiled.get("preserve_visual") or compiled.get("preserve_original_pixels") or compiled.get("must_preserve_visual"):
+            compiled.update({
+                "translatable": False,
+                "translation_strategy": "exact_preserve",
+                "render_policy": "fixed_preserve",
+                "coverage_required": compiled.get("coverage_required") or "strict",
+                "protected_visual": True,
+                "preserve_visual": True,
+                "preserve_original_pixels": True,
+                "skip_translation": True,
+                "skip_text_reconstruction": True,
+                "policy_source": "visual_region_preserve",
+                "non_translatable_reason": "protected_visual_region",
+            })
+            _mirror_policy_to_unit_contract(unit, compiled)
+            return compiled
         compiled.update({
             "translatable": False,
             "translation_strategy": compiled.get("translation_strategy") or f"{level}_container",
@@ -82,6 +98,13 @@ def compile_unit_policy(unit: dict, *, decision_context: dict) -> dict:
         return compiled
 
     role = str(understanding.get("role") or "").lower()
+    if role in {"diagram_label", "axis_label", "legend_label", "chart_tick", "figure_label"}:
+        return _with_source({**existing, **_preserve_policy("preserve_as_visual_overlay"),
+                             "protected_visual": True,
+                             "preserve_original_pixels": True,
+                             "skip_translation": True,
+                             "skip_text_reconstruction": True},
+                            f"role:{role}_visual_label", unit)
     if role in {"publisher_mark", "watermark"}:
         return _with_source({**existing, **_artifact_policy("exclude_as_artifact")}, f"role:{role}_artifact", unit)
 
@@ -184,7 +207,7 @@ def _looks_like_preserve_unit(unit: dict, text: str | None) -> bool:
         str(understanding.get("object_type") or "").lower(),
         str(understanding.get("semantic_kind") or "").lower(),
     }
-    if tags & {"formula_expression", "formula", "code_line", "command_name", "path"}:
+    if tags & {"formula_expression", "formula", "code_line", "command_name", "path", "diagram_label", "axis_label", "legend_label", "chart_tick"}:
         return True
     if unit.get("level") in {"word", "char"}:
         return False

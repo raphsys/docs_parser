@@ -80,16 +80,45 @@ def _slim_pageprint(d: dict) -> dict:
     }
 
 
-def process(orchestrator, engine, pdf: Path, page: int, out: Path, source_lang: str, target_lang: str) -> dict:
+def _regen_clean_background(tid: dict, out: Path, tag: str) -> None:
+    """(Re)génère le fond propre avec le cleaner corrigé et le branche dans le tid
+    (clean_background prioritaire au rendu, pas la source)."""
+    try:
+        from pipelines.background_cleaner import build_clean_background
+        cp = build_clean_background(tid, out_path=str(out / f"cleanbg_{tag}.png"))
+        if cp:
+            tid.setdefault("visual_layers", {})["clean_background_path"] = cp
+            tid.setdefault("assets", {})["background_clean_path"] = cp
+    except Exception as exc:
+        print(f"{tag}: clean_bg regen failed: {exc}", flush=True)
+
+
+def process(orchestrator, engine, pdf: Path, page: int, out: Path, source_lang: str, target_lang: str,
+            pubready_mode: str = "review", tid_cache: Path | None = None, reuse_tid: bool = False) -> dict:
     tag = f"{pdf.stem[:24]}_p{page:04d}"
-    doc = orchestrator.run(str(pdf), pages=str(page), language={"source_lang": source_lang, "target_lang": target_lang})
-    ok = [p for p in (doc.get("pages") or []) if p.get("status") == "ok"]
-    if not ok:
-        print(f"{tag}: extraction KO", flush=True)
-        return {"tag": tag, "error": "extraction_failed"}
-    input_data = ok[0]["input_data"]
-    result = build_page_translation(input_data, translator=engine, target_lang=target_lang, source_lang=source_lang, allow_fallback=True)
-    tid = result["translated_input_data"]
+    cache_file = (tid_cache / f"tid_{tag}.json") if tid_cache else None
+
+    if reuse_tid and cache_file and cache_file.is_file():
+        # tid GELÉ : pas de re-traduction (langue/texte/styles stables entre essais).
+        tid = json.loads(cache_file.read_text(encoding="utf-8"))
+        input_data = tid
+        result = {}
+        print(f"{tag}: tid réutilisé (gelé)", flush=True)
+    else:
+        doc = orchestrator.run(str(pdf), pages=str(page), language={"source_lang": source_lang, "target_lang": target_lang})
+        ok = [p for p in (doc.get("pages") or []) if p.get("status") == "ok"]
+        if not ok:
+            print(f"{tag}: extraction KO", flush=True)
+            return {"tag": tag, "error": "extraction_failed"}
+        input_data = ok[0]["input_data"]
+        result = build_page_translation(input_data, translator=engine, target_lang=target_lang, source_lang=source_lang, allow_fallback=True)
+        tid = result["translated_input_data"]
+        if cache_file:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(tid, ensure_ascii=False), encoding="utf-8")
+
+    # Fond propre corrigé, branché dans le tid AVANT compilation.
+    _regen_clean_background(tid, out, tag)
     plan = compile_page_render_plan(tid)
 
     (out / f"pageprint_{tag}.json").write_text(json.dumps(_slim_pageprint(input_data), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -115,12 +144,37 @@ def process(orchestrator, engine, pdf: Path, page: int, out: Path, source_lang: 
         pdf_vector.render(plan_dict, str(out / f"reconstructed_{tag}.pdf"))
     audit = validate(plan_dict)
     (out / f"audit_{tag}.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Évaluateur publication-ready (additif, ne touche pas le rendu).
+    src_png = out / f"source_{tag}.png"
+    rec_png = out / f"reconstructed_{tag}.png"
+    pubready_summary = None
+    try:
+        from pubready import evaluate_reconstruction
+        from pubready.reports import write_page_report
+        has_imgs = src_png.is_file() and rec_png.is_file()
+        rep = evaluate_reconstruction(
+            tid, plan_dict, page_id=tag, mode=pubready_mode,
+            source_image_path=str(src_png) if has_imgs else None,
+            reconstructed_image_path=str(rec_png) if has_imgs else None,
+            out_dir=str(out / f"pubready_{tag}"),
+        )
+        write_page_report(rep, str(out))
+        pubready_summary = {"score": rep.publication_ready_score, "status": rep.status,
+                            "publication_ready": rep.publication_ready,
+                            "hard_blockers": list(rep.hard_blockers)}
+    except Exception as exc:  # additif : ne bloque jamais le demo
+        pubready_summary = {"error": str(exc)}
+
     summary = plan.summary()
     summary["tag"] = tag
     summary["status"] = audit["status"]
     summary["quality"] = audit["quality"]
+    summary["pubready"] = pubready_summary
+    pr = pubready_summary or {}
     print(f"{tag}: translated={summary['translated_text_count']} protected={summary['protected_region_count']} "
-          f"preserved={summary['preserved_overlay_count']+summary['preserved_underlay_count']} findings={summary['finding_count']}", flush=True)
+          f"preserved={summary['preserved_overlay_count']+summary['preserved_underlay_count']} findings={summary['finding_count']} "
+          f"pubready={pr.get('score')}({pr.get('status')})", flush=True)
     return summary
 
 
@@ -137,6 +191,9 @@ def main() -> int:
     parser.add_argument("--model", default="opus_mt_tc_big_en_fr")
     parser.add_argument("--source-lang", default="en")
     parser.add_argument("--target-lang", default="fr")
+    parser.add_argument("--pubready-mode", default="review", choices=["debug", "review", "publication"])
+    parser.add_argument("--tid-cache", default="results/_tid_cache", help="dossier de gel des translated_input_data")
+    parser.add_argument("--reuse-tid", action="store_true", help="réutiliser le tid gelé (pas de re-traduction)")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -151,7 +208,9 @@ def main() -> int:
 
     summaries = []
     for pdf, page in picks:
-        summaries.append(process(orchestrator, engine, Path(pdf), page, out, args.source_lang, args.target_lang))
+        summaries.append(process(orchestrator, engine, Path(pdf), page, out, args.source_lang, args.target_lang,
+                                  pubready_mode=args.pubready_mode,
+                                  tid_cache=Path(args.tid_cache), reuse_tid=args.reuse_tid))
     (out / "summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Output:", out)
     return 0

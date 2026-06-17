@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="fr" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PAGEPRINT Studio — Atelier d'analyse & comparaison</title>
+<meta name="description" content="Atelier local : extraction, traduction, reconstruction fidèle de PDF, avec audit qualité et comparaison source/rendu." />
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<script>
+tailwind.config = {
+  theme: { extend: {
+    colors: {
+      ink: '#0F172A', panel: '#1E293B', panel2: '#172033',
+      primary: '#3B82F6', cta: '#2563EB', edge: '#334155',
+      text: '#F1F5F9', muted: '#94A3B8',
+      ok: '#22C55E', warn: '#F59E0B', bad: '#EF4444',
+    },
+    fontFamily: { sans: ['"Fira Sans"','system-ui','sans-serif'], mono: ['"Fira Code"','monospace'] },
+  }}
+}
+</script>
+<style>
+  :root { color-scheme: dark; }
+  body { background: radial-gradient(1200px 600px at 80% -10%, #1e293b55, transparent), #0F172A; }
+  .bar { transition: width .4s cubic-bezier(.2,.8,.2,1); }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+  .skel { background: linear-gradient(90deg,#1e293b 25%,#243049 37%,#1e293b 63%); background-size:400% 100%; animation: sh 1.2s infinite; }
+  @keyframes sh { 0%{background-position:100% 0} 100%{background-position:-100% 0} }
+  .scroll::-webkit-scrollbar{width:8px;height:8px}
+  .scroll::-webkit-scrollbar-thumb{background:#334155;border-radius:8px}
+  /* swipe compare */
+  .cmp-wrap{position:relative;overflow:hidden;user-select:none}
+  .cmp-wrap img{display:block;width:100%}
+  .cmp-top{position:absolute;inset:0;overflow:hidden}
+  .cmp-top img{position:absolute;top:0;left:0;height:100%;width:auto;max-width:none}
+  .cmp-handle{position:absolute;top:0;bottom:0;width:2px;background:#3B82F6;cursor:ew-resize;z-index:5}
+  .cmp-handle::after{content:'';position:absolute;top:50%;left:50%;width:34px;height:34px;transform:translate(-50%,-50%);border:2px solid #3B82F6;border-radius:9999px;background:#0F172Acc}
+</style>
+</head>
+<body class="font-sans text-text min-h-screen antialiased">
+
+<!-- NAV -->
+<header class="sticky top-0 z-30 border-b border-edge bg-ink/85 backdrop-blur">
+  <nav class="mx-auto flex max-w-[1600px] items-center justify-between px-5 py-3">
+    <div class="flex items-center gap-3">
+      <span class="grid h-9 w-9 place-items-center rounded-xl bg-primary/15 text-primary">
+        <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h10l6 6v10a2 2 0 0 1-2 2H4z"/><path d="M14 4v6h6"/><path d="M8 14h8M8 18h5"/></svg>
+      </span>
+      <div>
+        <p class="font-mono text-sm font-600 tracking-tight">PAGEPRINT<span class="text-primary">·</span>Studio</p>
+        <p class="text-[11px] text-muted -mt-0.5">Atelier d'analyse & comparaison — PDF → traduction → reconstruction</p>
+      </div>
+    </div>
+    <div id="status" class="flex items-center gap-2 rounded-full border border-edge bg-panel2 px-3 py-1.5 text-xs text-muted">
+      <span class="h-2 w-2 rounded-full bg-muted animate-pulse"></span> connexion…
+    </div>
+  </nav>
+</header>
+
+<main class="mx-auto grid max-w-[1600px] gap-5 px-5 py-6 lg:grid-cols-[340px_1fr]">
+
+  <!-- LEFT : nouveau run + bibliothèque -->
+  <aside class="flex flex-col gap-5 lg:sticky lg:top-[68px] lg:h-[calc(100vh-92px)]">
+    <!-- form -->
+    <section class="rounded-2xl border border-edge bg-panel p-5">
+      <h2 class="mb-4 flex items-center gap-2 font-600">
+        <svg viewBox="0 0 24 24" class="h-5 w-5 text-primary" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+        Nouveau run
+      </h2>
+
+      <label for="file" class="group flex cursor-pointer flex-col items-center gap-2 rounded-xl border border-dashed border-edge bg-panel2 px-4 py-6 text-center transition-colors hover:border-primary">
+        <svg viewBox="0 0 24 24" class="h-6 w-6 text-muted group-hover:text-primary transition-colors" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M5 20h14"/></svg>
+        <span id="fileName" class="text-sm text-muted">Déposer / choisir des PDF</span>
+        <span class="text-[11px] text-muted/70">plusieurs fichiers possibles</span>
+      </label>
+      <input id="file" type="file" accept="application/pdf" multiple class="sr-only" />
+      <ul id="fileList" class="mt-2 space-y-1"></ul>
+
+      <div class="mt-4 grid grid-cols-2 gap-3">
+        <div>
+          <label for="pages" class="block text-xs font-500 text-muted mb-1.5">Pages</label>
+          <input id="pages" type="text" value="1" placeholder="1-3,5" class="w-full rounded-lg border border-edge bg-panel2 px-3 py-2.5 text-sm font-mono focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/40" />
+        </div>
+        <div>
+          <label for="langs" class="block text-xs font-500 text-muted mb-1.5">Langues</label>
+          <select id="langs" class="w-full cursor-pointer rounded-lg border border-edge bg-panel2 px-3 py-2.5 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/40">
+            <option value="en|fr">EN → FR</option>
+          </select>
+        </div>
+      </div>
+      <div class="mt-3">
+        <label for="mode" class="block text-xs font-500 text-muted mb-1.5">Mode publication-ready</label>
+        <select id="mode" class="w-full cursor-pointer rounded-lg border border-edge bg-panel2 px-3 py-2.5 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/40">
+          <option value="review">review</option>
+          <option value="debug">debug</option>
+          <option value="publication">publication</option>
+        </select>
+      </div>
+
+      <button id="run" class="mt-5 flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-cta px-4 py-3 font-600 text-white transition-colors hover:bg-primary focus:outline-none focus:ring-2 focus:ring-primary/50 disabled:cursor-not-allowed disabled:opacity-60">
+        <svg id="runIcon" viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3l14 9-14 9z"/></svg>
+        <span id="runLabel">Lancer le pipeline</span>
+      </button>
+      <p id="hint" class="mt-3 text-center text-[11px] text-muted">Pages × fichiers traités en série. 1ʳᵉ exécution : chargement du moteur.</p>
+    </section>
+
+    <!-- library -->
+    <section class="flex min-h-0 flex-1 flex-col rounded-2xl border border-edge bg-panel p-4">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="flex items-center gap-2 font-600">
+          <svg viewBox="0 0 24 24" class="h-5 w-5 text-primary" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+          Bibliothèque
+        </h2>
+        <button id="refreshRuns" title="Rafraîchir" class="cursor-pointer rounded-lg border border-edge bg-panel2 p-1.5 text-muted hover:text-primary">
+          <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>
+        </button>
+      </div>
+      <ul id="runs" class="scroll min-h-0 flex-1 space-y-2 overflow-y-auto pr-1"></ul>
+    </section>
+  </aside>
+
+  <!-- RIGHT : détail run -->
+  <section class="min-w-0">
+    <!-- empty -->
+    <div id="empty" class="grid place-items-center rounded-2xl border border-edge bg-panel/50 py-24 text-center">
+      <svg viewBox="0 0 24 24" class="mb-3 h-10 w-10 text-edge" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="8" height="18" rx="1"/><rect x="13" y="3" width="8" height="18" rx="1"/></svg>
+      <p class="font-600">Aucun run sélectionné</p>
+      <p class="mt-1 max-w-sm text-sm text-muted">Téléverse des PDF et lance le pipeline, ou choisis un run dans la bibliothèque.</p>
+    </div>
+
+    <!-- loading -->
+    <div id="loading" class="hidden">
+      <div class="mb-4 grid grid-cols-4 gap-3">
+        <div class="skel h-16 rounded-xl"></div><div class="skel h-16 rounded-xl"></div><div class="skel h-16 rounded-xl"></div><div class="skel h-16 rounded-xl"></div>
+      </div>
+      <div class="grid gap-4 md:grid-cols-2"><div class="skel h-96 rounded-2xl"></div><div class="skel h-96 rounded-2xl"></div></div>
+      <p class="mt-3 text-center text-xs text-muted">Pipeline en cours… (peut prendre plusieurs secondes par page)</p>
+    </div>
+
+    <!-- error -->
+    <div id="error" class="hidden rounded-2xl border border-bad/40 bg-bad/10 p-5 text-sm">
+      <p class="font-600 text-bad">Échec</p><p id="errorMsg" class="mt-1 text-muted"></p>
+    </div>
+
+    <!-- run detail -->
+    <div id="runView" class="hidden">
+      <!-- run header -->
+      <div class="mb-4 flex flex-wrap items-center gap-3 rounded-2xl border border-edge bg-panel p-4">
+        <div class="min-w-0">
+          <p id="runLabelTitle" class="truncate font-600"></p>
+          <p id="runMeta" class="text-xs text-muted"></p>
+        </div>
+        <div id="runStats" class="ml-auto flex flex-wrap items-center gap-2"></div>
+        <a id="dlZip" href="#" class="flex cursor-pointer items-center gap-2 rounded-lg border border-edge bg-panel2 px-3 py-2 text-sm hover:border-primary">
+          <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v12M7 11l5 5 5-5"/><path d="M5 20h14"/></svg> ZIP
+        </a>
+        <button id="delRun" class="cursor-pointer rounded-lg border border-edge bg-panel2 px-3 py-2 text-sm text-muted hover:border-bad hover:text-bad">Supprimer</button>
+      </div>
+
+      <!-- pages strip -->
+      <div id="pagesStrip" class="scroll mb-4 flex gap-2 overflow-x-auto pb-1"></div>
+
+      <!-- page detail -->
+      <div id="pageView" class="hidden">
+        <!-- scorecards -->
+        <div class="mb-4 flex flex-wrap items-center gap-3">
+          <span id="readyBadge" class="rounded-full px-3 py-1.5 text-xs font-600"></span>
+          <span class="font-mono text-2xl font-600" id="readyScore">—</span>
+          <span class="text-sm text-muted">publication-ready</span>
+          <span id="countChips" class="ml-auto flex flex-wrap gap-2"></span>
+        </div>
+        <div id="scores" class="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6"></div>
+
+        <!-- tabs -->
+        <div class="scroll mb-3 flex gap-1 overflow-x-auto rounded-lg border border-edge bg-panel p-1 text-sm" role="tablist">
+          <button data-tab="compare" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Comparer</button>
+          <button data-tab="reconstructed" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Rendu</button>
+          <button data-tab="source" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Source</button>
+          <button data-tab="overlay" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Zones</button>
+          <button data-tab="cleanbg" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Fond</button>
+          <button data-tab="translate" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Traduction</button>
+          <button data-tab="audit" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Audit</button>
+          <button data-tab="files" class="tab shrink-0 cursor-pointer rounded-md px-3 py-1.5 font-500">Fichiers</button>
+        </div>
+
+        <div class="overflow-hidden rounded-2xl border border-edge bg-panel2">
+          <!-- compare -->
+          <div id="paneCompare" class="p-3">
+            <div class="mb-3 flex flex-wrap items-center gap-2">
+              <div class="inline-flex rounded-lg border border-edge bg-panel p-1 text-xs">
+                <button data-cmp="side" class="cmpmode cursor-pointer rounded-md px-2.5 py-1 font-500">Côte à côte</button>
+                <button data-cmp="swipe" class="cmpmode cursor-pointer rounded-md px-2.5 py-1 font-500">Swipe</button>
+                <button data-cmp="onion" class="cmpmode cursor-pointer rounded-md px-2.5 py-1 font-500">Fondu</button>
+              </div>
+              <label id="onionCtl" class="hidden items-center gap-2 text-xs text-muted">
+                Opacité rendu <input id="onion" type="range" min="0" max="100" value="50" class="accent-primary"/>
+                <span id="onionVal" class="font-mono">50%</span>
+              </label>
+            </div>
+            <!-- side by side -->
+            <div id="cmpSide" class="grid gap-px overflow-hidden rounded-xl bg-edge md:grid-cols-2">
+              <figure class="bg-panel2"><figcaption class="px-3 py-2 text-xs text-muted">SOURCE (original)</figcaption><img id="imgSrcA" alt="Source" class="w-full"/></figure>
+              <figure class="bg-panel2"><figcaption class="px-3 py-2 text-xs text-primary">RECONSTRUIT</figcaption><img id="imgRecA" alt="Reconstruit" class="w-full"/></figure>
+            </div>
+            <!-- swipe -->
+            <div id="cmpSwipe" class="hidden">
+              <div id="swipeWrap" class="cmp-wrap mx-auto max-w-3xl rounded-xl border border-edge">
+                <img id="swipeBase" alt="Source"/>
+                <div id="swipeTop" class="cmp-top"><img id="swipeOver" alt="Reconstruit"/></div>
+                <div id="swipeHandle" class="cmp-handle" style="left:50%"></div>
+              </div>
+              <p class="mt-2 text-center text-[11px] text-muted">Glisse la poignée — gauche = reconstruit, droite = source.</p>
+            </div>
+            <!-- onion -->
+            <div id="cmpOnion" class="hidden">
+              <div class="relative mx-auto max-w-3xl rounded-xl border border-edge">
+                <img id="onionBase" alt="Source" class="w-full"/>
+                <img id="onionOver" alt="Reconstruit" class="absolute inset-0 h-full w-full" style="opacity:.5"/>
+              </div>
+            </div>
+          </div>
+          <!-- single panes -->
+          <div id="paneReconstructed" class="hidden p-3">
+            <div class="mb-2 flex justify-end"><button id="recCompare" class="cursor-pointer rounded-lg border border-edge bg-panel px-3 py-1.5 text-xs hover:border-primary">⇄ Comparer à l'original</button></div>
+            <img id="imgRec" alt="Reconstruit" class="mx-auto w-full max-w-3xl rounded-lg"/>
+          </div>
+          <div id="paneSource" class="hidden p-3"><img id="imgSrc" alt="Source" class="mx-auto w-full max-w-3xl rounded-lg"/></div>
+          <div id="paneOverlay" class="hidden p-3"><img id="imgOvl" alt="Zones détectées" class="mx-auto w-full max-w-3xl rounded-lg"/></div>
+          <div id="paneCleanbg" class="hidden p-3"><img id="imgClean" alt="Fond propre" class="mx-auto w-full max-w-3xl rounded-lg"/></div>
+          <!-- translate table -->
+          <div id="paneTranslate" class="hidden p-3"><div id="trWrap" class="text-sm text-muted">—</div></div>
+          <!-- audit -->
+          <div id="paneAudit" class="hidden p-4"><div id="auditWrap"></div></div>
+          <!-- files -->
+          <div id="paneFiles" class="hidden p-4"><div id="filesWrap" class="space-y-4"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+let CURRENT = null;   // manifest du run affiché
+let PAGE = null;      // page sélectionnée
+
+// ---------- status / library ----------
+async function loadStatus(){
+  try { await fetch('/healthz').then(r=>r.json());
+    $('#status').innerHTML = '<span class="h-2 w-2 rounded-full bg-ok"></span> serveur actif';
+  } catch { $('#status').innerHTML = '<span class="h-2 w-2 rounded-full bg-bad"></span> hors ligne'; }
+}
+function fmtDate(iso){ try { return new Date(iso).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'}); } catch { return iso||''; } }
+function scoreColor(v){ return v>=0.95?'text-ok':v>=0.8?'text-warn':'text-bad'; }
+
+async function loadRuns(){
+  try {
+    const d = await fetch('/api/runs').then(r=>r.json());
+    const ul = $('#runs'); ul.innerHTML='';
+    if(!(d.runs||[]).length){ ul.innerHTML='<li class="px-2 py-4 text-center text-xs text-muted">Aucun run. Lance le pipeline.</li>'; return; }
+    d.runs.forEach(r=>{
+      const s=r.summary||{}; const avg=s.avg_pubready;
+      const li=document.createElement('li');
+      li.className='cursor-pointer rounded-xl border border-edge bg-panel2 p-3 transition-colors hover:border-primary';
+      li.innerHTML=`<div class="flex items-center gap-2">
+          <span class="truncate text-sm font-500">${r.label||r.run}</span>
+          <span class="ml-auto font-mono text-xs ${avg==null?'text-muted':scoreColor(avg)}">${avg==null?'—':avg.toFixed(2)}</span>
+        </div>
+        <div class="mt-1 flex items-center gap-2 text-[11px] text-muted">
+          <span>${fmtDate(r.created)}</span><span>·</span><span>${s.page_count||0} page(s)</span>
+          ${s.ready_count?`<span>·</span><span class="text-ok">${s.ready_count} ready</span>`:''}
+        </div>`;
+      li.addEventListener('click',()=>openRun(r.run));
+      ul.appendChild(li);
+    });
+  } catch { $('#runs').innerHTML='<li class="px-2 py-4 text-center text-xs text-bad">erreur de chargement</li>'; }
+}
+
+// ---------- file input ----------
+$('#file').addEventListener('change', e=>{
+  const fs=[...e.target.files];
+  $('#fileName').textContent = fs.length?`${fs.length} fichier(s)`:'Déposer / choisir des PDF';
+  const ul=$('#fileList'); ul.innerHTML='';
+  fs.forEach(f=>{ const li=document.createElement('li'); li.className='truncate rounded bg-panel2 px-2 py-1 text-[11px] text-muted'; li.textContent=f.name; ul.appendChild(li); });
+});
+
+// ---------- run pipeline ----------
+async function run(){
+  const btn=$('#run'); const files=$('#file').files;
+  if(!files.length){ $('#file').click(); return; }
+  const [src,tgt]=$('#langs').value.split('|');
+  const fd=new FormData();
+  [...files].forEach(f=>fd.append('files',f));
+  fd.append('pages',$('#pages').value||'1'); fd.append('source_lang',src); fd.append('target_lang',tgt); fd.append('pubready_mode',$('#mode').value);
+  btn.disabled=true; $('#runLabel').textContent='Traitement…'; $('#runIcon').classList.add('animate-spin');
+  show('loading');
+  try {
+    const r=await fetch('/api/run',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok||d.error) throw new Error(d.error||('HTTP '+r.status));
+    await loadRuns();
+    renderRun(d);
+  } catch(e){ show('error'); $('#errorMsg').textContent=String(e.message||e); }
+  finally { btn.disabled=false; $('#runLabel').textContent='Lancer le pipeline'; $('#runIcon').classList.remove('animate-spin'); }
+}
+
+function show(which){
+  ['empty','loading','error','runView'].forEach(id=>$('#'+id).classList.toggle('hidden', id!==which));
+}
+
+async function openRun(run){
+  show('loading');
+  try {
+    const d=await fetch('/api/runs/'+encodeURIComponent(run)).then(r=>r.json());
+    if(d.error) throw new Error(d.error);
+    renderRun(d);
+  } catch(e){ show('error'); $('#errorMsg').textContent=String(e.message||e); }
+}
+
+// ---------- render run ----------
+function chip(label,val,cls){ return `<span class="rounded-full border border-edge bg-panel2 px-2.5 py-1 text-xs"><span class="text-muted">${label}</span> <span class="font-mono ${cls||''}">${val}</span></span>`; }
+
+function renderRun(m){
+  CURRENT=m; show('runView');
+  $('#runLabelTitle').textContent=m.label||m.run;
+  $('#runMeta').textContent=`${m.run} · ${fmtDate(m.created)} · ${m.elapsed_s||0}s · pages ${m.params?.pages||''} · ${m.params?.source_lang}→${m.params?.target_lang}`;
+  const s=m.summary||{};
+  $('#runStats').innerHTML = chip('pages',s.page_count||0)+chip('docs',s.doc_count||0)
+    +chip('moy. pubready', s.avg_pubready==null?'—':s.avg_pubready.toFixed(2), s.avg_pubready==null?'':scoreColor(s.avg_pubready))
+    +chip('ready', (s.ready_count||0)+'/'+(s.page_count||0), s.ready_count?'text-ok':'text-muted')
+    +(m.errors?.length?chip('erreurs',m.errors.length,'text-bad'):'');
+  $('#dlZip').href='/api/runs/'+encodeURIComponent(m.run)+'/zip';
+  // pages strip
+  const strip=$('#pagesStrip'); strip.innerHTML='';
+  (m.pages||[]).forEach((p,i)=>{
+    const b=document.createElement('button');
+    const sc=p.pubready_score;
+    b.className='shrink-0 cursor-pointer rounded-xl border border-edge bg-panel px-3 py-2 text-left transition-colors hover:border-primary';
+    b.innerHTML=`<div class="max-w-[160px] truncate text-xs font-500">${p.document}</div>
+      <div class="flex items-center gap-2 text-[11px] text-muted">p.${p.page} · <span class="font-mono ${sc==null?'':scoreColor(sc)}">${sc==null?'—':sc.toFixed(2)}</span>
+        <span class="rounded px-1 ${p.publication_ready?'bg-ok/15 text-ok':p.pubready_status==='ko'?'bg-bad/15 text-bad':'bg-warn/15 text-warn'}">${p.pubready_status||'—'}</span></div>`;
+    b.addEventListener('click',()=>{ selectPageBtn(b); renderPage(p); });
+    strip.appendChild(b);
+    if(i===0){ selectPageBtn(b); renderPage(p); }
+  });
+  if(!(m.pages||[]).length){ $('#pageView').classList.add('hidden'); strip.innerHTML='<p class="text-xs text-bad">Aucune page traitée. '+((m.errors||[]).map(e=>e.error).join('; '))+'</p>'; }
+}
+function selectPageBtn(btn){ $$('#pagesStrip button').forEach(b=>b.classList.remove('border-primary','ring-2','ring-primary/40')); btn.classList.add('border-primary','ring-2','ring-primary/40'); }
+
+// ---------- scores ----------
+const SCORE_LABELS={text_presence:'Texte',non_text_presence:'Non-texte',overlap:'Sans collision',position:'Position',typography:'Typographie',source_text_leak:'Anti-fuite'};
+function pct(v){ return v==null?'—':Math.round(v*100)+'%'; }
+function barColor(v){ return v>=0.95?'bg-ok':v>=0.8?'bg-warn':'bg-bad'; }
+function renderScores(scores){
+  const wrap=$('#scores'); wrap.innerHTML='';
+  Object.entries(SCORE_LABELS).forEach(([k,label])=>{
+    if(scores[k]==null) return; const v=scores[k];
+    const el=document.createElement('div'); el.className='rounded-xl border border-edge bg-panel p-3';
+    el.innerHTML=`<div class="flex items-center justify-between text-xs"><span class="text-muted">${label}</span><span class="font-mono font-600">${pct(v)}</span></div>
+      <div class="mt-2 h-1.5 overflow-hidden rounded-full bg-panel2"><div class="bar h-full ${barColor(v)}" style="width:${Math.round(v*100)}%"></div></div>`;
+    wrap.appendChild(el);
+  });
+}
+
+// ---------- render page ----------
+function fileUrl(p,key){ return p.files?.[key]?.url || ''; }
+function renderPage(p){
+  PAGE=p; $('#pageView').classList.remove('hidden');
+  const a=p.audit||{}; const sc=a.scores||{};
+  const ready=p.publication_ready; const badge=$('#readyBadge');
+  badge.textContent = ready?'PUBLICATION-READY':(p.pubready_status||p.status||'review').toUpperCase();
+  badge.className='rounded-full px-3 py-1.5 text-xs font-600 '+(ready?'bg-ok/15 text-ok':p.pubready_status==='ko'?'bg-bad/15 text-bad':'bg-warn/15 text-warn');
+  $('#readyScore').textContent = p.pubready_score!=null?p.pubready_score.toFixed(2):'—';
+  const c=p.counts||{};
+  $('#countChips').innerHTML = chip('traduit',c.translated_text_count??'—')+chip('protégé',c.protected_region_count??'—')
+    +chip('préservé',(c.preserved_overlay_count||0)+(c.preserved_underlay_count||0))+chip('findings',c.finding_count??'—',c.finding_count?'text-warn':'text-ok');
+  renderScores(sc);
+
+  // images
+  const src=fileUrl(p,'source'), rec=fileUrl(p,'reconstructed');
+  $('#imgSrcA').src=$('#imgSrc').src=$('#swipeBase').src=$('#onionBase').src=src;
+  $('#imgRecA').src=$('#imgRec').src=$('#swipeOver').src=$('#onionOver').src=rec;
+  $('#imgOvl').src=fileUrl(p,'overlay'); $('#imgClean').src=fileUrl(p,'cleanbg');
+
+  // audit pane
+  renderAudit(p);
+  // translate + files (lazy)
+  $('#trWrap').innerHTML='<p class="text-xs text-muted">Ouvre l\'onglet pour charger…</p>';
+  renderFiles(p);
+  setTab('compare'); setCmp('side');
+}
+
+function renderAudit(p){
+  const a=p.audit||{}; const w=$('#auditWrap');
+  let html=`<div class="mb-3 flex flex-wrap gap-2">`
+    +chip('status',a.status||'—')+chip('ready',a.publication_ready?'oui':'non',a.publication_ready?'text-ok':'text-bad')
+    +chip('score',a.publication_ready_score!=null?a.publication_ready_score.toFixed(2):'—')+`</div>`;
+  const ko=a.ko_findings||[];
+  if(ko.length){
+    html+=`<p class="mb-2 text-xs font-600 text-muted">Findings bloquants (${ko.length})</p>`+
+      ko.map(f=>`<div class="mb-1 flex items-center gap-2 rounded-lg border border-bad/30 bg-bad/5 px-3 py-2 text-xs">
+        <span class="h-1.5 w-1.5 rounded-full bg-bad"></span><span class="font-mono text-bad">${f.type||f.code||'finding'}</span>
+        <span class="text-muted">${f.ratio?('ratio '+f.ratio):''} ${f.unit_id||''}</span></div>`).join('');
+  } else html+='<div class="rounded-lg border border-ok/30 bg-ok/5 px-3 py-2 text-xs text-ok">Aucun finding bloquant.</div>';
+  if(p.hard_blockers?.length) html+=`<p class="mt-3 mb-1 text-xs font-600 text-muted">Hard blockers</p>`+
+    p.hard_blockers.map(b=>`<span class="mr-1 inline-block rounded bg-bad/10 px-2 py-0.5 text-[11px] text-bad">${b}</span>`).join('');
+  const af=p.files?.audit?.url;
+  if(af) html+=`<a href="/api/file?run=${encodeURIComponent(CURRENT.run)}&name=${encodeURIComponent(p.files.audit.name)}" target="_blank" class="mt-3 inline-block text-xs text-primary hover:underline">› audit JSON complet</a>`;
+  w.innerHTML=html;
+}
+
+async function renderTranslate(p){
+  const f=p.files?.pagetranslate; const w=$('#trWrap');
+  if(!f){ w.innerHTML='<p class="text-xs text-muted">Pas de données de traduction.</p>'; return; }
+  w.innerHTML='<p class="text-xs text-muted">Chargement…</p>';
+  try {
+    const d=await fetch('/api/file?run='+encodeURIComponent(CURRENT.run)+'&name='+encodeURIComponent(f.name)).then(r=>r.json());
+    const units=d.units||[]; const st=d.statuses||{};
+    let html=`<div class="mb-3 flex flex-wrap gap-2">`+Object.entries(st).map(([k,v])=>chip(k.replace(/_/g,' '),v||'—')).join('')+`</div>`;
+    html+=`<div class="scroll max-h-[520px] overflow-auto rounded-lg border border-edge"><table class="w-full text-left text-xs">
+      <thead class="sticky top-0 bg-panel text-muted"><tr><th class="p-2">Rôle</th><th class="p-2">Source</th><th class="p-2">Traduction</th><th class="p-2">Statut</th></tr></thead><tbody>`;
+    units.forEach(u=>{
+      const rev=u.needs_review;
+      html+=`<tr class="border-t border-edge align-top ${rev?'bg-warn/5':''}">
+        <td class="p-2 font-mono text-muted">${u.role||''}</td>
+        <td class="p-2">${esc(u.source_text)}</td>
+        <td class="p-2 text-text">${esc(u.translated_text)}</td>
+        <td class="p-2"><span class="rounded px-1 ${u.status==='ok'?'text-ok':rev?'text-warn':'text-muted'}">${u.status||''}${rev?' ⚑':''}</span></td></tr>`;
+    });
+    html+='</tbody></table></div>';
+    w.innerHTML=html;
+  } catch(e){ w.innerHTML='<p class="text-xs text-bad">Erreur: '+e+'</p>'; }
+}
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderFiles(p){
+  const w=$('#filesWrap'); const files=p.files||{};
+  const order=['reconstructed','source','overlay','cleanbg','pdf','audit','pubready','plan','pageprint','pagetranslate'];
+  let html='';
+  order.forEach(k=>{
+    const f=files[k]; if(!f) return;
+    const isJson=f.name.endsWith('.json');
+    const view = isJson ? `/api/file?run=${encodeURIComponent(CURRENT.run)}&name=${encodeURIComponent(f.name)}` : f.url;
+    html+=`<div class="flex items-center gap-3 rounded-lg border border-edge bg-panel px-3 py-2">
+      <span class="grid h-8 w-8 place-items-center rounded-lg bg-primary/10 text-primary text-[10px] font-mono">${f.name.split('.').pop().toUpperCase()}</span>
+      <div class="min-w-0"><p class="text-sm font-500">${f.label}</p><p class="truncate font-mono text-[11px] text-muted">${f.name}</p></div>
+      <div class="ml-auto flex gap-2">
+        <a href="${view}" target="_blank" class="rounded-lg border border-edge bg-panel2 px-2.5 py-1.5 text-xs hover:border-primary">Afficher</a>
+        <a href="${f.url}" download class="rounded-lg border border-edge bg-panel2 px-2.5 py-1.5 text-xs hover:border-primary">↓</a>
+      </div></div>`;
+  });
+  w.innerHTML=html||'<p class="text-xs text-muted">Aucun fichier.</p>';
+}
+
+// ---------- tabs ----------
+const TAB_PANES={compare:'#paneCompare',reconstructed:'#paneReconstructed',source:'#paneSource',overlay:'#paneOverlay',cleanbg:'#paneCleanbg',translate:'#paneTranslate',audit:'#paneAudit',files:'#paneFiles'};
+function setTab(name){
+  $$('.tab').forEach(b=>{ const on=b.dataset.tab===name; b.classList.toggle('bg-primary',on); b.classList.toggle('text-white',on); b.classList.toggle('text-muted',!on); });
+  Object.entries(TAB_PANES).forEach(([k,sel])=>$(sel).classList.toggle('hidden',k!==name));
+  if(name==='translate' && PAGE) renderTranslate(PAGE);
+}
+$$('.tab').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.tab)));
+$('#recCompare').addEventListener('click',()=>{ setTab('compare'); setCmp('swipe'); });
+
+// ---------- compare modes ----------
+function setCmp(mode){
+  $$('.cmpmode').forEach(b=>{ const on=b.dataset.cmp===mode; b.classList.toggle('bg-primary',on); b.classList.toggle('text-white',on); b.classList.toggle('text-muted',!on); });
+  $('#cmpSide').classList.toggle('hidden',mode!=='side');
+  $('#cmpSwipe').classList.toggle('hidden',mode!=='swipe');
+  $('#cmpOnion').classList.toggle('hidden',mode!=='onion');
+  $('#onionCtl').classList.toggle('hidden',mode!=='onion');
+  $('#onionCtl').classList.toggle('flex',mode==='onion');
+  if(mode==='swipe') setTimeout(()=>setSwipe(0.5),30);
+}
+$$('.cmpmode').forEach(b=>b.addEventListener('click',()=>setCmp(b.dataset.cmp)));
+
+// swipe drag
+function setSwipe(frac){
+  const wrap=$('#swipeWrap'); const w=wrap.clientWidth; const x=Math.max(0,Math.min(1,frac))*w;
+  $('#swipeTop').style.width=x+'px'; $('#swipeOver').style.width=w+'px'; $('#swipeHandle').style.left=x+'px';
+}
+(function(){
+  const wrap=$('#swipeWrap'); let drag=false;
+  const at=e=>{ const r=wrap.getBoundingClientRect(); const cx=(e.touches?e.touches[0].clientX:e.clientX)-r.left; setSwipe(cx/r.width); };
+  wrap.addEventListener('mousedown',e=>{drag=true;at(e);});
+  window.addEventListener('mousemove',e=>{if(drag)at(e);});
+  window.addEventListener('mouseup',()=>drag=false);
+  wrap.addEventListener('touchstart',e=>{drag=true;at(e);},{passive:true});
+  wrap.addEventListener('touchmove',e=>{if(drag)at(e);},{passive:true});
+  wrap.addEventListener('touchend',()=>drag=false);
+  $('#swipeBase').addEventListener('load',()=>setSwipe(0.5));
+})();
+$('#onion').addEventListener('input',e=>{ const v=e.target.value; $('#onionOver').style.opacity=v/100; $('#onionVal').textContent=v+'%'; });
+
+// ---------- delete ----------
+$('#delRun').addEventListener('click',async()=>{
+  if(!CURRENT) return;
+  if(!confirm('Supprimer ce run et tous ses fichiers ?')) return;
+  await fetch('/api/runs/'+encodeURIComponent(CURRENT.run),{method:'DELETE'});
+  CURRENT=null; show('empty'); loadRuns();
+});
+
+$('#run').addEventListener('click',run);
+$('#refreshRuns').addEventListener('click',loadRuns);
+loadStatus(); loadRuns();
+</script>
+</body>
+</html>

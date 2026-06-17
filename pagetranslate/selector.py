@@ -24,6 +24,11 @@ EXCLUDED_CLASSES = {
     "citation",
     "reference_link",
     "page_number",
+    "diagram_label",
+    "axis_label",
+    "legend_label",
+    "chart_tick",
+    "figure_label",
 }
 
 EXCLUDED_STRATEGIES = {"exact_preserve", "keep_original", "background_only"}
@@ -146,6 +151,63 @@ def _select_semantic_system_units(
     return output, blocked_source_ids, blocked_block_ids
 
 
+
+def _prefix_ancestor(ancestor: str | None, descendant: str | None) -> bool:
+    """Conservative PagePrint id ancestry fallback.
+
+    PagePrint ids usually follow pXXX_block_NNN_line_MMM_phrase_KKK... .  The
+    explicit children graph is the source of truth when present, but the prefix
+    convention is often the only available signal in compact views.
+    """
+    return bool(ancestor) and bool(descendant) and descendant != ancestor and str(descendant).startswith(str(ancestor) + "_")
+
+
+def _related_to_any_source(unit_id: str | None, source_ids: set[str], units_by_id: dict[str, dict]) -> bool:
+    if not unit_id:
+        return False
+    if unit_id in source_ids:
+        return True
+    # Avoid parent/child double selection: if a semantic phrase was selected,
+    # the line/block ancestor must not be selected as a whole; if a semantic
+    # group selected a parent, its children must not be reselected either.
+    for sid in source_ids:
+        if _prefix_ancestor(unit_id, sid) or _prefix_ancestor(sid, unit_id):
+            return True
+        anc = ancestor_id(unit_id, units_by_id, level="block")
+        sid_anc = ancestor_id(sid, units_by_id, level="block") if sid in units_by_id else None
+        if anc and sid_anc and anc == sid_anc and (unit_id == sid or _prefix_ancestor(unit_id, sid) or _prefix_ancestor(sid, unit_id)):
+            return True
+    return False
+
+
+def strip_running_header_page_number(text: str, *, role: str | None = None, bbox=None) -> tuple[str, dict]:
+    """Remove page numbers accidentally fused with running headers.
+
+    The page number is preserved by PAGEPRINT as a dedicated immutable overlay.
+    If the translation unit also contains it (e.g. "70 CHAPTER 2 ..."), the
+    renderer draws it twice and the translator may translate/relocate it.  This
+    function strips only plausible running-header cases, not ordinary numbered
+    section titles such as "2.5.4 Mean square error" or table cells like
+    "4 bytes ...".
+    """
+    s = normalize_spaces(text)
+    if not s:
+        return s, {}
+    m = re.match(r"^(\d{1,4})\s+(.+)$", s)
+    if not m:
+        return s, {}
+    number, rest = m.group(1), normalize_spaces(m.group(2))
+    if not rest or re.match(r"^\d+(?:[.)]|\.\d)", rest):
+        return s, {}
+    role_l = str(role or "").lower()
+    y0 = float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None
+    upper_header = y0 is not None and y0 <= 55.0
+    chapterish = bool(re.match(r"^(?:CHAPTER|Chapter|PART|Part)\b", rest))
+    titleish = bool(re.match(r"^[A-Z][A-Za-z].{4,}$", rest)) and not re.match(r"^(?:bytes?|decimal|floating)\b", rest, re.I)
+    if upper_header and (chapterish or role_l in {"running_header", "section_heading", "chapter_heading"} and titleish):
+        return rest, {"stripped_page_number": number, "strip_reason": "running_header_fused_page_number"}
+    return s, {}
+
 def _select_pageprint_units_by_block(
     input_data: dict,
     units_by_id: dict[str, dict],
@@ -168,8 +230,18 @@ def _select_pageprint_units_by_block(
             continue
         block_id = unit["unit_id"] if level == "block" else ancestor_id(unit["unit_id"], units_by_id, level="block")
         block_key = block_id or "__page__"
-        if block_key in selected_blocks or block_key in blocked_block_ids:
+        # Do NOT skip a whole block merely because PAGEPRINT emitted one or two
+        # semantic phrases for it.  Semantic coverage can be incomplete; skipping
+        # the block here is the main reason large parts of pages remain in the
+        # original language.  Skip only explicit non-translatable blocks and
+        # individual units already covered by semantic translation.
+        if block_key in blocked_block_ids:
             continue
+        if _related_to_any_source(unit["unit_id"], semantic_source_ids, units_by_id):
+            # For line ancestors, keep the block in play: unselected phrase
+            # children may still be translated below.
+            if level != "line":
+                continue
         by_block[block_key][level].append(unit)
 
     output = []
@@ -180,9 +252,20 @@ def _select_pageprint_units_by_block(
         if lines:
             phrase_parent_ids = {unit.get("parent_id") for unit in phrases}
             for line in lines:
-                line_phrases = [phrase for phrase in phrases if phrase.get("parent_id") == line.get("unit_id")]
-                selected_units = line_phrases or [line]
+                line_phrases = [
+                    phrase for phrase in phrases
+                    if phrase.get("parent_id") == line.get("unit_id")
+                    and not _related_to_any_source(phrase.get("unit_id"), semantic_source_ids, units_by_id)
+                ]
+                # If a semantic phrase already covers part of this line, do not
+                # fall back to the whole line: that would duplicate the semantic
+                # phrase.  Translate remaining phrase children when they exist;
+                # otherwise leave the missing fragment to the lifecycle audit.
+                line_has_semantic_descendant = any(_prefix_ancestor(line.get("unit_id"), sid) for sid in semantic_source_ids)
+                selected_units = line_phrases or ([] if line_has_semantic_descendant else [line])
                 for unit in selected_units:
+                    if _related_to_any_source(unit.get("unit_id"), semantic_source_ids, units_by_id):
+                        continue
                     output.append(_make_item(
                         unit_id=unit["unit_id"],
                         level=unit.get("level"),
@@ -192,7 +275,12 @@ def _select_pageprint_units_by_block(
                         block_id=block_key,
                         bbox=(unit.get("geometry") or {}).get("bbox"),
                     ))
-            orphan_phrases = [phrase for phrase in phrases if phrase.get("parent_id") not in phrase_parent_ids and not ancestor_id(phrase["unit_id"], units_by_id, level="line")]
+            orphan_phrases = [
+                phrase for phrase in phrases
+                if phrase.get("parent_id") not in phrase_parent_ids
+                and not ancestor_id(phrase["unit_id"], units_by_id, level="line")
+                and not _related_to_any_source(phrase.get("unit_id"), semantic_source_ids, units_by_id)
+            ]
             for unit in orphan_phrases:
                 output.append(_make_item(
                     unit_id=unit["unit_id"],
@@ -206,6 +294,8 @@ def _select_pageprint_units_by_block(
             continue
         selected_units = phrases or blocks
         for unit in selected_units:
+            if _related_to_any_source(unit.get("unit_id"), semantic_source_ids, units_by_id):
+                continue
             output.append(_make_item(
                 unit_id=unit["unit_id"],
                 level=unit.get("level"),
@@ -365,6 +455,8 @@ def _make_item(
     understanding = unit.get("understanding") or {}
     policy = unit.get("policy") or {}
     entry = semantic_entry or {}
+    role = entry.get("role") or understanding.get("role")
+    source_text, preprocess = strip_running_header_page_number(source_text, role=role, bbox=bbox)
     return {
         "translation_unit_id": "",
         "unit_id": unit_id,
@@ -373,9 +465,10 @@ def _make_item(
         "source_unit_ids": source_unit_ids,
         "block_id": block_id,
         "source_text": normalize_spaces(source_text),
+        "preprocess": preprocess,
         "bbox": bbox,
         "reading_order_index": (unit.get("geometry") or {}).get("reading_order_index") or entry.get("reading_order_index") or 0,
-        "role": entry.get("role") or understanding.get("role"),
+        "role": role,
         "object_type": entry.get("object_type") or understanding.get("object_type") or policy.get("unit_type"),
         "object_class": entry.get("object_class") or understanding.get("object_class"),
         "semantic_kind": entry.get("semantic_kind") or entry.get("kind") or understanding.get("semantic_kind"),

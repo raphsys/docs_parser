@@ -26,6 +26,29 @@ DEFAULT_STYLE = {
 }
 
 
+
+def _bbox_height(bbox) -> float:
+    return float(bbox[3]) - float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else 0.0
+
+
+def _max_font_size_for_role(role: str | None, line_bbox) -> float | None:
+    """Role-aware hard safety caps.
+
+    The OCR/EM estimator can overestimate small labels when a narrow multi-line
+    figure label is misread as a heading.  Layout philosophy: labels, table cells
+    and captions must stay inside their original micro-zones; they may shrink,
+    but they must not become display headings.
+    """
+    r = str(role or "").lower()
+    h = _bbox_height(line_bbox)
+    if r in {"diagram_label", "axis_label", "legend_label", "anchored_label"}:
+        return min(8.5, max(5.0, h * 0.55 if h else 8.5))
+    if r in {"table_body_cell", "table_header_cell", "table_numeric_cell"}:
+        return min(9.0, max(5.0, h * 0.78 if h else 9.0))
+    if r in {"figure_caption", "figure_caption_text", "table_caption", "table_caption_text"}:
+        return min(9.0, max(5.5, h * 0.90 if h else 9.0))
+    return None
+
 def _is_real(style: dict) -> bool:
     return any(v is not None for k, v in (style or {}).items() if k not in _IGNORED)
 
@@ -74,6 +97,15 @@ def resolve_style(reconstruction_unit: dict, recon_plan_item: dict | None, unit_
     style["font_size_pt_raw"] = style.get("font_size_pt")
     apply_font_class(style)  # serif/sans/mono from font_family
     resolved_size, size_findings = sanitize_font_size(style.get("font_size_pt"), line_bbox, role)
+    max_size = _max_font_size_for_role(role, line_bbox)
+    if max_size is not None and resolved_size > max_size:
+        size_findings.append({
+            "type": "font_size_clamped_for_locked_label_role",
+            "role": role,
+            "from_pt": round(float(resolved_size), 3),
+            "to_pt": round(float(max_size), 3),
+        })
+        resolved_size = max_size
     style["font_size_pt"] = resolved_size
     style["font_size_pt_resolved"] = resolved_size
     findings.extend(size_findings)

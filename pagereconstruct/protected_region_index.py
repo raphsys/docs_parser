@@ -64,8 +64,28 @@ class ProtectedRegionIndex:
         return len(self.regions)
 
 
+def _zone_of(bbox, zones, min_ratio: float = 0.6):
+    if not zones or not _valid_bbox(bbox):
+        return None
+    b = [float(x) for x in bbox]
+    denom = max(1e-6, _area(b))
+    for z in zones:
+        if _intersection_area(b, z["bbox"]) / denom >= min_ratio:
+            return z
+    return None
+
+
 def build_protected_region_index(*, units: dict, preservation_plan: list, exclusion_plan: list,
-                                 regions: list | None = None, visual_layers: dict | None = None) -> ProtectedRegionIndex:
+                                 regions: list | None = None, visual_layers: dict | None = None,
+                                 translated_source_ids: set | None = None,
+                                 special_zones: list | None = None) -> ProtectedRegionIndex:
+    # Coherence invariant: a source unit that is being TRANSLATED must never also
+    # be protected — else the same content lands in both the translated layer and
+    # the protected layer and they self-collide (the upstream formula/protected
+    # over-detection symptom). translated_source_ids carries every source id the
+    # translated_text layer consumes; we drop any protection that targets one.
+    translated_source_ids = translated_source_ids or set()
+    special_zones = special_zones or []
     out: list[ProtectedRegion] = []
     n = 0
 
@@ -77,7 +97,19 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
         out.append(ProtectedRegion(id=f"prot_{n:04d}", source=source, reason=str(reason or "protected"),
                                    bbox=[float(x) for x in bbox], hard=hard, z_policy=z))
 
+    # Merged formula/code zones are THE tight protection for their block
+    # (one rectangle replacing many oversized per-unit formula bboxes).
+    for z in special_zones:
+        add("special_zone", z.get("kind") or "formula", z.get("bbox"))
+
     for p in preservation_plan or []:
+        # Skip a preservation whose source is also translated (over-detected
+        # formula/protected on a line the pipeline translates).
+        if translated_source_ids & set(p.get("source_unit_ids") or []):
+            continue
+        # A preservation inside a merged zone is already covered by the zone.
+        if _zone_of(p.get("bbox"), special_zones):
+            continue
         # text-preserved exact (page refs, captions labels) is over_text; visual is original.
         mode = p.get("preservation_mode")
         z = "over_text" if mode == "preserve_text_exactly" else "preserve_original"
@@ -89,15 +121,40 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
         # and protecting every span/word/char floods false collisions.
         if u.get("level") in {"span", "word", "char"}:
             continue
+        # A translated unit must not also be protected (coherence invariant).
+        if u.get("unit_id") in translated_source_ids:
+            continue
+        # Candidate-region units are special-region-detector OBSERVATIONS (inline
+        # "1 × 1" fragments sitting inside translatable prose); they over-fire and
+        # must not hard-protect. Real formulas protect via block/line roles above.
+        if "candidate" in str(u.get("unit_id") or ""):
+            continue
         policy = u.get("policy") or {}
         bbox = (u.get("geometry") or {}).get("bbox")
         role = (u.get("understanding") or {}).get("role")
         ot = (u.get("understanding") or {}).get("object_type")
-        if policy.get("render_policy") in {"background_only", "fixed_preserve", "preserve_overlay"} \
-                or policy.get("preservation_mode") in {"preserve_as_visual_overlay"} \
-                or role in {"formula_expression", "publisher_mark", "watermark"} \
-                or str(ot or "").lower() in _PROTECTED_OBJECTS:
-            add("unit_policy", role or ot or policy.get("render_policy"), bbox)
+        rp = policy.get("render_policy")
+        ot_l = str(ot or "").lower()
+        # A unit hard-protects ONLY if it carries a confirmed visual identity:
+        #  - a real protected object_type (formula/image/code/table_grid…), OR
+        #  - a confirmed visual role (formula_expression/publisher_mark/watermark), OR
+        #  - render_policy == background_only (true page background).
+        # render_policy fixed_preserve / preserve_overlay alone (page numbers,
+        # small artifacts, unknown-role text) must NOT hard-protect: those flood
+        # false collisions over the translated text and never carry real visuals.
+        is_object = ot_l in _PROTECTED_OBJECTS
+        is_visual_role = role in {"formula_expression", "publisher_mark", "watermark"}
+        is_background = rp == "background_only"
+        if not (is_object or is_visual_role or is_background):
+            continue
+        # A formula/code unit inside a merged zone is already protected by the
+        # tight zone rectangle; its own (often oversized) bbox would re-introduce
+        # the collisions with neighbouring prose. Let the zone own it.
+        is_formula_code = role in {"formula_expression", "code_line", "code_block"} \
+            or ot_l in {"formula", "formula_expression", "equation", "code", "code_block"}
+        if is_formula_code and _zone_of(bbox, special_zones):
+            continue
+        add("unit_policy", role or ot or rp, bbox)
     for r in regions or []:
         rtype = str(r.get("region_type") or "").lower()
         # Candidate / observation-only regions are not hard protections.

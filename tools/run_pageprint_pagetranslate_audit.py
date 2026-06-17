@@ -335,7 +335,7 @@ def main() -> int:
     parser.add_argument("--enable-ocr", action="store_true")
     args = parser.parse_args()
 
-    out = Path(args.out or f"ocr_results/pageprint_pagetranslate_audit_{time.strftime('%Y%m%d_%H%M%S')}")
+    out = Path(args.out or f"results/audit/pageprint_pagetranslate_audit_{time.strftime('%Y%m%d_%H%M%S')}")
     out.mkdir(parents=True, exist_ok=True)
     (out / "source_pages").mkdir(exist_ok=True)
 

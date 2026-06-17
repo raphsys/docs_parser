@@ -17,3 +17,7 @@ class PageRenderPlanError(PageReconstructError):
 
 class PageRenderBackendError(PageReconstructError):
     pass
+
+
+class PublicationReadyError(PageReconstructError):
+    pass

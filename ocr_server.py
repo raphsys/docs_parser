@@ -34,7 +34,7 @@ from page_extraction_postprocessors import apply_page_extraction_postprocessors
 from layout_ai_enricher import get_layout_ai_enricher
 
 # --- Configuration ---
-UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'uploads', 'converted_pages', 'ocr_results'
+UPLOAD_DIR, CONV_DIR, RESULTS_DIR = 'results/uploads', 'converted_pages', 'results/ocr_results'
 TARGET_DPI = 150 
 FONT_AI_AUDIT_DEFAULT = False
 EXTRACTION_AI_ENABLED = os.getenv("DOCS_PARSER_ENABLE_EXTRACTION_AI", "0") == "1"

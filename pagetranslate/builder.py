@@ -28,6 +28,10 @@ from .terminology import apply_post_translation_glossary, explicit_protected_ter
 from .technical_protection import is_technical_role, technical_tokens
 from .translation_plan_reader import read_translation_plan
 from .translator_bridge import TranslatorBridge
+from .text_survival import (
+    split_translation_units_for_text_survival,
+    repair_truncated_translation_units,
+)
 from translation_engines.placeholder_policy import choose_placeholder_style
 from translation_engines.translation_memory import TranslationMemory, load_translation_memory
 
@@ -98,7 +102,10 @@ class PageTranslationBuilder:
                 units = []
                 selection_mode = "fallback_disabled"
                 selection_warning = "PAGEPRINT did not provide translation_plan and fallback is disabled"
+        units = split_translation_units_for_text_survival(input_data, units)
         units = attach_unit_context(units, input_data, translation_profile)
+        # Hard invariant: PAGEPRINT visible lines are atomic output obligations.
+        units = split_translation_units_for_text_survival(input_data, units)
 
         translated_units = self._translate_units(
             units,
@@ -106,6 +113,7 @@ class PageTranslationBuilder:
             dry_run=dry_run,
             batch_size=batch_size,
         )
+        translated_units = repair_truncated_translation_units(input_data, translated_units)
         projections = project_translations(translated_input, translated_units)
         quality = assess_translation_quality(translated_units)
         runtime = self._runtime_status(translated_units, translation_profile, dry_run=dry_run)
@@ -178,6 +186,7 @@ class PageTranslationBuilder:
                 "translation_plan_input_count": translation_plan_input_count,
                 "fallback_selector_used": fallback_selector_used,
                 "generic_coalescer_used": generic_coalescer_used,
+                "text_survival_split_enabled": True,
                 "warning": selection_warning,
                 "selection_policy": "translation_plan first; selector/coalescer fallback only when plan is missing",
                 "fine_token_policy": "word/char excluded from translation units",

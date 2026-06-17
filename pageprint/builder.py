@@ -97,7 +97,11 @@ class PagePrintBuilder:
             pdf_page=pdf_page,
             sx=sx,
             sy=sy,
-            run_detector=False,
+            # PAGEPRINT must be able to run the region detector when upstream
+            # did not produce special regions. The detector remains optional:
+            # without DOCS_PARSER_SPECIAL_REGION_MODEL it falls back to the CPU
+            # PDF/heuristic path and reports its availability in debug.
+            run_detector=True,
         )
         dimensions = page_structure.get("dimensions") or dimensions
 
@@ -680,10 +684,21 @@ class PagePrintBuilder:
             policy = unit.get("policy") or {}
             constraints = unit.get("constraints") or {}
             understanding = unit.get("understanding") or {}
+            region_type = str(
+                (unit.get("structure_hints") or {}).get("region_type")
+                or understanding.get("region_type")
+                or policy.get("unit_type")
+                or ""
+            ).lower()
             return bool(
                 policy.get("protected_visual")
+                or policy.get("preserve_visual")
+                or policy.get("preserve_original_pixels")
+                or policy.get("must_preserve_visual")
                 or constraints.get("skip_text_reconstruction")
+                or constraints.get("preserve_original_pixels")
                 or understanding.get("protected_visual")
+                or region_type in {"image_region", "drawing_region", "non_text_zone", "figure_region", "chart_region"}
                 or policy.get("render_policy") == "background_only"
                 or policy.get("translation_strategy") == "background_only"
                 or policy.get("unit_type") in {

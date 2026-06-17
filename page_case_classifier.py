@@ -47,13 +47,20 @@ class PageCaseClassifier:
         s = self._block_text({"text": text})
         if not s or len(s) > 200:
             return False
-        if re.search(r"\b(from|import|def|class|return|lambda)\b", s, flags=re.IGNORECASE):
+        words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9'\-]*", s)
+        punct_ratio = self._safe_ratio(len(re.findall(r"[^A-Za-zÀ-ÿ0-9\s]", s)), max(1, len(s)))
+        # Long prose may contain words like "from" or function-looking tokens
+        # inside explanations.  Do not classify it as code unless code
+        # punctuation is dense.
+        if len(words) >= 10 and punct_ratio < 0.18:
+            return False
+        if re.search(r"^\s*(from|import|def|class|return|lambda)\b", s, flags=re.IGNORECASE):
             return True
-        if re.search(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", s):
+        if re.search(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", s) and len(words) <= 8:
             return True
-        if re.search(r"[A-Za-z_][A-Za-z0-9_]*\(", s):
+        if re.search(r"[A-Za-z_][A-Za-z0-9_]*\(", s) and (len(words) <= 8 or punct_ratio >= 0.18):
             return True
-        if re.search(r"[{}\[\]_]|==|!=|<=|>=|=>|:=|=\s*['\"]", s):
+        if re.search(r'[{}\[\]_"]|==|!=|<=|>=|=>|:=|=\s*[\'"]', s):
             return True
         return False
 
@@ -314,7 +321,11 @@ class PageCaseClassifier:
 
         whitespace_ratio = max(0.0, 1.0 - min(1.0, (text_area + sum(self._bbox_area(item.get("bbox")) for item in images or [])) / page_area))
         scientific_pattern_score = min(1.0, round((scientific_pattern_hits * 1.5 + citation_like_blocks + equation_blocks) / 8.0, 4))
-        form_pattern_score = min(1.0, round((form_pattern_hits + max(0, tableish_lines - 1)) / 6.0, 4))
+        # Table-like spacing alone is not form evidence. PDF extraction often
+        # creates double-space gaps inside ordinary book/manual text and figure
+        # labels; using those gaps as form evidence misclassifies book pages as
+        # forms, then every downstream policy becomes wrong.
+        form_pattern_score = min(1.0, round((form_pattern_hits * 1.5 + email_count + url_count) / 6.0, 4))
         invoice_pattern_score = min(1.0, round((invoice_pattern_hits + currency_symbol_count + date_pattern_count) / 8.0, 4))
         toc_pattern_score = min(1.0, round((toc_like_lines * 2 + page_marker_lines) / 10.0, 4))
 
@@ -387,6 +398,7 @@ class PageCaseClassifier:
             "ai_header_regions": int(ai_region_types.get("header", 0)),
             "ai_caption_regions": int(ai_region_types.get("caption", 0)),
             "ai_region_coverage_ratio": self._safe_ratio(ai_region_area, page_area),
+            "page_index": int(page_data.get("page_index") or page_data.get("page") or 0),
         }
 
     def _build_regions(self, page_data):
@@ -426,6 +438,11 @@ class PageCaseClassifier:
         figure_ratio = float(features.get("figure_coverage_ratio", 0.0))
         url_count = int(features.get("url_count", 0))
         citation_like = int(features.get("citation_like_blocks", 0))
+        num_words = int(features.get("num_words", 0))
+        body_blocks = int(features.get("body_blocks", 0))
+        section_heading_blocks = int(features.get("section_heading_blocks", 0))
+        figure_captions = int(features.get("figure_captions", 0))
+        book_like = num_words >= 80 and (body_blocks >= 2 or section_heading_blocks >= 1 or figure_captions >= 1)
 
         if page_family == "toc" or toc_score >= 0.65:
             scores["book_page"] += 0.72
@@ -439,11 +456,19 @@ class PageCaseClassifier:
             scores["book_page"] += 0.42
         if features.get("figure_captions", 0) >= 1 and scientific < 0.35:
             scores["manual_guide"] += 0.2
+        if book_like:
+            scores["book_page"] += 0.52
+            scores["manual_guide"] += 0.28
         if page_family in {"mixed_page", "mixed_dense_illustrated", "mixed_formula_annotation_page"}:
             scores["report"] += 0.55
             scores["manual_guide"] += 0.45
-        if form_score >= 0.5:
+        if page_family == "cover_visual_page":
+            scores["book_page"] += 0.75
+            scores["advertisement_poster"] += 0.25
+        if form_score >= 0.5 and not book_like:
             scores["form"] += 0.88
+        elif form_score >= 0.5 and book_like:
+            scores["form"] += 0.18
         if invoice_score >= 0.45:
             scores["invoice"] += 0.9
             scores["receipt"] += 0.45
@@ -473,6 +498,10 @@ class PageCaseClassifier:
         ai_chart_regions = int(features.get("ai_chart_regions", 0))
         ai_formula_regions = int(features.get("ai_formula_regions", 0))
         ai_title_regions = int(features.get("ai_title_regions", 0))
+        body_blocks = int(features.get("body_blocks", 0))
+        figure_captions = int(features.get("figure_captions", 0))
+        num_words = int(features.get("num_words", 0))
+        book_like = num_words >= 80 and (body_blocks >= 2 or figure_captions >= 1 or int(features.get("section_heading_blocks", 0)) >= 1)
 
         if page_role == "toc":
             scores["toc_page"] = 0.98
@@ -482,7 +511,12 @@ class PageCaseClassifier:
             scores["double_column"] += 0.82
         elif col_count >= 3:
             scores["multi_column"] += 0.9
-        if page_family in {"table_page", "table_diagram_example"} or table_blocks >= 2 or table_ratio >= 0.28:
+        strong_table = (
+            page_family in {"table_page", "table_diagram_example"}
+            or table_ratio >= 0.28
+            or (table_blocks >= 3 and text_ratio < 0.35)
+        )
+        if strong_table and not (book_like and text_ratio >= 0.12 and table_ratio < 0.35):
             scores["table_dominant"] += 0.9
         if ai_table_regions >= 1:
             scores["table_dominant"] += min(0.28, 0.12 * ai_table_regions)
@@ -508,6 +542,10 @@ class PageCaseClassifier:
         if col_count == 2 and text_ratio >= 0.35 and table_blocks == 0:
             scores["double_column"] += 0.08
             scores["table_dominant"] = max(0.0, scores["table_dominant"] - 0.15)
+        if book_like and text_ratio >= 0.12:
+            scores["single_column"] += 0.12 if col_count == 1 else 0.0
+            scores["double_column"] += 0.12 if col_count == 2 else 0.0
+            scores["table_dominant"] = min(scores["table_dominant"], 0.55)
         return {k: round(min(1.0, max(0.0, v)), 4) for k, v in scores.items()}
 
     def score_style_profiles(self, features, page_family="unknown", page_role="body"):
@@ -517,11 +555,18 @@ class PageCaseClassifier:
         whitespace = float(features.get("whitespace_ratio", 0.0))
         table_ratio = float(features.get("table_coverage_ratio", 0.0))
         scientific = float(features.get("scientific_pattern_score", 0.0))
+        num_words = int(features.get("num_words", 0) or 0)
+        body_blocks = int(features.get("body_blocks", 0) or 0)
+        figure_captions = int(features.get("figure_captions", 0) or 0)
+        section_heading_blocks = int(features.get("section_heading_blocks", 0) or 0)
+        book_like = num_words >= 80 and (body_blocks >= 2 or figure_captions >= 1 or section_heading_blocks >= 1)
 
         if scientific >= 0.45 or page_family in {"body_text_two_column_equations", "citation_heavy_body_page"}:
             scores["academic_dense"] += 0.84
-        if page_family in {"table_page", "table_diagram_example"} or table_ratio >= 0.28:
+        if (page_family in {"table_page", "table_diagram_example"} or table_ratio >= 0.28) and not book_like:
             scores["tabular_structured"] += 0.88
+        elif book_like and table_ratio >= 0.28:
+            scores["editorial_visual"] += 0.22
         if page_family in {"illustrated_label_page", "chart_label_page", "body_with_figure"}:
             scores["editorial_visual"] += 0.8
         if int(features.get("visual_non_text", 0)) >= 4 and int(features.get("short_label_lines", 0)) >= 4:
@@ -558,6 +603,7 @@ class PageCaseClassifier:
             "mixed_formula_annotation_page": 0.0,
             "narrative_reference_page": 0.0,
             "citation_heavy_body_page": 0.0,
+            "cover_visual_page": 0.0,
         }
 
         col_count = int(features.get("column_count", 1))
@@ -579,12 +625,24 @@ class PageCaseClassifier:
         ai_chart_regions = int(features.get("ai_chart_regions", 0))
         ai_formula_regions = int(features.get("ai_formula_regions", 0))
         ai_title_regions = int(features.get("ai_title_regions", 0))
+        page_index = int(features.get("page_index", 0) or 0)
+        text_ratio = float(features.get("text_coverage_ratio", 0.0) or 0.0)
+        figure_ratio = float(features.get("figure_coverage_ratio", 0.0) or 0.0)
+        num_words = int(features.get("num_words", 0) or 0)
+        book_like = num_words >= 80 and (body_blocks >= 2 or section_heading_blocks >= 1 or figure_captions >= 1)
 
-        if int(features.get("tableish_lines", 0)) >= 6:
+        if (page_index in {0, 1}
+                and major_non_text >= 1
+                and figure_ratio >= 0.45
+                and text_ratio <= 0.16
+                and block_count <= 8):
+            scores["cover_visual_page"] += 0.9
+
+        if int(features.get("tableish_lines", 0)) >= 6 and not book_like:
             scores["table_page"] += 0.75
         if ai_table_regions >= 1:
             scores["table_page"] += min(0.25, 0.12 * ai_table_regions)
-        if int(features.get("tableish_lines", 0)) >= 2 and short_native_labels >= 3 and equation_blocks >= 1:
+        if int(features.get("tableish_lines", 0)) >= 2 and short_native_labels >= 3 and equation_blocks >= 1 and not book_like:
             scores["table_diagram_example"] += 0.82
         if ai_table_regions >= 1 and ai_formula_regions >= 1:
             scores["table_diagram_example"] += 0.12
@@ -608,6 +666,12 @@ class PageCaseClassifier:
             scores["chart_label_page"] += 0.16
         if figure_captions >= 1:
             scores["body_with_figure"] += 0.45
+        if book_like:
+            scores["body_text"] += 0.48
+            if figure_captions >= 1 or major_non_text >= 1:
+                scores["body_with_figure"] += 0.22
+            scores["table_page"] = min(scores["table_page"], 0.35)
+            scores["table_diagram_example"] = min(scores["table_diagram_example"], 0.35)
         if major_non_text >= 1:
             scores["body_with_figure"] += 0.15
             scores["body_with_diagram"] += 0.2
@@ -659,6 +723,11 @@ class PageCaseClassifier:
                     scores["body_text_two_column_equations"] += 0.08
             elif col_count == 1 and visual_non_text <= 1 and block_count <= 4 and short_text_blocks >= max(1, block_count - 1):
                 scores["body_text_single_column_sparse"] += 0.62
+
+        if scores.get("cover_visual_page", 0.0) >= 0.75:
+            scores["body_text"] = min(scores["body_text"], 0.12)
+            scores["mixed_page"] = min(scores["mixed_page"], 0.18)
+            scores["body_with_figure"] = min(scores["body_with_figure"], 0.25)
 
         if scores["body_text_two_column_sectioned"] > 0:
             scores["body_text_two_column"] = max(

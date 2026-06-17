@@ -32,7 +32,10 @@ def validate(plan: dict) -> dict:
         status = "ko"
 
     # --- review conditions
-    review_metrics = ("unresolved_style", "font_size_repaired", "layout_repaired",
+    # font_size_repaired n'est plus un déclencheur direct de review : la fidélité
+    # typo est jugée par le score typography + le gate page_style_unreliable
+    # (sinon une seule taille inférée bloquerait une page par ailleurs fiable).
+    review_metrics = ("unresolved_style", "layout_repaired",
                       "overflow", "patch_protected_overlap", "unknown_renderer")
     if status != "ko":
         if any(q[m] for m in review_metrics) or q["source_text_leak_risk"] == "high":
@@ -52,13 +55,17 @@ def validate(plan: dict) -> dict:
     findings.extend(vqa["findings"])
     publication_ready = (
         status == "ok"
+        and not vqa.get("hard_blockers")
         and scores["text_presence"] >= 1.0
+        and scores["non_text_presence"] >= 0.99
         and scores["overlap"] >= 0.99
         and scores["typography"] >= 0.95
         and scores["position"] >= 0.95
+        and scores.get("source_text_leak", 0.0) >= 0.98
         and q["source_text_leak_risk"] != "high"
         and vqa["publication_ready_score"] >= 0.95
     )
     return {"status": status, "quality": q, "findings": findings,
             "visual_scores": scores, "publication_ready_score": vqa["publication_ready_score"],
+            "hard_blockers": vqa.get("hard_blockers", []),
             "publication_ready": publication_ready}

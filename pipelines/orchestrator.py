@@ -11,6 +11,7 @@ document. ocr_server.py historique n'est ni importé ni modifié.
 
 from __future__ import annotations
 
+import os
 import time
 
 from .page_renderer import DEFAULT_TARGET_DPI, PageRenderer
@@ -158,8 +159,28 @@ class PipelineOrchestrator:
                 source_context=source_context,
                 extraction_result=extraction_result,
                 assets={"source_image_path": render_path},
+                page_image=render["image"],
+                pdf_page=pdf_page,
                 page_index=page_index,
             )
+
+            # 5b. Clean (text-removed) background — the legacy pipeline produced
+            # this and PAGERECONSTRUCT needs it; without it every page leaks the
+            # source text (source_background mode). Inpaint translatable text out.
+            try:
+                from .background_cleaner import build_clean_background
+                clean_path = build_clean_background(
+                    input_data,
+                    out_path=os.path.splitext(render_path)[0] + "_clean_bg.png",
+                )
+                if clean_path:
+                    input_data["assets"]["background_path"] = clean_path
+                    bg = input_data.setdefault("background", {})
+                    if isinstance(bg, dict):
+                        bg["path"] = clean_path
+                        bg["text_removed"] = True
+            except Exception as exc:  # pragma: no cover - never block extraction
+                trace.setdefault("background_cleaner", {})["error"] = repr(exc)
             trace["pageprint"] = {
                 "duration_s": round(time.perf_counter() - t0, 3),
                 "unit_count": len(input_data["units"]),

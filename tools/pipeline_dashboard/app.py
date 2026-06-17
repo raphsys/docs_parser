@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LIVE_DIR = ROOT / "ocr_results" / "dashboard_live"
+LIVE_DIR = ROOT / "results" / "dashboard_live"
 
 CAT_TAG = {"texte": "🟩 texte", "texte_exclu": "🟥 exclu", "formule": "🟨 formule",
            "code": "🟧 code", "table": "🟦 table", "figure": "🟪 figure", "region": "⬜ région"}
@@ -114,7 +114,7 @@ def _arg_db() -> str | None:
 
 
 def _find_dbs() -> list[str]:
-    return sorted(glob.glob(str(ROOT / "ocr_results" / "**" / "*.db"), recursive=True), reverse=True)
+    return sorted(glob.glob(str(ROOT / "results" / "**" / "*.db"), recursive=True), reverse=True)
 
 
 # ----------------------------------------------------------------- live run
@@ -413,7 +413,7 @@ def main() -> None:
             corpus = st.selectbox("…ou un PDF du corpus", ["—"] + [Path(p).name for p in pdfs]) if pdfs else "—"
             pdf = None
             if uploaded is not None:
-                up = ROOT / "uploads" / "dashboard_uploads"; up.mkdir(parents=True, exist_ok=True)
+                up = ROOT / "results" / "uploads" / "dashboard_uploads"; up.mkdir(parents=True, exist_ok=True)
                 pdf = str(up / uploaded.name); Path(pdf).write_bytes(uploaded.getvalue())
             elif corpus and corpus != "—":
                 pdf = str(pdf_dir / corpus)

@@ -61,10 +61,12 @@ TEXT_EXACT_ROLES = {
 }
 
 VISUAL_OVERLAY_ROLES = {
+    "formula_region",
     "formula_expression",
-    # A label baked inside a figure/chart belongs to the preserved figure pixels;
-    # keep it as a visual overlay (never translated, never repainted).
-    "diagram_label",
+    "equation",
+    "math_expression",
+    "code_region",
+    "protected_visual_region",
 }
 
 ARTIFACT_ROLES = {
@@ -102,8 +104,14 @@ def compile_unit_preservation(unit: dict, *, page_intelligence: dict) -> dict:
     text = str((unit.get("content") or {}).get("text") or "").strip()
     tags = {role, object_type, semantic_kind}
 
+    hints = (unit.get("understanding") or {}).get("structure_hints") or {}
+    if hints.get("policy_pending") or hints.get("observation_only"):
+        return _policy("none", "candidate_region_observation")
+
     if tags & ARTIFACT_ROLES:
         return _policy("exclude_as_artifact", "artifact_role")
+    if tags & {"formula_region", "formula", "equation", "math_expression", "code_region", "code", "protected_visual_region", "protected_visual"}:
+        return _policy("preserve_as_visual_overlay", "hard_special_region")
     if role in VISUAL_OVERLAY_ROLES:
         if _formula_can_be_redrawn_exactly(text):
             return _policy("preserve_text_exactly", "simple_formula_text")
@@ -132,6 +140,7 @@ def _inline_protected_tokens(text: str, *, role: str = "unknown") -> list[str]:
     if not text:
         return []
     tokens = []
+    tokens.extend(re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", text))
     for raw in re.findall(r"\b[A-Z0-9][A-Z0-9&./+-]{1,12}\b", text):
         if _is_protected_acronym(raw, role=role):
             tokens.append(raw)

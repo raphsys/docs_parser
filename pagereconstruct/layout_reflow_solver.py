@@ -9,8 +9,8 @@ from __future__ import annotations
 from .flow_geometry_optimizer import solve_flow_geometry, apply_flow_geometry_patches_in_place
 
 
-def solve_spacing_reflow(contract, *, enabled: bool = True):
-    return solve_flow_geometry(contract, enabled=enabled)
+def solve_spacing_reflow(contract, *, enabled: bool = True, normalized: dict | None = None, **kwargs):
+    return solve_flow_geometry(contract, enabled=enabled, normalized=normalized)
 
 
 def apply_spacing_reflow_patches_in_place(contract, result):

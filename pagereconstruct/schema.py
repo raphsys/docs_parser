@@ -21,10 +21,12 @@ class ProtectedRegion:
     bbox: list | None
     hard: bool = True
     z_policy: str = "preserve_original"  # under_text | over_text | preserve_original
+    source_unit_ids: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "source": self.source, "reason": self.reason,
-                "bbox": self.bbox, "hard": self.hard, "z_policy": self.z_policy}
+                "bbox": self.bbox, "hard": self.hard, "z_policy": self.z_policy,
+                "source_unit_ids": list(self.source_unit_ids or [])}
 
 
 @dataclass

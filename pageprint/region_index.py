@@ -23,6 +23,9 @@ VISUAL_REGION_TYPES = {
     "image_region",
     "drawing_region",
     "non_text_zone",
+    "formula_region",
+    "code_region",
+    "protected_visual_region",
     "formula_candidate_region",
     "code_candidate_region",
     "visual_candidate_region",
@@ -68,6 +71,9 @@ def _overlap_ratio(unit_bbox, region_bbox) -> float:
 
 def _normalize_region_type(raw_type: str | None) -> str:
     mapping = {
+        # HARD special zones: formulas/code/protected visuals are no longer
+        # observation-only candidates.  They must survive PAGEPRINT ->
+        # PAGERECONSTRUCT -> final contract.
         "formula": "formula_candidate_region",
         "formula_region": "formula_candidate_region",
         "formula_candidate_region": "formula_candidate_region",
@@ -75,19 +81,19 @@ def _normalize_region_type(raw_type: str | None) -> str:
         "math_expression": "formula_candidate_region",
         "chemical_formula": "formula_candidate_region",
         "symbolic_expression": "formula_candidate_region",
+        "special_notation": "formula_candidate_region",
+        "table_formula_cell": "formula_candidate_region",
         "code": "code_candidate_region",
         "code_region": "code_candidate_region",
         "code_candidate_region": "code_candidate_region",
         "code_block": "code_candidate_region",
         "inline_code": "code_candidate_region",
         "algorithm_block": "code_candidate_region",
-        "special_notation": "formula_candidate_region",
-        "table_formula_cell": "formula_candidate_region",
-        "diagram_label_non_linguistic": "diagram_region",
         "protected_visual": "visual_candidate_region",
         "protected_visual_region": "visual_candidate_region",
         "visual_candidate_region": "visual_candidate_region",
-        "table_candidate_region": "table_candidate_region",
+        "diagram_label_non_linguistic": "diagram_region",
+        "table_candidate_region": "table_region",
         "table": "table_region",
         "table_region": "table_region",
         "table_cell": "table_cell",
@@ -111,7 +117,28 @@ def _normalize_region_type(raw_type: str | None) -> str:
     return mapping.get(str(raw_type), str(raw_type))
 
 
+def _hard_special_policy(region_type: str) -> dict:
+    return {
+        "unit_type": region_type,
+        "object_type": "formula" if "formula" in region_type else "code" if "code" in region_type else "protected_visual",
+        "translatable": False,
+        "translation_strategy": "exact_preserve",
+        "render_policy": "fixed_preserve",
+        "coverage_required": "strict",
+        "policy_pending": False,
+        "must_preserve_visual": True,
+        "protected_visual": True,
+        "preserve_visual": True,
+        "preserve_original_pixels": True,
+        "skip_translation": True,
+        "skip_text_reconstruction": True,
+        "must_exclude_from_translation_flow": True,
+    }
+
+
 def _region_policy(region_type: str) -> dict:
+    if region_type in {"formula_region", "code_region", "protected_visual_region"}:
+        return _hard_special_policy(region_type)
     if region_type in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
         return {
             "unit_type": region_type,
@@ -167,11 +194,11 @@ def _region_policy(region_type: str) -> dict:
 
 
 def _region_constraints(region_type: str) -> dict:
-    fixed = region_type in {"image_region", "drawing_region", "non_text_zone", "chart_tick"}
+    fixed = region_type in {"image_region", "drawing_region", "non_text_zone", "chart_tick", "formula_region", "code_region", "protected_visual_region"}
     return {
         "preserve_bbox": fixed,
-        "preserve_as_overlay": region_type in {"image_region", "drawing_region"},
-        "allow_reflow": not fixed and region_type not in {"table_cell", "code"},
+        "preserve_as_overlay": region_type in {"image_region", "drawing_region", "formula_region", "code_region", "protected_visual_region"},
+        "allow_reflow": not fixed and region_type not in {"table_cell", "code", "formula_region", "code_region", "protected_visual_region"},
     }
 
 
@@ -202,6 +229,7 @@ def _collect_raw_regions(page_structure: dict) -> list[tuple[dict, str]]:
         if isinstance(raw, dict):
             collected.append(({**raw, "region_type": "drawing"}, "native_pdf"))
     return collected
+
 
 
 def build_regions(page_structure: dict, *, page_index: int = 0,
@@ -288,10 +316,22 @@ def build_regions(page_structure: dict, *, page_index: int = 0,
                 "reason": raw.get("reason") or "candidate_region_observation",
                 "detection_source": raw.get("detection_source") or raw.get("source") or source,
             })
+        if region_type in {"formula_region", "code_region", "protected_visual_region"}:
+            obj = "formula" if region_type == "formula_region" else "code" if region_type == "code_region" else "protected_visual"
+            region.update({
+                "object_type": raw.get("object_type") or raw.get("special_class") or obj,
+                "object_class": raw.get("object_class") or raw.get("subtype") or obj,
+                "claim_type": raw.get("claim_type") or f"{obj}_confirmed",
+                "policy_pending": False,
+                "observation_only": False,
+                "protected_visual": True,
+                "preserve_original_pixels": True,
+                "reason": raw.get("reason") or "hard_special_region",
+                "detection_source": raw.get("detection_source") or raw.get("source") or source,
+            })
         if raw.get("subtype"):
             region["subtype"] = raw.get("subtype")
         regions.append(region)
-
     return regions
 
 
@@ -354,6 +394,15 @@ def unit_has_protected_visual_region(unit: dict) -> bool:
 
 
 def _membership_threshold(level: str | None, region_type: str | None, default: float) -> float:
+    if region_type in {"formula_region", "code_region", "protected_visual_region"}:
+        return {
+            "block": 0.85,
+            "line": 0.75,
+            "phrase": 0.65,
+            "span": 0.55,
+            "word": 0.45,
+            "char": 0.35,
+        }.get(level or "", 0.75)
     if region_type not in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:
         return default
     if level in {"block", "line"}:
@@ -383,6 +432,8 @@ def _coverage_mode(level: str | None, overlap_ratio: float) -> str:
 
 
 def _action_hint(region_type: str | None, coverage_mode: str) -> str:
+    if region_type in {"formula_region", "code_region", "protected_visual_region"}:
+        return "hard_preserve_region"
     if coverage_mode == "full_coverage":
         return "resolve_policy_for_unit"
     if region_type in {"formula_candidate_region", "code_candidate_region", "visual_candidate_region"}:

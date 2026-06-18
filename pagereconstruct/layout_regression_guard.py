@@ -158,6 +158,11 @@ def sanitize_contract_layouts_in_place(contract: Any, *, findings: list | None =
             continue
         checked += 1
         bad, reason = _is_dangerous_shift(cur, ref, role=_role(block), page_h=page_h)
+        if not bad and getattr(layout, "allow_local_shift", False) is not True:
+            dy = abs(_center_y(cur) - _center_y(ref))
+            dx = abs(_center_x(cur) - _center_x(ref))
+            if dy > 2.0 or dx > 2.0:
+                bad, reason = True, "source_anchor_shift_without_permission"
         if not bad:
             continue
         _set_layout_bbox(layout, ref)

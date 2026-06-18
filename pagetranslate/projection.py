@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .text_utils import normalize_spaces
 from .text_survival import append_uncovered_source_line_fallbacks
+from source_ownership import filter_translation_units_by_ownership, build_source_ownership, is_non_translatable_owner
 
 
 def project_translations(translated_input: dict, translated_units: list[dict]) -> list[dict]:
@@ -12,6 +13,7 @@ def project_translations(translated_input: dict, translated_units: list[dict]) -
         for unit in translated_input.get("units") or []
         if isinstance(unit, dict) and unit.get("unit_id")
     }
+    translated_units = filter_translation_units_by_ownership(translated_input, translated_units)
     projections = []
     for item in translated_units:
         target_ids = item.get("source_unit_ids") or [item.get("unit_id")]
@@ -114,6 +116,10 @@ def _backfill_single_span_child(unit: dict, unit_map: dict[str, dict], translate
 
 
 def _aggregate_parent_translations(unit_map: dict[str, dict]) -> None:
+    # Do not aggregate protected/preserved child text back into a parent.  That
+    # would reintroduce formula/code glyphs into translated natural-text blocks.
+    pseudo_input = {"units": list(unit_map.values())}
+    ownership = build_source_ownership(pseudo_input)
     ordered = sorted(
         unit_map.values(),
         key=lambda unit: (unit.get("geometry") or {}).get("reading_order_index") or 0,
@@ -129,6 +135,7 @@ def _aggregate_parent_translations(unit_map: dict[str, dict]) -> None:
             normalize_spaces((child.get("content") or {}).get("translated_text"))
             for child in children
             if child.get("level") in {"phrase", "line", "span", "block"}
+            and not is_non_translatable_owner(ownership, child.get("unit_id"))
         ]
         translated_children = [text for text in translated_children if text]
         if translated_children and not normalize_spaces((unit.get("content") or {}).get("translated_text")):
@@ -206,6 +213,7 @@ def _semantic_reconstruction_unit(item: dict, unit_map: dict[str, dict] | None =
 
 
 def _reconstruction_units(translated_input: dict, translated_units: list[dict]) -> list[dict]:
+    translated_units = filter_translation_units_by_ownership(translated_input, translated_units)
     output = []
     unit_map = {
         unit.get("unit_id"): unit

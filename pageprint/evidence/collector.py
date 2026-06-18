@@ -143,7 +143,16 @@ def _unit_text_claims(unit: dict, page_intelligence: dict) -> list[dict]:
         claims.append(_simple_claim(unit, "email", text, 0.98, "email_pattern"))
     if ACRONYM_RE.fullmatch(text):
         claims.append(_simple_claim(unit, "acronym", text, 0.85, "acronym_pattern"))
-    if PAGE_REF_RE.fullmatch(text) and level in {"phrase", "span", "line"}:
+    # A numeric/roman token is not a page reference by syntax alone.  In
+    # particular, PDF spans split headings such as "CHAPTER 7" into "C" and
+    # "7"; treating those spans as page references creates exact-preservation
+    # ops on top of the translated heading.  Page references are autonomous
+    # line/phrase units and require page/role/position context.
+    if (
+        PAGE_REF_RE.fullmatch(text)
+        and level in {"phrase", "line"}
+        and _has_page_reference_context(unit, page_intelligence, page_role, role)
+    ):
         claims.append(_simple_claim(unit, "page_reference", text, 0.78, "page_reference_pattern"))
     if SECTION_NUMBER_RE.fullmatch(f" {text} "):
         claims.append(_simple_claim(unit, "section_number", text, 0.82, "section_number_pattern"))
@@ -193,6 +202,26 @@ def _simple_claim(unit: dict, claim_type: str, value: str, confidence: float, re
         evidence={"level": unit.get("level")},
         bbox=(unit.get("geometry") or {}).get("bbox"),
     )
+
+
+def _has_page_reference_context(
+    unit: dict,
+    page_intelligence: dict,
+    page_role: str,
+    role: str,
+) -> bool:
+    if page_role in {"toc", "index"} or "page_reference" in role or role == "page_number":
+        return True
+    bbox = (unit.get("geometry") or {}).get("bbox")
+    page_geometry = page_intelligence.get("page_geometry") or {}
+    height = float(page_geometry.get("height") or 0.0)
+    dpi = float(page_geometry.get("render_dpi") or 72.0)
+    if height and dpi:
+        height = height * 72.0 / dpi
+    if not height or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return False
+    y0, y1 = float(bbox[1]), float(bbox[3])
+    return y1 < height * 0.12 or y0 > height * 0.88
 
 
 def _looks_natural_text(text: str) -> bool:

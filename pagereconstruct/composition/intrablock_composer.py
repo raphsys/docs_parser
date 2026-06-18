@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
 from ..text_measure import measure_block
+from .text_sanitizer import sanitize_render_text
 
 
 @dataclass
@@ -125,6 +126,72 @@ def _clamp_render_size(size: float, role: str) -> float:
     return max(lo, min(hi, float(size or 10.0)))
 
 
+
+def _role_name(block) -> str:
+    return str(getattr(block, "role", "") or "")
+
+
+def _bbox_dims(bbox) -> tuple[float, float]:
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        return max(0.0, float(bbox[2]) - float(bbox[0])), max(0.0, float(bbox[3]) - float(bbox[1]))
+    return 0.0, 0.0
+
+
+def _role_line_height_factor(role: str) -> float:
+    if role in {"section_heading", "subsection_heading", "chapter_heading", "title", "subtitle", "heading"}:
+        return 1.18
+    if role in {"caption", "figure_caption", "table_caption", "footnote", "bibliography_entry"}:
+        return 1.16
+    if role in {"toc_entry", "toc_entry_title", "index_entry", "index_subentry"}:
+        return 1.10
+    return 1.22
+
+
+def _flow_block_id(block) -> bool:
+    return str(getattr(block, "block_id", "") or "").startswith("flowgrp_")
+
+
+def _allow_render_expansion(block) -> bool:
+    role = _role_name(block)
+    layout = getattr(block, "layout", None)
+    if bool(getattr(layout, "bbox_locked", False)):
+        return False
+    if role in {"page_number", "page_reference", "formula", "formula_expression", "equation", "code", "code_line", "code_block", "table_body_cell", "table_header_cell", "table_numeric_cell"}:
+        return False
+    return _flow_block_id(block) or role in {"body_paragraph", "body", "paragraph", "list_item", "caption", "figure_caption", "table_caption", "bibliography_entry", "footnote"}
+
+
+def _expanded_bbox_for_text(block, bbox, text: str, style: dict) -> list:
+    """Give the composer enough vertical room for real wrapped lines.
+
+    Earlier render stages sometimes kept source-line height while translation
+    needed multiple lines.  Rendering inside that tiny box put text in the
+    interline.  This expansion is render-time only and bounded by page/obstacles
+    upstream; it does not mutate the source contract.
+    """
+    if not _allow_render_expansion(block) or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return list(bbox) if isinstance(bbox, (list, tuple)) else bbox
+    x0, y0, x1, y1 = [float(x) for x in bbox]
+    w, h = _bbox_dims(bbox)
+    if w <= 4 or not text:
+        return [x0, y0, x1, y1]
+    size = float(style.get("font_size_pt") or 10.0)
+    factor = _role_line_height_factor(_role_name(block))
+    line_h = max(size * factor, float(style.get("line_height_pt") or 0.0), 7.0)
+    # Conservative character-width estimate.  It intentionally overestimates a
+    # little to prevent overflow-induced interline writing.
+    avg_char_w = max(3.0, size * 0.50)
+    est_lines = max(1, int((len(text) * avg_char_w) // max(12.0, w)) + 1)
+    # A flow group already represents multiple source lines; preserve at least
+    # that vertical rhythm even if the text is short.
+    if _flow_block_id(block):
+        est_lines = max(est_lines, 2)
+    needed_h = est_lines * line_h + max(1.5, size * 0.20)
+    if needed_h <= h:
+        return [x0, y0, x1, y1]
+    max_growth = 220.0 if _flow_block_id(block) else 90.0
+    return [x0, y0, x1, min(y1 + max_growth, y0 + needed_h)]
+
 def _style_for_measure(block) -> dict:
     st = getattr(block, "style", None)
     if st is None:
@@ -134,14 +201,17 @@ def _style_for_measure(block) -> dict:
              "serif": getattr(st, "font_class", "serif") == "serif"}
     raw = getattr(st, "font_size_pt", None) or 10.0
     size = _clamp_render_size(raw, getattr(block, "role", ""))
+    line_h = getattr(st, "line_height", None) or getattr(st, "line_height_pt", None) or size * _role_line_height_factor(getattr(block, "role", ""))
     return {"font_size_pt": size, "flags": flags,
             "color": getattr(st, "color", "#000000"),
+            "line_height_pt": float(line_h or size * 1.2),
             "alignment": getattr(st, "alignment", "left")}
 
 
 def compose_block(block) -> IntraBlockComposition:
     """Compose un BlockReconstructionContract en lignes mesurées (pt)."""
-    text = (getattr(block, "translated_text", "") or getattr(block, "source_text", "") or "").strip()
+    raw_text = (getattr(block, "translated_text", "") or getattr(block, "source_text", "") or "").strip()
+    text, sanitize_findings = sanitize_render_text(raw_text)
     layout = getattr(block, "layout", None)
     bbox = getattr(layout, "layout_bbox", None) or getattr(layout, "coverage_bbox", None) or getattr(layout, "source_bbox", None)
     block_id = getattr(block, "block_id", "")
@@ -154,10 +224,15 @@ def compose_block(block) -> IntraBlockComposition:
         block_bbox=list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
         content_bbox=list(bbox) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else None,
     )
+    if sanitize_findings:
+        comp.findings.extend(sanitize_findings)
     if not text or not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
         comp.findings.append("missing_text_or_bbox")
         return comp
     style = _style_for_measure(block)
+    bbox = _expanded_bbox_for_text(block, bbox, text, style)
+    comp.block_bbox = list(bbox)
+    comp.content_bbox = list(bbox)
     align = style.get("alignment") if style.get("alignment") in {"left", "center", "right"} else "left"
     lay = measure_block(text, bbox, style, align=align)
     color = _hex_rgb(getattr(getattr(block, "style", None), "color", "#000000"))
@@ -167,11 +242,11 @@ def compose_block(block) -> IntraBlockComposition:
     lns = lay.get("lines") or []
     base_lh = float(lay.get("line_h") or size * 1.2)
 
-    # Natural baseline grid: do not distribute lines across spare bbox height.
-    # The publication geometry optimizer owns bbox expansion/cascade.
-    # Intra-block composition only stacks wrapped lines by measured line height.
-    box_h = float(bbox[3] - bbox[1])
-    lh = base_lh
+    # Stable baseline grid.  Use the larger of measured glyph height and style
+    # line height so wrapped lines cannot be painted into the interline.
+    role_factor = _role_line_height_factor(_role_name(block))
+    style_lh = float(style.get("line_height_pt") or 0.0)
+    lh = max(base_lh, style_lh, size * role_factor)
     comp.used_font_size = size
     comp.used_line_height = lh
     comp.overflow = bool(lay.get("overflow"))
@@ -180,7 +255,7 @@ def compose_block(block) -> IntraBlockComposition:
         line_id = f"{comp.block_id}_l{idx}"
         run_id = f"{line_id}_r0"
         glyph_h = float(box[3] - box[1])
-        y_top = y0 + idx * lh if lh > base_lh else float(box[1])
+        y_top = y0 + idx * lh
         nbox = [box[0], y_top, box[2], y_top + glyph_h]
         run = TextRunPlacement(text=ln, bbox=nbox, font_path=fpath,
                                size_pt=size, color=color,

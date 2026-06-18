@@ -17,6 +17,7 @@ from .block_contract import BlockReconstructionContract
 from .object_contract import ObjectContract
 from .preservation_contract import PreservationContract
 from .quality_contract import QualityContract
+from source_ownership import NON_TRANSLATABLE_STATES
 
 # Ordre des couches obligatoire (directive: layer_order_contract).
 LAYER_ORDER = [
@@ -110,6 +111,12 @@ class FinalReconstructionContract:
             preservation=PreservationContract.from_plan(plan),
             quality=QualityContract(),
         )
+        contract.legacy_compatibility["source_ownership"] = (
+            (plan.get("render_policy") or {}).get("source_ownership")
+            or normalized.get("source_ownership")
+            or ((normalized.get("views") or {}).get("source_ownership"))
+            or {}
+        )
         contract.source_unit_states = build_source_unit_states(contract)
         return contract
 
@@ -166,8 +173,25 @@ class FinalReconstructionContract:
 
 def build_source_unit_states(contract: FinalReconstructionContract) -> list[SourceUnitState]:
     states: dict[str, SourceUnitState] = {}
+    ownership = (contract.legacy_compatibility or {}).get("source_ownership") or {}
+
+    # Seed upstream non-translatable ownership.  These states are authoritative:
+    # a formula/code/protected visual owner cannot later become translated text.
+    for sid, entry in ownership.items():
+        state = (entry or {}).get("state")
+        if state in NON_TRANSLATABLE_STATES:
+            states[sid] = SourceUnitState(
+                source_unit_id=sid,
+                state=state,
+                owner_contract_id=(entry or {}).get("region_id") or (entry or {}).get("preservation_id") or (entry or {}).get("owner"),
+                findings=[],
+            )
+
     for b in contract.blocks:
         for sid in b.source_unit_ids or []:
+            if sid in states and states[sid].state in NON_TRANSLATABLE_STATES:
+                states[sid].findings.append("translated_block_suppressed_by_source_ownership")
+                continue
             states[sid] = SourceUnitState(
                 source_unit_id=sid,
                 state="translated_and_rendered",
@@ -185,9 +209,15 @@ def build_source_unit_states(contract: FinalReconstructionContract) -> list[Sour
             if not sid:
                 continue
             st = states.get(sid)
-            if st:
+            if st and st.state == "translated_and_rendered":
                 st.preservationop_ids.append(getattr(p, "object_id", sid))
                 st.findings.append("source_unit_both_preserved_and_translated")
+            elif st:
+                st.preservationop_ids.append(getattr(p, "object_id", sid))
+                if st.state in {"preserved_visual", "preserved_text_exact"}:
+                    st.state = st.state
+                else:
+                    st.state = "preserved_exact"
             else:
                 states[sid] = SourceUnitState(
                     source_unit_id=sid,

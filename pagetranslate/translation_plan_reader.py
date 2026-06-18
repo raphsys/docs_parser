@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .text_utils import normalize_spaces
 from .selector import strip_running_header_page_number
+from source_ownership import filter_translation_units_by_ownership
 
 
 def read_translation_plan(input_data: dict) -> list[dict]:
@@ -49,4 +50,4 @@ def read_translation_plan(input_data: dict) -> list[dict]:
             "original_unit_id": item.get("unit_id") or translation_unit_id,
             "plan_item": item,
         })
-    return output
+    return filter_translation_units_by_ownership(input_data, output)

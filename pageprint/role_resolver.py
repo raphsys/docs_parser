@@ -219,7 +219,10 @@ def infer_page_role(role_counts: dict | None, logical_structures: dict | None = 
     return current
 
 
-_FIGURE_REGION_TYPES = ("drawing_region", "image_region", "diagram_region", "chart")
+# A PDF drawing is often a table grid, coloured callout, underline or page
+# decoration.  It is not sufficient evidence that nearby PDF text is baked into
+# a figure.  Raster images and explicitly classified diagrams/charts are.
+_FIGURE_REGION_TYPES = ("image_region", "diagram_region", "chart_region")
 
 
 def _inside_figure_zone(unit: dict) -> bool:
@@ -249,7 +252,7 @@ def resolve_unit_role(unit: dict, *, page_intelligence: dict, document_context: 
             return "publisher_mark", "publisher_mark_pattern", 0.88
         if WATERMARK_RE.search(text):
             return "watermark", "watermark_pattern", 0.88
-        if PAGE_REF_RE.fullmatch(text) and _in_margin(unit, page_intelligence):
+        if level in {"block", "line", "phrase"} and PAGE_REF_RE.fullmatch(text) and _in_margin(unit, page_intelligence):
             return "page_reference", "page_number_margin", 0.82
         # Strong math wins over any legacy/page-context role: an equation line
         # ("= …", "× 6 ×") must be PRESERVED, never carried into a toc_entry/list
@@ -373,6 +376,8 @@ def _is_strong_math(text: str) -> bool:
     """
     s = str(text or "").strip()
     if not s:
+        return False
+    if re.fullmatch(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+(?:[,.])?", s):
         return False
     words = re.findall(r"[A-Za-z]{2,}", s)
     # Symbol/Wingdings glyphs (U+F000–U+F0FF) mark a formula fragment (piecewise

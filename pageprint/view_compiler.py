@@ -19,6 +19,12 @@ FORBIDDEN_TRANSLATION_ROLES = {
     "code",
     "watermark",
     "publisher_mark",
+    "formula_region",
+    "code_region",
+    "protected_visual_region",
+    "formula",
+    "equation",
+    "math_expression",
 }
 
 
@@ -91,8 +97,15 @@ def _translation_plan(unit_map: dict[str, dict], semantic_system: dict, page_int
             errors.append(f"translation_segment_empty_text:{entry.get('translation_segment_id') or idx}")
             continue
         render_target = entry.get("render_target") or _render_target_for_segment(entry, unit_map, source_ids, idx, role)
+        inherited_protected = []
+        for sid in source_ids:
+            inherited_protected.extend((unit_map.get(sid, {}).get("policy") or {}).get("protected_tokens") or [])
         protected_tokens = [
-            token for token in list(dict.fromkeys((entry.get("protected_tokens") or entry.get("protected") or []) + (policy.get("protected_tokens") or [])))
+            token for token in list(dict.fromkeys(
+                (entry.get("protected_tokens") or entry.get("protected") or [])
+                + (policy.get("protected_tokens") or [])
+                + inherited_protected
+            ))
             if token and token in source_text
         ]
         output.append({
@@ -125,10 +138,83 @@ def _translation_plan(unit_map: dict[str, dict], semantic_system: dict, page_int
     return output, errors, warnings
 
 
+def _is_hard_special_unit(unit: dict) -> bool:
+    policy = unit.get("policy") or {}
+    understanding = unit.get("understanding") or {}
+    hints = understanding.get("structure_hints") or {}
+    if hints.get("policy_pending") or hints.get("observation_only"):
+        return False
+    tags = {
+        str(policy.get("unit_type") or "").lower(),
+        str(understanding.get("role") or "").lower(),
+        str(understanding.get("object_type") or "").lower(),
+        str(understanding.get("object_class") or "").lower(),
+        str(understanding.get("semantic_kind") or "").lower(),
+    }
+    if tags & {"formula_region", "formula", "equation", "math_expression", "code_region", "code", "protected_visual_region", "protected_visual"}:
+        return True
+    # Generic image/drawing preservation is background ownership, not a hard
+    # special-text overlay.  Only explicit formula/code/protected-special roles
+    # enter the PreservationPlan.
+    return False
+
+
+def _hard_special_reason(unit: dict) -> str:
+    understanding = unit.get("understanding") or {}
+    tags = [
+        str(understanding.get("role") or "").lower(),
+        str(understanding.get("object_type") or "").lower(),
+        str((unit.get("policy") or {}).get("unit_type") or "").lower(),
+    ]
+    if any("formula" in t or "equation" in t or "math" in t for t in tags):
+        return "formula_region"
+    if any("code" in t for t in tags):
+        return "code_region"
+    return "protected_visual_region"
+
+
 def _preservation_plan(units: list[dict], logical_structures: dict | None = None) -> list[dict]:
     output = []
     counter = 1
     logical_structures = logical_structures or {}
+    hard_seen: set[str] = set()
+    by_id = {u.get("unit_id"): u for u in units or [] if isinstance(u, dict) and u.get("unit_id")}
+    hard_ids = {uid for uid, unit in by_id.items() if _is_hard_special_unit(unit) and bbox_of(unit)}
+
+    def has_hard_ancestor(unit: dict) -> bool:
+        parent = unit.get("parent_id") or unit.get("parent_unit_id")
+        while parent:
+            if parent in hard_ids:
+                return True
+            ancestor = by_id.get(parent) or {}
+            parent = ancestor.get("parent_id") or ancestor.get("parent_unit_id")
+        return False
+
+    for unit in units or []:
+        if not isinstance(unit, dict) or not _is_hard_special_unit(unit):
+            continue
+        if has_hard_ancestor(unit):
+            continue
+        bbox = bbox_of(unit)
+        if not bbox:
+            continue
+        uid = unit.get("unit_id")
+        key = uid or str(bbox)
+        if key in hard_seen:
+            continue
+        hard_seen.add(key)
+        output.append({
+            "preservation_id": f"pres_{counter:04d}",
+            "source_unit_ids": [uid] if uid else [],
+            "logical_unit_id": uid,
+            "text": text_of(unit) or None,
+            "preservation_mode": "preserve_as_visual_overlay",
+            "render_mode": "fixed_preserve",
+            "reason": _hard_special_reason(unit),
+            "bbox": bbox,
+            "hard_special_region": True,
+        })
+        counter += 1
     for entry in logical_structures.get("toc_entries") or []:
         for kind, value in (
             ("toc_bullet_marker", entry.get("marker")),

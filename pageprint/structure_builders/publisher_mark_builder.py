@@ -36,7 +36,9 @@ def build_artifacts(units: list[dict], *, page_intelligence: dict | None = None)
         elif role == "watermark" or WATERMARK_RE.search(text):
             watermarks.append(_artifact("watermark", idx, unit, "exclude_as_artifact", location))
         elif role in {"page_reference", "page_number", "toc_page_reference"} or (
-            PAGE_NUMBER_RE.fullmatch(text) and location in {"top_margin", "bottom_margin"}
+            unit.get("level") in {"block", "line", "phrase"}
+            and PAGE_NUMBER_RE.fullmatch(text)
+            and location in {"top_margin", "bottom_margin"}
         ):
             page_numbers.append(_artifact("page_number", idx, unit, "preserve_text_exactly", location))
     return {

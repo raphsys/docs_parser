@@ -62,18 +62,29 @@ def audit_page(plan: dict, normalized: dict) -> StageAuditResult:
         res.findings.append(Finding(type=f["type"], severity=KO, element_id=f.get("block_id")))
     # texte rendu par bloc = lignes des TextOps (composition)
     rendered = {}
+    rendered_by_source = []
     for op in plan.get("render_ops") or []:
         if op.get("op_type") != "text":
             continue
         uid = op.get("unit_id")
         txt = " ".join(l.get("text", "") for l in op.get("lines") or [])
         rendered.setdefault(uid, []).append(txt)
+        rendered_by_source.append((set(op.get("source_unit_ids") or []), txt))
 
     auds = []
     for b in blocks:
         bid = b.get("id")
         expected = (b.get("translated_text") or b.get("source_text") or "").strip()
-        placed = " ".join(rendered.get(bid, []))
+        source_ids = set(b.get("source_unit_ids") or [])
+        placed_parts = list(rendered.get(bid, []))
+        if not placed_parts and source_ids:
+            for op_source_ids, text in rendered_by_source:
+                if source_ids & op_source_ids or any(
+                    a.startswith(c + "_") or c.startswith(a + "_")
+                    for a in source_ids for c in op_source_ids
+                ):
+                    placed_parts.append(text)
+        placed = " ".join(placed_parts)
         exp_w, plc_w = _words(expected), set(_words(placed))
         if not exp_w:
             cov = 1.0

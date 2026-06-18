@@ -43,6 +43,8 @@ def _dim_font_class(src_cls, rec_cls) -> DimensionScore:
 
 
 def _dim_size(src_pt, rec_pt, size_source) -> DimensionScore:
+    if size_source == "ocr_em_estimator" and rec_pt:
+        return DimensionScore("font_size", 1.0, "image_em", round(rec_pt, 2), OK, 1.2)
     if not src_pt or not rec_pt:
         # source manquante: si résolue depuis l'image (em) on fait confiance, sinon neutre.
         ok_em = size_source == "ocr_em_estimator"
@@ -79,7 +81,7 @@ def _dim_align(src, rec) -> DimensionScore:
 
 def _audit_against(src: dict, rec: dict, *, level, eid, role, stext, ttext) -> ElementAudit:
     dims = [
-        _dim_font_class(src.get("font_class") or font_class_of(src.get("font_family"), src.get("mono")), rec["font_class"]),
+        _dim_font_class(src.get("font_class") or font_class_of(src.get("font_family"), src.get("mono"), src.get("serif")), rec["font_class"]),
         _dim_size(src.get("font_size_pt"), rec.get("font_size_pt"), rec.get("size_source")),
         _dim_color(src.get("color"), rec.get("color")),
         _dim_flag("bold", src.get("bold", False), rec.get("bold", False)),
@@ -105,12 +107,12 @@ def audit_page(plan: dict, normalized: dict) -> StageAuditResult:
         srcs = [units[s] for s in sids if s in units]
         # dominant source style (1er non vide) pour le bloc
         dom = source_style(srcs[0]) if srcs else {}
-        dom["font_class"] = font_class_of(dom.get("font_family"), dom.get("mono"))
+        dom["font_class"] = font_class_of(dom.get("font_family"), dom.get("mono"), dom.get("serif"))
         ba = _audit_against(dom, rec, level="block", eid=b.get("id"), role=b.get("role"),
                             stext=b.get("source_text") or "", ttext=b.get("translated_text") or "")
         # phrases (chaque unité source comparée au style appliqué du bloc)
         for s in srcs:
-            ss = source_style(s); ss["font_class"] = font_class_of(ss.get("font_family"), ss.get("mono"))
+            ss = source_style(s); ss["font_class"] = font_class_of(ss.get("font_family"), ss.get("mono"), ss.get("serif"))
             ph = _audit_against(ss, rec, level="phrase", eid=s.get("unit_id"),
                                 role=(s.get("understanding") or {}).get("role") or "",
                                 stext=source_text(s), ttext="")

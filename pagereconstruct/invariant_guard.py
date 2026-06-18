@@ -47,6 +47,12 @@ def summarize_text_render_invariants(normalized: dict, contract, render_ops: lis
         elif tgt or src:
             identity_count += 1
 
+    preservation = getattr(contract, "preservation", None)
+    for obj in getattr(preservation, "objects", []) or []:
+        for sid in getattr(obj, "source_unit_ids", []) or []:
+            if sid:
+                rendered_ids.add(sid)
+
     missing = []
     for sid in source_ids:
         if not any(_related(sid, rid) for rid in rendered_ids):

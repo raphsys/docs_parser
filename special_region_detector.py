@@ -804,19 +804,107 @@ def _pdf_formula_candidates(pdf_page, sx=1.0, sy=1.0):
     return candidates
 
 
+def _discover_special_region_model():
+    """Find a local ONNX/YOLO-style special-region model without forcing env vars.
+
+    Priority:
+      1. DOCS_PARSER_SPECIAL_REGION_MODEL
+      2. project-local ai_models/special_regions|layout|ppstructurev3 paths
+      3. any .onnx whose path hints formula/equation/math/layout/yolo/det.
+
+    The inference reader stays YOLO-compatible. If the discovered ONNX is not a
+    YOLO detector, inference will fail safely and the CPU/PDF detector remains
+    active. This is deliberate: YOLO is a complement, never a hard dependency.
+    """
+    explicit = os.environ.get("DOCS_PARSER_SPECIAL_REGION_MODEL", "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit, "env:DOCS_PARSER_SPECIAL_REGION_MODEL"
+
+    roots = []
+    for raw in (
+        os.environ.get("DOCS_PARSER_AI_MODELS_DIR"),
+        os.environ.get("AI_MODELS_DIR"),
+        os.path.join(os.getcwd(), "ai_models"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_models"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ai_models"),
+    ):
+        if raw and os.path.isdir(raw):
+            roots.append(os.path.abspath(raw))
+    roots = list(dict.fromkeys(roots))
+
+    preferred_markers = (
+        "special", "formula", "formulanet", "equation", "math", "layout", "yolo", "det",
+        "pp-doclayout", "pp-docblocklayout", "pp-formulanet",
+    )
+    candidates = []
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            low_dir = dirpath.lower()
+            # Avoid very unrelated model branches when possible.
+            if not any(m in low_dir for m in preferred_markers + ("ppstructure",)):
+                continue
+            for fn in filenames:
+                if not fn.lower().endswith(".onnx"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                low = path.lower()
+                score = 0
+                for i, marker in enumerate(preferred_markers):
+                    if marker in low:
+                        score += 20 - min(i, 10)
+                if "int8" in low or "quant" in low:
+                    score += 2
+                candidates.append((score, path))
+    if not candidates:
+        return "", "not_found"
+    candidates.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+    return candidates[0][1], "auto_discovered"
+
+
+def _letterbox_image(image, target_w, target_h):
+    """Resize preserving aspect ratio; return image, scale, pad_x, pad_y."""
+    src_w, src_h = image.size
+    scale = min(float(target_w) / max(1.0, src_w), float(target_h) / max(1.0, src_h))
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    canvas = image.new("RGB", (target_w, target_h), (114, 114, 114))
+    resized = image.resize((new_w, new_h))
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    canvas.paste(resized, (pad_x, pad_y))
+    return canvas, scale, pad_x, pad_y
+
+
+def _nms_detections(detections, iou_threshold=0.45):
+    def iou(a, b):
+        ra = a.get("rect")
+        rb = b.get("rect")
+        if not ra or not rb:
+            return 0.0
+        inter = _intersection_area(ra, rb)
+        ua = max(1.0, float(ra.get_area()) + float(rb.get_area()) - inter)
+        return inter / ua
+    ordered = sorted(detections, key=lambda d: float(d.get("confidence") or 0.0), reverse=True)
+    kept = []
+    for d in ordered:
+        if all(iou(d, k) < iou_threshold for k in kept):
+            kept.append(d)
+    return kept
+
+
 def _ai_formula_candidates(page_image):
-    model_path = os.environ.get("DOCS_PARSER_SPECIAL_REGION_MODEL", "").strip()
+    model_path, model_source = _discover_special_region_model()
     if not model_path or not os.path.exists(model_path):
-        return [], {"available": False, "reason": "no_model_configured"}
+        return [], {"available": False, "reason": "no_model_configured", "model_source": model_source}
     try:
         import onnxruntime as ort  # type: ignore
         import numpy as np  # type: ignore
     except Exception as exc:
-        return [], {"available": False, "reason": f"onnxruntime_unavailable:{exc.__class__.__name__}"}
+        return [], {"available": False, "reason": f"onnxruntime_unavailable:{exc.__class__.__name__}", "model": model_path}
     if page_image is None:
-        return [], {"available": True, "runtime": "onnxruntime", "model": model_path, "reason": "no_page_image"}
+        return [], {"available": True, "runtime": "onnxruntime", "model": model_path, "model_source": model_source, "reason": "no_page_image"}
     class_path = os.environ.get("DOCS_PARSER_SPECIAL_REGION_CLASSES", "").strip()
-    class_names = ["formula", "equation", "inline_formula", "code", "technical_expression"]
+    class_names = ["formula", "equation", "inline_formula", "code", "technical_expression", "table", "diagram"]
     if class_path and os.path.exists(class_path):
         try:
             payload = json.loads(open(class_path, "r", encoding="utf-8").read())
@@ -831,23 +919,26 @@ def _ai_formula_candidates(page_image):
         input_meta = session.get_inputs()[0]
         input_name = input_meta.name
         shape = list(input_meta.shape or [])
-        target_h = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) else 640
-        target_w = int(shape[3]) if len(shape) == 4 and isinstance(shape[3], int) else 640
+        # common NCHW. Dynamic dims become 640.
+        target_h = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) and shape[2] > 0 else 640
+        target_w = int(shape[3]) if len(shape) == 4 and isinstance(shape[3], int) and shape[3] > 0 else 640
         image = page_image.convert("RGB")
         src_w, src_h = image.size
-        resized = image.resize((target_w, target_h))
-        arr = np.asarray(resized).astype("float32") / 255.0
+        boxed, scale, pad_x, pad_y = _letterbox_image(image, target_w, target_h)
+        arr = np.asarray(boxed).astype("float32") / 255.0
         arr = np.transpose(arr, (2, 0, 1))[None, ...]
         outputs = session.run(None, {input_name: arr})
     except Exception as exc:
-        return [], {"available": True, "runtime": "onnxruntime", "model": model_path, "reason": f"inference_failed:{exc.__class__.__name__}"}
+        return [], {"available": True, "runtime": "onnxruntime", "model": model_path, "model_source": model_source, "reason": f"inference_failed:{exc.__class__.__name__}"}
 
     detections = []
+    score_thr = float(os.environ.get("DOCS_PARSER_SPECIAL_REGION_SCORE", "0.30"))
     for output in outputs:
         data = np.asarray(output)
         if data.ndim == 3:
             data = data[0]
-        if data.ndim == 2 and data.shape[0] in {5, 6, 7} and data.shape[1] > data.shape[0]:
+        # YOLOv8 often emits [features, boxes].
+        if data.ndim == 2 and data.shape[0] in {5, 6, 7, 8, 9, 10, 84, 85} and data.shape[1] > data.shape[0]:
             data = data.T
         if data.ndim != 2 or data.shape[1] < 5:
             continue
@@ -859,30 +950,41 @@ def _ai_formula_candidates(page_image):
             if len(values) > 6:
                 class_scores = values[5:]
                 class_id = int(max(range(len(class_scores)), key=lambda idx: class_scores[idx]))
-                score *= float(class_scores[class_id])
+                # YOLO variants sometimes put objectness at values[4], sometimes not.
+                score = max(score * float(class_scores[class_id]), float(class_scores[class_id]))
             elif len(values) == 6:
                 class_id = int(values[5])
-            if score < float(os.environ.get("DOCS_PARSER_SPECIAL_REGION_SCORE", "0.35")):
+            if score < score_thr:
                 continue
             class_name = class_names[class_id] if 0 <= class_id < len(class_names) else "formula"
             class_low = class_name.lower()
-            if not any(marker in class_low for marker in ("formula", "equation", "math", "code", "technical")):
+            if not any(marker in class_low for marker in ("formula", "equation", "math", "code", "technical", "table", "diagram")):
                 continue
-            # Accept both xyxy and cxcywh style YOLO outputs.
-            if x1 <= x0 or y1 <= y0:
+            # Accept both xyxy and cxcywh style outputs. cxcywh usually has x1/y1 as width/height.
+            if x1 <= x0 or y1 <= y0 or (x1 <= target_w and y1 <= target_h and x0 + x1 <= target_w * 1.25 and y0 + y1 <= target_h * 1.25 and x1 > 0 and y1 > 0 and x0 > x1):
                 cx, cy, w, h = x0, y0, max(0.0, x1), max(0.0, y1)
                 x0, y0, x1, y1 = cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
-            scale_x = src_w / max(1.0, float(target_w))
-            scale_y = src_h / max(1.0, float(target_h))
-            rect = fitz.Rect(x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y)
+            # unletterbox back to source pixels.
+            x0 = (x0 - pad_x) / max(1e-6, scale)
+            x1 = (x1 - pad_x) / max(1e-6, scale)
+            y0 = (y0 - pad_y) / max(1e-6, scale)
+            y1 = (y1 - pad_y) / max(1e-6, scale)
+            x0, x1 = sorted((max(0.0, min(src_w, x0)), max(0.0, min(src_w, x1))))
+            y0, y1 = sorted((max(0.0, min(src_h, y0)), max(0.0, min(src_h, y1))))
+            rect = fitz.Rect(x0, y0, x1, y1)
             if rect.get_area() <= 4:
                 continue
-            special_class = "code" if "code" in class_low else "formula"
+            if "code" in class_low or "technical" in class_low:
+                special_class = "code"
+            elif "diagram" in class_low:
+                special_class = "diagram"
+            else:
+                special_class = "formula"
             detections.append(
                 {
                     "rect": rect,
                     "special_class": special_class,
-                    "source": "onnx_region_detector",
+                    "source": "onnx_yolo_special_region_detector",
                     "block_ids": [],
                     "confidence": min(0.99, max(0.0, score)),
                     "preserve_subregions": [
@@ -891,13 +993,14 @@ def _ai_formula_candidates(page_image):
                             "block_id": "",
                             "bbox": _bbox_from_rect(rect),
                             "policy": "preserve_visual",
-                            "source": "onnx_region_detector",
+                            "source": "onnx_yolo_special_region_detector",
                             "class_name": class_name,
                         }
                     ],
                 }
             )
-    return detections, {"available": True, "runtime": "onnxruntime", "model": model_path, "detections": len(detections)}
+    detections = _nms_detections(detections, iou_threshold=float(os.environ.get("DOCS_PARSER_SPECIAL_REGION_NMS", "0.45")))
+    return detections, {"available": True, "runtime": "onnxruntime", "model": model_path, "model_source": model_source, "detections": len(detections)}
 
 
 def _block_text(block):

@@ -19,6 +19,8 @@ import copy
 import re
 from typing import Iterable
 
+from source_ownership import build_source_ownership, is_non_translatable_owner, source_ids_have_non_translatable_owner
+
 try:
     from .text_utils import normalize_spaces
 except Exception:  # pragma: no cover
@@ -109,6 +111,31 @@ def _object_type_of(unit: dict | None) -> str:
     return str((unit.get("understanding") or {}).get("object_type") or "")
 
 
+def _in_hard_special_region(unit: dict | None) -> bool:
+    if not isinstance(unit, dict):
+        return False
+    policy = unit.get("policy") or {}
+    constraints = unit.get("constraints") or {}
+    understanding = unit.get("understanding") or {}
+    tags = {
+        str(policy.get("unit_type") or "").lower(),
+        str(understanding.get("role") or "").lower(),
+        str(understanding.get("object_type") or "").lower(),
+        str(understanding.get("semantic_kind") or "").lower(),
+    }
+    if tags & {"formula_region", "formula", "equation", "math_expression", "code_region", "code", "protected_visual_region", "protected_visual"}:
+        return True
+    if policy.get("skip_translation") or constraints.get("skip_translation") or policy.get("protected_visual"):
+        return True
+    for m in understanding.get("region_memberships") or []:
+        rt = str(m.get("region_type") or "").lower()
+        ratio = float(m.get("overlap_ratio") or 0.0)
+        mode = str(m.get("coverage_mode") or "").lower()
+        if rt in {"formula_region", "code_region", "protected_visual_region"} and (ratio >= 0.35 or mode in {"full_coverage", "dominant_overlap"}):
+            return True
+    return False
+
+
 def _is_visible_text_line(unit: dict) -> bool:
     if not isinstance(unit, dict) or unit.get("level") != "line":
         return False
@@ -116,6 +143,8 @@ def _is_visible_text_line(unit: dict) -> bool:
     if not text:
         return False
     if _role_of(unit) in _TEXT_ROLES_TO_SKIP_AS_TRANSLATION_CONTEXT:
+        return False
+    if _in_hard_special_region(unit):
         return False
     policy = unit.get("policy") or {}
     if policy.get("visible") is False:
@@ -327,9 +356,16 @@ def _covered_by_any_line(uid: str, covered: set[str]) -> bool:
 
 
 def split_translation_units_for_text_survival(input_data: dict, units: list[dict]) -> list[dict]:
-    """Expand translation units to atomic PAGEPRINT line units."""
+    """Expand translation units to atomic PAGEPRINT line units.
+
+    Ownership/Lifecycle v1: text survival guarantees visible natural text only.
+    A formula/code/protected visual zone is covered by preservation, not by a
+    TextOp fallback.  Therefore preserved/excluded source ids are never split
+    back into translation units here.
+    """
     unit_map = _unit_map(input_data)
     cmap = _children_map(input_data)
+    ownership = build_source_ownership(input_data)
     out: list[dict] = []
     covered_line_ids: set[str] = set()
 
@@ -337,8 +373,18 @@ def split_translation_units_for_text_survival(input_data: dict, units: list[dict
         text = normalize_spaces(item.get("source_text") or "")
         if not text:
             continue
+        sids = [sid for sid in item.get("source_unit_ids") or [] if sid]
+        if source_ids_have_non_translatable_owner(ownership, sids):
+            # Mixed parent blocks should normally be split into their descendant
+            # visible lines. If the item itself is already an owned special line,
+            # suppress it completely.
+            if len(sids) == 1 and is_non_translatable_owner(ownership, sids[0]):
+                continue
+        if any(_in_hard_special_region(unit_map.get(sid)) for sid in sids):
+            continue
 
-        line_units = _line_units_for_item(item, unit_map, cmap)
+        line_units = [ln for ln in _line_units_for_item(item, unit_map, cmap)
+                      if not is_non_translatable_owner(ownership, ln.get("unit_id"))]
         if line_units:
             total = len(line_units)
             for idx, line in enumerate(line_units, start=1):
@@ -348,13 +394,14 @@ def split_translation_units_for_text_survival(input_data: dict, units: list[dict
                 out.append(_line_item_from_plan(item, line, index=idx, total=total))
             continue
 
-        for ni in _split_item_without_lines(item):
-            out.append(ni)
+        if not source_ids_have_non_translatable_owner(ownership, sids):
+            for ni in _split_item_without_lines(item):
+                out.append(ni)
 
     next_index = len(out) + 1
     for line in _all_visible_lines(input_data):
         uid = line.get("unit_id")
-        if not uid or _covered_by_any_line(uid, covered_line_ids):
+        if not uid or is_non_translatable_owner(ownership, uid) or _covered_by_any_line(uid, covered_line_ids):
             continue
         out.append(_standalone_line_item(line, index=next_index))
         covered_line_ids.add(uid)
@@ -420,7 +467,12 @@ def _related(a: str, b: str) -> bool:
 
 
 def append_uncovered_source_line_fallbacks(translated_input: dict, reconstruction_units: list[dict], unit_map: dict[str, dict]) -> list[dict]:
-    """Append identity fallback reconstruction units for still-uncovered lines."""
+    """Append identity fallback reconstruction units for still-uncovered lines.
+
+    Ownership/Lifecycle v1: preserved visual/code/formula units must not be
+    resurrected as raw text fallbacks.
+    """
+    ownership = build_source_ownership(translated_input)
     covered: set[str] = set()
     for ru in reconstruction_units or []:
         for sid in ru.get("source_unit_ids") or []:
@@ -431,6 +483,8 @@ def append_uncovered_source_line_fallbacks(translated_input: dict, reconstructio
     for unit in sorted(unit_map.values(), key=_reading_key):
         uid = unit.get("unit_id")
         if not uid or not _is_visible_text_line(unit):
+            continue
+        if is_non_translatable_owner(ownership, uid):
             continue
         if any(_related(uid, c) for c in covered):
             continue

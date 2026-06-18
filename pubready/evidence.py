@@ -19,6 +19,7 @@ def source_style(unit: dict) -> dict:
         "bold": bool(flags.get("bold") or s.get("bold")),
         "italic": bool(flags.get("italic") or s.get("italic")),
         "mono": bool(flags.get("monospace")),
+        "serif": flags.get("serif"),
         "alignment": s.get("alignment") or (unit.get("understanding") or {}).get("alignment"),
     }
 
@@ -31,10 +32,12 @@ def source_bbox(unit: dict):
     return (unit.get("geometry") or {}).get("bbox")
 
 
-def font_class_of(family: str | None, mono: bool = False) -> str:
+def font_class_of(family: str | None, mono: bool = False, serif: bool | None = None) -> str:
     f = str(family or "").lower()
     if mono or any(k in f for k in ("mono", "courier", "consol", "code")):
         return "mono"
-    if any(k in f for k in ("sans", "arial", "helvet", "calibri", "verdana", "dejavusans")):
+    if any(k in f for k in ("sans", "arial", "helvet", "calibri", "verdana", "dejavusans", "franklin", "gothic")):
+        return "sans"
+    if serif is False:
         return "sans"
     return "serif"

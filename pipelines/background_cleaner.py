@@ -7,14 +7,13 @@ PAGERECONSTRUCT the raw source image, so every page reconstructed in
 ``source_background`` mode with ``source_text_leak_risk = high`` — never
 publication-ready by construction.
 
-This module restores that step: it inpaints the bounding boxes of the
-*translatable* text units (the ones PAGERECONSTRUCT will repaint) while leaving
-formula/code/preserved units and figures untouched (they keep their pixels).
+This module restores that step. In the current contract, clean background means visual substrate: all text and text-like special content is removed, while non-text visual material may remain. Those objects are restored later by TextOp or
+PreservationOp, never left in cleanbg.
 """
 
 from __future__ import annotations
 
-from pipelines.background_cover import build_deterministic_text_cover_background
+from pipelines.background_cover import build_deterministic_text_cover_background, collect_background_purity_boxes
 
 import os
 
@@ -100,9 +99,20 @@ def _text_regions_px(input_data: dict, sx: float, sy: float, protected_boxes_pt:
     paragraphes entiers dans le clean background.
     """
     units = input_data.get("units") or []
-    protected_boxes_pt = protected_boxes_pt or []
+    protected_boxes_pt = []  # no source content is protected in cleanbg.
     by_id = {u.get("unit_id"): u for u in units if isinstance(u, dict) and u.get("unit_id")}
     candidate_boxes: list[list[int]] = []
+
+    try:
+        purity_boxes_pt = collect_background_purity_boxes(input_data)
+    except Exception:
+        purity_boxes_pt = []
+    if purity_boxes_pt:
+        for bpt in purity_boxes_pt:
+            x0, y0, x1, y1 = (bpt[0] * sx, bpt[1] * sy, bpt[2] * sx, bpt[3] * sy)
+            if x1 > x0 and y1 > y0:
+                candidate_boxes.append(_pad_px([int(x0), int(y0), int(x1), int(y1)]))
+        return _merge_px_boxes(candidate_boxes)
 
     def add_bbox(b) -> None:
         if not (isinstance(b, (list, tuple)) and len(b) == 4):
@@ -170,23 +180,12 @@ def _contains_translatable_text(region_bbox, text_boxes, min_ratio: float = 0.40
 
 
 def _protected_boxes_pt(input_data: dict) -> list:
-    """Bbox (pt) des vrais visuels à préserver de l'inpaint. Un panneau ombré qui
-    contient du texte traduisible N'EST PAS protégé (on inpainte le texte, Telea
-    garde l'ombre) — sinon l'ancien texte fuit sous la traduction."""
-    text_boxes = _translatable_line_boxes_pt(input_data.get("units") or [])
-    out = []
-    for r in input_data.get("regions") or []:
-        rt = str(r.get("region_type") or r.get("object_type") or "").lower()
-        b = r.get("bbox")
-        if not (isinstance(b, (list, tuple)) and len(b) == 4):
-            continue
-        bb = [float(x) for x in b]
-        if any(k in rt for k in _STRONG_PROTECT):
-            out.append(bb)
-        elif any(k in rt for k in _AMBIGUOUS_PROTECT) and not _contains_translatable_text(bb, text_boxes):
-            out.append(bb)
-    return out
+    """Non-text visual content may remain in clean background; text/formula/code cannot.
 
+    Historical behavior protected formula/code/figures to keep their pixels in
+    the background. That is now forbidden: cleanbg is visual substrate without text/formula/code.
+    """
+    return []
 
 def _overlaps_protected(b, protected_pt, min_ratio: float) -> bool:
     area = max(1e-6, (b[2] - b[0]) * (b[3] - b[1]))

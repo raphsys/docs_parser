@@ -4,7 +4,13 @@ from pagereconstruct.input_adapter import PageReconstructInputAdapter
 from pagereconstruct.final_contract import FinalReconstructionContract
 from pagereconstruct.composition.typography_planner import plan_typography
 from pubready.stages import typography_audit
+from pubready.evidence import font_class_of
 from tests.pagereconstruct._fixtures import translated_input_data
+
+
+def test_franklin_gothic_and_explicit_non_serif_are_sans():
+    assert font_class_of("FranklinGothic-Demi") == "sans"
+    assert font_class_of("UnknownFamily", serif=False) == "sans"
 
 
 def test_typography_planner_outputs_em_and_confidence():

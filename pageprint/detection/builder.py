@@ -101,7 +101,8 @@ class PageRegionDetectBuilder:
             },
             "warnings": [],
         }
-        if not os.environ.get("DOCS_PARSER_SPECIAL_REGION_MODEL"):
+        ai_info = result.get("detectors", {}).get("onnx_yolo") or {}
+        if ai_info.get("available") is False and ai_info.get("reason") in {"no_model_configured", "no_ai_detector_report"}:
             result["warnings"].append("onnx_yolo_model_not_configured")
         return work, result
 
@@ -128,6 +129,12 @@ def build_page_region_detect(
 
 
 def normalize_detected_region(region: dict, *, source_default: str = "page_region_detect") -> dict:
+    """Normalize detector output without turning evidence into a decision.
+
+    Detector hits are candidates unless the producer explicitly marks the
+    claim as confirmed.  Policy compilation, not detection, owns the decision
+    to suppress translation or preserve source pixels.
+    """
     out = dict(region or {})
     special_class = str(
         out.get("special_class")
@@ -138,45 +145,96 @@ def normalize_detected_region(region: dict, *, source_default: str = "page_regio
         or out.get("kind")
         or "protected_visual"
     ).strip()
-    normalized_class = special_class or "protected_visual"
-    if normalized_class.lower() in PROTECTED_SPECIAL_CLASSES:
-        out["region_type"] = _candidate_region_type(normalized_class)
-        out["claim_type"] = _claim_type(normalized_class)
-        out["policy_pending"] = True
-        out["observation_only"] = True
-        out.setdefault("reason", "special_region_detector")
-    else:
-        out.setdefault("region_type", normalized_class)
-    out.setdefault("special_class", normalized_class)
-    out.setdefault("object_type", normalized_class)
-    out.setdefault("object_class", normalized_class)
+    normalized_class = (special_class or "protected_visual").lower()
+    confirmed = bool(
+        out.get("confirmed") is True
+        or str(out.get("claim_type") or "").lower().endswith("_confirmed")
+        or (
+            out.get("observation_only") is False
+            and out.get("policy_pending") is False
+            and out.get("protected_visual") is True
+        )
+    )
+    region_type = _confirmed_region_type(normalized_class) if confirmed else _candidate_region_type(normalized_class)
+    out["region_type"] = region_type
+    out["claim_type"] = _claim_type(normalized_class) if confirmed else _candidate_claim_type(normalized_class)
+    out["policy_pending"] = not confirmed
+    out["observation_only"] = not confirmed
+    out["protected_visual"] = confirmed
+    out["must_preserve_visual"] = confirmed
+    out["preserve_original_pixels"] = confirmed
+    out["skip_translation"] = confirmed
+    out["skip_text_reconstruction"] = confirmed
+    out.setdefault("reason", "confirmed_special_region" if confirmed else "special_region_candidate")
+    out.setdefault("special_class", "formula" if "formula" in region_type else "code" if "code" in region_type else "protected_visual")
+    out.setdefault("object_type", out["special_class"])
+    out.setdefault("object_class", out["special_class"])
     out.setdefault("source", out.get("detection_source") or source_default)
     out.setdefault("detection_source", out.get("source") or source_default)
+    if confirmed:
+        out["policy"] = {
+            "translatable": False,
+            "translation_strategy": "exact_preserve",
+            "render_policy": "fixed_preserve",
+            "coverage_required": "strict",
+            "must_preserve_visual": True,
+            "protected_visual": True,
+            "preserve_visual": True,
+            "preserve_original_pixels": True,
+            "skip_translation": True,
+            "skip_text_reconstruction": True,
+            "must_exclude_from_translation_flow": True,
+        }
+    else:
+        out["policy"] = {
+            "translatable": None,
+            "translation_strategy": "claim_pending",
+            "render_policy": "claim_pending",
+            "coverage_required": "review",
+            "policy_pending": True,
+            "skip_translation": False,
+            "skip_text_reconstruction": False,
+        }
     return out
 
 
-def _candidate_region_type(special_class: str) -> str:
+def _confirmed_region_type(special_class: str) -> str:
     normalized = str(special_class or "").lower()
     if any(key in normalized for key in ("formula", "equation", "math", "chemical", "symbolic")):
-        return "formula_candidate_region"
+        return "formula_region"
     if any(key in normalized for key in ("code", "algorithm")):
-        return "code_candidate_region"
+        return "code_region"
     if "table" in normalized:
-        return "table_candidate_region"
+        return "table_region"
     if "diagram" in normalized:
         return "diagram_region"
-    return "visual_candidate_region"
+    if "logo" in normalized:
+        return "logo_region"
+    return "protected_visual_region"
+
+
+def _candidate_region_type(special_class: str) -> str:
+    confirmed = _confirmed_region_type(special_class)
+    return {
+        "formula_region": "formula_candidate_region",
+        "code_region": "code_candidate_region",
+        "protected_visual_region": "visual_candidate_region",
+    }.get(confirmed, confirmed)
+
+
+def _candidate_claim_type(special_class: str) -> str:
+    return _candidate_region_type(special_class).replace("_region", "")
 
 
 def _claim_type(special_class: str) -> str:
-    region_type = _candidate_region_type(special_class)
-    if region_type == "formula_candidate_region":
-        return "formula_candidate"
-    if region_type == "code_candidate_region":
-        return "code_candidate"
-    if region_type == "table_candidate_region":
-        return "table_candidate"
-    return "visual_candidate"
+    region_type = _confirmed_region_type(special_class)
+    if region_type == "formula_region":
+        return "formula_confirmed"
+    if region_type == "code_region":
+        return "code_confirmed"
+    if region_type == "table_region":
+        return "table_confirmed"
+    return "protected_visual_confirmed"
 
 
 def _dedupe_regions(regions: list[dict]) -> list[dict]:

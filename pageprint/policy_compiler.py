@@ -98,13 +98,31 @@ def compile_unit_policy(unit: dict, *, decision_context: dict) -> dict:
         return compiled
 
     role = str(understanding.get("role") or "").lower()
-    if role in {"diagram_label", "axis_label", "legend_label", "chart_tick", "figure_label"}:
+    ot = str(understanding.get("object_type") or "").lower()
+    sk = str(understanding.get("semantic_kind") or "").lower()
+    if {role, ot, sk} & {"formula_region", "formula", "equation", "math_expression", "code_region", "code", "protected_visual_region", "protected_visual"}:
         return _with_source({**existing, **_preserve_policy("preserve_as_visual_overlay"),
+                             "unit_type": ot or role,
                              "protected_visual": True,
+                             "preserve_visual": True,
                              "preserve_original_pixels": True,
                              "skip_translation": True,
-                             "skip_text_reconstruction": True},
-                            f"role:{role}_visual_label", unit)
+                             "skip_text_reconstruction": True,
+                             "non_translatable_reason": "hard_special_region"},
+                            "hard_special_region", unit)
+    if role in {"diagram_label", "axis_label", "legend_label", "figure_label"}:
+        # A PDF text unit remains text even when anchored in a diagram.  The
+        # diagram substrate stays in cleanbg; its labels are removed and redrawn.
+        return _with_source({**existing,
+                             "unit_type": "diagram_text_label",
+                             "translatable": True,
+                             "translation_strategy": "layout_constrained",
+                             "render_policy": "anchored_text",
+                             "coverage_required": "strict",
+                             "preservation_mode": "none",
+                             "skip_translation": False,
+                             "skip_text_reconstruction": False},
+                            f"role:{role}_anchored_text", unit)
     if role in {"publisher_mark", "watermark"}:
         return _with_source({**existing, **_artifact_policy("exclude_as_artifact")}, f"role:{role}_artifact", unit)
 
@@ -207,7 +225,7 @@ def _looks_like_preserve_unit(unit: dict, text: str | None) -> bool:
         str(understanding.get("object_type") or "").lower(),
         str(understanding.get("semantic_kind") or "").lower(),
     }
-    if tags & {"formula_expression", "formula", "code_line", "command_name", "path", "diagram_label", "axis_label", "legend_label", "chart_tick"}:
+    if tags & {"formula_region", "formula_expression", "formula", "equation", "math_expression", "code_region", "code_line", "code_block", "command_name", "path", "diagram_label", "axis_label", "legend_label", "chart_tick", "protected_visual_region"}:
         return True
     if unit.get("level") in {"word", "char"}:
         return False

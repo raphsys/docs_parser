@@ -110,6 +110,13 @@ def audit_page(plan: dict, normalized: dict, *, source_image_path: str,
     # 1. zones protégées : diff faible attendue (préservé). diff élevée = détruit.
     prot_scores = []
     for r in plan.get("protected_regions") or []:
+        reason = str(r.get("reason") or "").lower()
+        if reason in {
+            "page_number", "page_reference", "toc_page_reference",
+            "toc_section_number", "caption_label", "caption_number",
+            "preserved_text_exact", "preserve_text_exactly",
+        }:
+            continue
         b = r.get("bbox")
         if not (isinstance(b, (list, tuple)) and len(b) == 4):
             continue

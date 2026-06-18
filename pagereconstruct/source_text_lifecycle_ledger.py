@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 
+from source_ownership import build_source_ownership, ownership_state, NON_TRANSLATABLE_STATES
+
 
 TEXT_LEVELS = {"block", "line", "phrase", "span", "word"}
 VALID_EXCLUSION_REASONS = {
@@ -58,6 +60,7 @@ def build_source_text_lifecycle_ledger(plan: dict, normalized: dict) -> list[Sou
     preservation_plan = normalized.get("preservation_plan") or []
     exclusion_plan = normalized.get("exclusion_plan") or []
     render_ops = plan.get("render_ops") or []
+    ownership = build_source_ownership(normalized)
 
     translation_ids_by_source = _ids_by_source(translated_units, "translation_unit_id", unit_ids, parent_by_id, children_by_parent)
     reconstruction_ids_by_source = _ids_by_source(translated_units, "reconstruction_unit_id", unit_ids, parent_by_id, children_by_parent)
@@ -100,11 +103,22 @@ def build_source_text_lifecycle_ledger(plan: dict, normalized: dict) -> list[Sou
         preserved_by_plan = bool(preservation_plan_by_source.get(uid))
         excluded_reason = excluded.get(uid)
 
-        if entry.reconstruction_unit_ids:
+        owner_state = ownership_state(ownership, uid)
+        if owner_state in {"preserved_visual", "preserved_text_exact"}:
+            entry.pagetranslate_state = owner_state
+            # A preserved formula/code/special glyph is covered by PreservationOp,
+            # not by TextOp.  Do not count it as missing translated text.
+            if not entry.preservationop_ids and not preserved_by_plan:
+                entry.findings.append("source_text_missing_preservation_op")
+            if entry.textop_ids:
+                entry.findings.append("preserved_source_has_textop")
+        elif owner_state in {"excluded", "background_only"}:
+            entry.pagetranslate_state = owner_state
+        elif entry.reconstruction_unit_ids:
             entry.pagetranslate_state = "translated_or_projected"
             if not entry.textop_ids:
                 entry.findings.append("source_text_missing_render_op")
-        elif preserved_by_plan:
+        elif preserved_by_plan or entry.preservationop_ids:
             entry.pagetranslate_state = "preserved"
             if not entry.preservationop_ids:
                 entry.findings.append("source_text_missing_preservation_op")

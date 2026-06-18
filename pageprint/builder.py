@@ -344,6 +344,15 @@ class PagePrintBuilder:
         ))
         input_data["views"]["detected_regions"] = self._build_detected_regions_view(regions)
         input_data["views"]["region_memberships"] = self._build_region_memberships_view(units)
+        # Ownership/Lifecycle v1: freeze the single owner of every source unit
+        # after PAGEPRINT has compiled regions + preservation/exclusion views.
+        # Downstream modules may rebuild it, but this view is the PAGEPRINT
+        # declaration of intent: translated OR preserved OR excluded, never both.
+        try:
+            from source_ownership import annotate_input_data_ownership
+            annotate_input_data_ownership(input_data)
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            input_data.setdefault("debug", {}).setdefault("ownership_errors", []).append(str(exc))
         input_data.setdefault("quality", {}).setdefault("metrics", {}).update(
             input_data["views"].get("metrics") or {}
         )

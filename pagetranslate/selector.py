@@ -8,6 +8,7 @@ from typing import Any
 
 from .schema import AUXILIARY_TEXT_LEVELS, PRIMARY_TEXT_LEVELS
 from .text_utils import ancestor_id, bbox_union, normalize_spaces, reading_order, unit_text
+from source_ownership import filter_translation_units_by_ownership
 
 
 EXCLUDED_CLASSES = {
@@ -29,6 +30,11 @@ EXCLUDED_CLASSES = {
     "legend_label",
     "chart_tick",
     "figure_label",
+    "formula_region",
+    "code_region",
+    "protected_visual_region",
+    "equation",
+    "math_expression",
 }
 
 EXCLUDED_STRATEGIES = {"exact_preserve", "keep_original", "background_only"}
@@ -84,6 +90,7 @@ def select_translation_units(input_data: dict) -> list[dict]:
         blocked_block_ids,
     ))
 
+    selected = filter_translation_units_by_ownership(input_data, selected)
     selected.sort(key=lambda item: item.get("reading_order_index") or 0)
     for idx, item in enumerate(selected, start=1):
         item["translation_unit_id"] = f"tu_{idx:04d}"
@@ -404,8 +411,12 @@ def _covered_by_protected_visual(unit: dict) -> bool:
     if (unit.get("relations") or {}).get("covered_by_protected_region_id"):
         return True
     for membership in (unit.get("understanding") or {}).get("region_memberships") or []:
-        if membership.get("region_type") == "protected_visual_region":
-            return True
+        rt = str(membership.get("region_type") or "").lower()
+        mode = str(membership.get("coverage_mode") or "").lower()
+        ratio = float(membership.get("overlap_ratio") or 0.0)
+        if rt in {"protected_visual_region", "formula_region", "code_region"}:
+            if mode in {"full_coverage", "dominant_overlap"} or ratio >= 0.35:
+                return True
     return False
 
 

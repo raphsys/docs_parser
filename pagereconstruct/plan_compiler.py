@@ -13,8 +13,15 @@ from .input_adapter import PageReconstructInputAdapter
 from .layout_box_resolver import resolve_layout
 from .patch_planner import plan_patches
 from .protected_region_index import build_protected_region_index
-from .schema import PageRenderPlan, PreservedUnit, TranslatedTextUnit
+from .schema import PageRenderPlan, PreservedUnit, TranslatedTextUnit, ProtectedRegion, PatchZone
 from .style_resolver import resolve_style
+from source_ownership import (
+    build_source_ownership,
+    is_non_translatable_owner,
+    source_ids_have_non_translatable_owner,
+    all_source_ids_non_translatable,
+    audit_source_ownership,
+)
 
 RENDERER_BY_ROLE = {
     "body_paragraph": "paragraph", "list_item": "paragraph", "author_bio": "paragraph",
@@ -135,24 +142,40 @@ def _contained_ratio(inner, outer) -> float:
 
 
 def _build_special_zones(regions) -> list[dict]:
-    """Merge confident formula/code detector regions into tight preserved blocks.
+    """Merge formula/code/protected regions into tight preserved blocks.
 
-    The detector emits many small fragments per equation/listing; one merged
-    rectangle per block becomes THE protection (replacing oversized per-unit
-    formula bboxes) and the boundary that excludes inner text from translation.
+    These zones are hard objects, not advisory candidates.  They must survive to
+    the final contract as both protected regions and preserved underlay blocks.
     """
     raw = []
     for r in regions or []:
-        rt = str(r.get("region_type") or "").lower()
-        kind = "formula" if "formula" in rt else "code" if "code" in rt else None
+        rt = str(r.get("region_type") or r.get("object_type") or "").lower()
+        if rt not in {"formula_region", "code_region", "protected_visual_region"}:
+            continue
+        kind = "formula" if "formula" in rt or "equation" in rt or "math" in rt else "code" if "code" in rt else "protected_visual" if "protected_visual" in rt else None
         if not kind:
             continue
-        if (r.get("confidence") or 0) < SPECIAL_ZONE_CONF_MIN:
+        # Keep confirmed special regions even at moderate confidence.  Formula
+        # detection is allowed to be conservative upstream; it must not be
+        # re-neutralized here.
+        conf = float(r.get("confidence") or 0.0)
+        if conf and conf < max(0.20, SPECIAL_ZONE_CONF_MIN * 0.50):
             continue
-        b = r.get("bbox")
-        if isinstance(b, (list, tuple)) and len(b) == 4:
-            raw.append({"kind": kind, "bbox": [float(x) for x in b]})
-    # Iterative union of touching same-kind boxes.
+        b = r.get("bbox") or r.get("visual_bbox")
+        if not (isinstance(b, (list, tuple)) and len(b) == 4):
+            continue
+        members = r.get("members") or {}
+        source_ids = []
+        for key in ("block_ids", "line_ids", "phrase_ids", "span_ids", "word_ids", "char_ids"):
+            source_ids.extend([sid for sid in members.get(key) or [] if sid])
+        raw.append({
+            "kind": kind,
+            "bbox": [float(x) for x in b],
+            "source_unit_ids": list(dict.fromkeys(source_ids)),
+            "region_id": r.get("region_id"),
+            "confidence": conf or 0.5,
+            "source": r.get("source") or r.get("detection_source") or "pageprint_region",
+        })
     merged: list[dict] = []
     for z in raw:
         hit = None
@@ -162,9 +185,11 @@ def _build_special_zones(regions) -> list[dict]:
                 break
         if hit:
             hit["bbox"] = _union([hit["bbox"], z["bbox"]])
+            hit["source_unit_ids"] = list(dict.fromkeys((hit.get("source_unit_ids") or []) + (z.get("source_unit_ids") or [])))
+            hit["confidence"] = max(float(hit.get("confidence") or 0), float(z.get("confidence") or 0))
+            hit.setdefault("region_ids", []).append(z.get("region_id"))
         else:
-            merged.append({"kind": z["kind"], "bbox": list(z["bbox"])})
-    # Second pass: zones grown in pass 1 may now touch each other.
+            merged.append({**z, "region_ids": [z.get("region_id")] if z.get("region_id") else []})
     changed = True
     while changed:
         changed = False
@@ -173,6 +198,9 @@ def _build_special_zones(regions) -> list[dict]:
                 if (merged[i]["kind"] == merged[j]["kind"]
                         and _boxes_touch(merged[i]["bbox"], merged[j]["bbox"], SPECIAL_ZONE_MERGE_GAP)):
                     merged[i]["bbox"] = _union([merged[i]["bbox"], merged[j]["bbox"]])
+                    merged[i]["source_unit_ids"] = list(dict.fromkeys((merged[i].get("source_unit_ids") or []) + (merged[j].get("source_unit_ids") or [])))
+                    merged[i]["confidence"] = max(float(merged[i].get("confidence") or 0), float(merged[j].get("confidence") or 0))
+                    merged[i].setdefault("region_ids", []).extend(merged[j].get("region_ids") or [])
                     merged.pop(j)
                     changed = True
                     break
@@ -324,7 +352,7 @@ def _must_preserve_even_if_consumed(p: dict, page_width: float | None, page_heig
     if "page_number" in tags or reason == "page_number":
         return _is_valid_page_number_preservation(p, page_width, page_height)
     immutable = {
-        "formula", "formula_expression", "code", "code_line", "code_block",
+        "formula_region", "formula", "formula_expression", "equation", "math_expression", "code_region", "code", "code_line", "code_block",
         "diagram_label", "axis_label", "legend_label", "publisher_mark", "watermark",
         "protected_visual_region", "caption_number", "caption_label",
         "toc_page_reference", "toc_section_number",
@@ -332,8 +360,27 @@ def _must_preserve_even_if_consumed(p: dict, page_width: float | None, page_heig
     return bool(tags & immutable)
 
 
+def _source_ids_of_item(item) -> set[str]:
+    if isinstance(item, dict):
+        vals = item.get("source_unit_ids") or []
+    else:
+        vals = getattr(item, "source_unit_ids", None) or []
+    return {str(s) for s in vals if s}
+
+
+def _set_source_ids_on_item(item, source_ids: set[str]) -> None:
+    merged = sorted(_source_ids_of_item(item) | {str(s) for s in (source_ids or set()) if s})
+    if isinstance(item, dict):
+        item["source_unit_ids"] = merged
+    else:
+        try:
+            item.source_unit_ids = merged
+        except Exception:
+            pass
+
+
 def _dedupe_preserved_units(items: list) -> list:
-    seen = set()
+    seen: dict[tuple, object] = {}
     out = []
     for item in items:
         bbox = getattr(item, "bbox", None)
@@ -345,10 +392,296 @@ def _dedupe_preserved_units(items: list) -> list:
             rb = None
         key = (str(reason or ""), str(text or ""), rb)
         if key in seen:
+            # Dedupe must never drop ownership descendants. Merge source ids into
+            # the retained object so audit/render contract still sees them.
+            _set_source_ids_on_item(seen[key], _source_ids_of_item(item))
             continue
-        seen.add(key)
+        seen[key] = item
         out.append(item)
     return out
+
+
+# --- Ownership/Lifecycle v2.1: render-contract propagation lock -----------
+def _valid_box(b) -> bool:
+    return isinstance(b, (list, tuple)) and len(b) == 4
+
+
+def _box_area(b) -> float:
+    if not _valid_box(b):
+        return 0.0
+    return max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1]))
+
+
+def _box_intersection(a, b) -> float:
+    if not (_valid_box(a) and _valid_box(b)):
+        return 0.0
+    x0, y0 = max(float(a[0]), float(b[0])), max(float(a[1]), float(b[1]))
+    x1, y1 = min(float(a[2]), float(b[2])), min(float(a[3]), float(b[3]))
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _box_overlap_ratio(inner, outer) -> float:
+    return _box_intersection(inner, outer) / max(1e-6, _box_area(inner))
+
+
+def _box_union(boxes) -> list | None:
+    boxes = [[float(x) for x in b] for b in boxes or [] if _valid_box(b)]
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _box_key_1(b) -> tuple | None:
+    if not _valid_box(b):
+        return None
+    return tuple(round(float(x), 1) for x in b)
+
+
+def _bbox_of_item(item):
+    return item.get("bbox") if isinstance(item, dict) else getattr(item, "bbox", None)
+
+
+def _covered_by_box_or_source_ids(bbox, source_ids: set[str], items, *, threshold: float = 0.72) -> bool:
+    if source_ids:
+        for item in items or []:
+            if source_ids & _source_ids_of_item(item):
+                return True
+    if not _valid_box(bbox):
+        return False
+    for item in items or []:
+        b = _bbox_of_item(item)
+        if _valid_box(b) and (_box_overlap_ratio(bbox, b) >= threshold or _box_overlap_ratio(b, bbox) >= 0.92):
+            return True
+    return False
+
+
+def _merge_source_ids_into_covering_items(bbox, source_ids: set[str], items, *, threshold: float = 0.72) -> int:
+    """Attach all descendant ownership ids to every covering render item.
+
+    v2.1 could decide that a region was already represented because one ancestor
+    or sibling was present.  The audit, however, checks each descendant id.  A
+    covering ProtectedRegion/PreservedUnit must therefore explicitly carry all
+    descendants of the special region.
+    """
+    if not source_ids:
+        return 0
+    changed = 0
+    for item in items or []:
+        hit = bool(source_ids & _source_ids_of_item(item))
+        b = _bbox_of_item(item)
+        if not hit and _valid_box(b) and _valid_box(bbox):
+            hit = (_box_overlap_ratio(bbox, b) >= threshold or _box_overlap_ratio(b, bbox) >= 0.92)
+        if hit:
+            before = _source_ids_of_item(item)
+            _set_source_ids_on_item(item, source_ids)
+            if _source_ids_of_item(item) != before:
+                changed += 1
+    return changed
+
+
+def _subtract_box(rect, hole) -> list[list[float]]:
+    """Return rect minus hole as up to four non-overlapping rectangles."""
+    if not (_valid_box(rect) and _valid_box(hole)) or _box_intersection(rect, hole) <= 0:
+        return [[float(x) for x in rect]] if _valid_box(rect) else []
+    rx0, ry0, rx1, ry1 = [float(x) for x in rect]
+    hx0, hy0, hx1, hy1 = [float(x) for x in hole]
+    hx0, hy0, hx1, hy1 = max(rx0, hx0), max(ry0, hy0), min(rx1, hx1), min(ry1, hy1)
+    out = []
+    if hy0 > ry0:
+        out.append([rx0, ry0, rx1, hy0])
+    if hy1 < ry1:
+        out.append([rx0, hy1, rx1, ry1])
+    my0, my1 = max(ry0, hy0), min(ry1, hy1)
+    if hx0 > rx0:
+        out.append([rx0, my0, hx0, my1])
+    if hx1 < rx1:
+        out.append([hx1, my0, rx1, my1])
+    return [r for r in out if (r[2] - r[0]) > 0.50 and (r[3] - r[1]) > 0.50]
+
+
+def _patch_to_dict(patch) -> dict:
+    return patch.to_dict() if hasattr(patch, "to_dict") else dict(patch or {})
+
+
+def _patch_from_dict(d: dict, bbox: list, suffix: str | int = "") -> PatchZone:
+    return PatchZone(
+        op_type=str(d.get("op_type") or "patch_text_zone"),
+        unit_id=str(d.get("unit_id") or "patch") + (f"_safe{suffix}" if suffix != "" else ""),
+        bbox=[float(x) for x in bbox],
+        method=str(d.get("method") or "sampled_color_patch"),
+        background_color=d.get("background_color"),
+        protected_overlap_ratio=0.0,
+        must_not_overlap=list(d.get("must_not_overlap") or []),
+        padding=list(d.get("padding") or [1.8, 0.9, 1.8, 0.9]),
+    )
+
+
+def _preserved_visual_groups_from_ownership(source_ownership: dict) -> list[dict]:
+    """Compact preserved_visual entries into renderable groups.
+
+    The ownership table can contain a region plus its line/span/word/char
+    descendants. Render/preservation must not materialise thousands of tiny
+    duplicate objects.  Region id is therefore the primary grouping key; source
+    id is a fallback for orphan entries.
+    """
+    groups: dict[str, dict] = {}
+    for sid, entry in (source_ownership or {}).items():
+        if not isinstance(entry, dict) or entry.get("state") != "preserved_visual":
+            continue
+        bbox = entry.get("bbox")
+        if not _valid_box(bbox):
+            continue
+        region_id = str(entry.get("region_id") or "").strip()
+        preservation_id = str(entry.get("preservation_id") or "").strip()
+        key = (
+            f"region:{region_id}" if region_id
+            else f"preservation:{preservation_id}" if preservation_id
+            else f"unit:{sid}"
+        )
+        g = groups.setdefault(key, {
+            "key": key,
+            "region_id": region_id or None,
+            "reason": str(entry.get("reason") or "protected_visual"),
+            "source_unit_ids": [],
+            "boxes": [],
+        })
+        g["source_unit_ids"].append(str(sid))
+        g["boxes"].append([float(x) for x in bbox])
+    out = []
+    for idx, g in enumerate(groups.values(), start=1):
+        bbox = _box_union(g.get("boxes") or [])
+        if not bbox:
+            continue
+        out.append({
+            "id": f"ownlife_v21_{idx:04d}",
+            "region_id": g.get("region_id"),
+            "reason": g.get("reason") or "protected_visual",
+            "bbox": bbox,
+            "source_unit_ids": list(dict.fromkeys(g.get("source_unit_ids") or [])),
+        })
+    return out
+
+
+def _filter_patches_around_preserved_visual(patches: list, preserved_boxes: list[list[float]], findings: list[dict]) -> list:
+    if not patches or not preserved_boxes:
+        return patches or []
+    safe: list[PatchZone] = []
+    removed = 0
+    split = 0
+    for patch in patches or []:
+        d = _patch_to_dict(patch)
+        bbox = d.get("bbox")
+        if not _valid_box(bbox):
+            continue
+        rects = [[float(x) for x in bbox]]
+        touched = False
+        for hole in preserved_boxes:
+            nxt = []
+            for r in rects:
+                if _box_intersection(r, hole) > 0:
+                    touched = True
+                    nxt.extend(_subtract_box(r, hole))
+                else:
+                    nxt.append(r)
+            rects = nxt
+            if not rects:
+                break
+        if not touched:
+            safe.append(patch if hasattr(patch, "to_dict") else _patch_from_dict(d, bbox))
+            continue
+        if not rects:
+            removed += 1
+            continue
+        split += max(0, len(rects) - 1)
+        for i, r in enumerate(rects, start=1):
+            safe.append(_patch_from_dict(d, r, i))
+    if removed or split:
+        findings.append({
+            "type": "ownership_lifecycle_v2_1_patch_clipped_around_preserved_visual",
+            "severity": "info",
+            "removed_patch_count": removed,
+            "additional_patch_piece_count": split,
+        })
+    return safe
+
+
+def _enforce_preserved_visual_render_contract(plan: PageRenderPlan, normalized: dict, source_ownership: dict, findings: list[dict]) -> None:
+    """Force v1 preserved_visual ownership into the render contract.
+
+    This is the v2.1 lock: a source unit owned by a preserved visual region must
+    have render-level representation (protected region + preserved layer, which
+    subsequently produces PreservationOp) and no patch is allowed to cover it.
+    """
+    groups = _preserved_visual_groups_from_ownership(source_ownership)
+    if not groups:
+        return
+
+    added_prot = 0
+    added_pres = 0
+    for g in groups:
+        bbox = g["bbox"]
+        source_ids = set(g.get("source_unit_ids") or [])
+        # ProtectedRegion: hard obstacle for layout, patch planning and audit.
+        if not _covered_by_box_or_source_ids(bbox, source_ids, plan.protected_regions, threshold=0.72):
+            idx = len(plan.protected_regions) + 1
+            plan.protected_regions.append(ProtectedRegion(
+                id=f"ownlife_v21_prot_{idx:04d}",
+                source="source_ownership_v2_1",
+                reason=g.get("reason") or "preserved_visual",
+                bbox=[float(x) for x in bbox],
+                hard=True,
+                z_policy="preserve_original",
+                source_unit_ids=list(g.get("source_unit_ids") or []),
+            ))
+            added_prot += 1
+        else:
+            _merge_source_ids_into_covering_items(bbox, source_ids, plan.protected_regions, threshold=0.72)
+        # PreservedUnit: source pixels/visual object in the layer contract.
+        preserved_items = list(plan.preserved_underlays or []) + list(plan.preserved_overlays or [])
+        if not _covered_by_box_or_source_ids(bbox, source_ids, preserved_items, threshold=0.72):
+            idx = len(plan.preserved_underlays) + len(plan.preserved_overlays) + 1
+            plan.preserved_underlays.append(PreservedUnit(
+                id=f"ownlife_v21_pres_{idx:04d}",
+                source="source_ownership_v2_1",
+                reason=g.get("reason") or "preserved_visual",
+                bbox=[float(x) for x in bbox],
+                text=None,
+                preservation_mode="preserve_as_visual_overlay",
+                source_unit_ids=list(g.get("source_unit_ids") or []),
+                z_policy="preserve_original",
+            ))
+            added_pres += 1
+        else:
+            _merge_source_ids_into_covering_items(bbox, source_ids, preserved_items, threshold=0.72)
+
+    # Final exhaustive pass: every preserved_visual descendant id must be
+    # explicitly attached to at least one covering ProtectedRegion and one
+    # covering PreservedUnit.  This is the v2.2 closure over descendants.
+    merged_prot_sids = 0
+    merged_pres_sids = 0
+    for g in groups:
+        bbox = g.get("bbox")
+        source_ids = set(g.get("source_unit_ids") or [])
+        merged_prot_sids += _merge_source_ids_into_covering_items(bbox, source_ids, plan.protected_regions, threshold=0.72)
+        merged_pres_sids += _merge_source_ids_into_covering_items(bbox, source_ids, list(plan.preserved_underlays or []) + list(plan.preserved_overlays or []), threshold=0.72)
+
+    # Re-dedupe after forced insertions, then rebuild patch layer around the full
+    # preserved-visual box set.  This catches patches planned before v2.1 added
+    # missing protections.
+    plan.preserved_underlays = _dedupe_preserved_units(plan.preserved_underlays)
+    plan.preserved_overlays = _dedupe_preserved_units(plan.preserved_overlays)
+    preserved_boxes = [g["bbox"] for g in groups if _valid_box(g.get("bbox"))]
+    plan.patches = _filter_patches_around_preserved_visual(plan.patches, preserved_boxes, findings)
+    if added_prot or added_pres:
+        findings.append({
+            "type": "ownership_lifecycle_v2_1_render_contract_enforced",
+            "severity": "info",
+            "preserved_visual_group_count": len(groups),
+            "added_protected_region_count": added_prot,
+            "added_preserved_layer_count": added_pres,
+            "merged_protected_source_id_item_count": locals().get("merged_prot_sids", 0),
+            "merged_preserved_source_id_item_count": locals().get("merged_pres_sids", 0),
+        })
 
 def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode: str = "debug") -> PageRenderPlan:
     normalized = PageReconstructInputAdapter().normalize(translated_input_data)
@@ -366,31 +699,13 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
     page_width_pt = geom.get("width")
     page_height_pt = geom.get("height")
 
-    # Zone = source of truth: confident formula/code detector zones, merged into
-    # tight preserved blocks. Text inside is kept as original pixels (not
-    # translated, not patched); the zone rectangle is the protection.
+    # Zone = source of truth: hard formula/code/protected detector zones.
+    # They are never neutralized merely because an upstream translation unit
+    # overlaps them; instead the overlapping translation unit is skipped below
+    # and the zone is preserved as an object block.
     special_zones = _build_special_zones(normalized["regions"])
-    # Drop FALSE formula/code zones: a real preserved formula is never translated.
-    # If a zone is ≥30% covering a unit that the pipeline TRANSLATES (prose, SQL
-    # with function-call parens, index entries…), the detector over-fired — remove
-    # it so it can't protect (and collide with) the translated text.
-    if special_zones:
-        _tt_boxes = []
-        for it in translated_units:
-            b = it.get("layout_bbox") or (it.get("render_target") or {}).get("layout_bbox") or it.get("bbox")
-            if isinstance(b, (list, tuple)) and len(b) == 4:
-                _tt_boxes.append([float(x) for x in b])
-        kept_zones = []
-        for z in special_zones:
-            zb = z["bbox"]
-            # (a) la zone couvre ≥30% d'une ligne traduite, OU (b) la zone est un
-            # fragment ≥50% à l'intérieur d'une ligne traduite (parens de fonction
-            # "rank()"/"median()" dans de la prose/un index) → fausse zone.
-            false_zone = any(_contained_ratio(b, zb) > 0.30 or _contained_ratio(zb, b) > 0.50
-                             for b in _tt_boxes)
-            if not false_zone:
-                kept_zones.append(z)
-        special_zones = kept_zones
+    source_ownership = build_source_ownership(normalized)
+    normalized["source_ownership"] = source_ownership
 
     # Index the reconstruction_plan so each translated unit can pull its style /
     # render_contract / role (directive §9, lot 1).
@@ -413,10 +728,15 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
     # consumed: source ids covered by a chosen reconstruction unit (+ descendants).
     consumed: set = set()
     for item in translated_units:
-        for sid in item.get("source_unit_ids") or []:
+        sids = list(item.get("source_unit_ids") or [])
+        if all_source_ids_non_translatable(source_ownership, sids):
+            continue
+        for sid in sids:
+            if is_non_translatable_owner(source_ownership, sid):
+                continue
             consumed.add(sid)
             if item.get("consume_source_units") or item.get("preferred_over_children"):
-                consumed |= _descendants(sid, children_map)
+                consumed |= {d for d in _descendants(sid, children_map) if not is_non_translatable_owner(source_ownership, d)}
 
     excluded: set = set()
     for e in exclusion_plan:
@@ -435,6 +755,17 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
     rendered_boxes: list = []
     for i, item in enumerate(translated_units, start=1):
         sids = list(item.get("source_unit_ids") or [])
+        if all_source_ids_non_translatable(source_ownership, sids):
+            for s in sids:
+                excluded.add(s)
+                rendered_ids.add(s)
+            findings.append({
+                "type": "translated_unit_suppressed_by_source_ownership",
+                "translation_unit_id": item.get("translation_unit_id"),
+                "source_unit_ids": sids,
+                "severity": "info",
+            })
+            continue
         if sids and all(s in rendered_ids for s in sids):
             findings.append({"type": "duplicate_render_skipped", "source_unit_ids": sids,
                              "translation_unit_id": item.get("translation_unit_id")})
@@ -501,6 +832,8 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
         uid = u.get("unit_id")
         if not uid or _source_unit_is_rendered_or_covered(uid, rendered_ids, consumed, excluded):
             continue
+        if is_non_translatable_owner(source_ownership, uid):
+            continue
         if not _is_text_survival_candidate(u):
             continue
         bbox_u = _unit_bbox(u)
@@ -537,7 +870,67 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
     # This removes the typical duplicate overlays "C" / "2" from CHAPTER headers
     # and other false page-number fragments.
     underlays, overlays = [], []
+
+    # Existing preservation_plan entries already represent some formula/code/
+    # protected visual objects. Special detector zones strengthen protection,
+    # but must not create a second preserved layer for the same source object.
+    existing_preserve_sids = set()
+    existing_preserve_boxes = []
+    for _p in preservation_plan or []:
+        existing_preserve_sids.update(_p.get("source_unit_ids") or [])
+        _b = _p.get("bbox")
+        if isinstance(_b, (list, tuple)) and len(_b) == 4:
+            existing_preserve_boxes.append([float(x) for x in _b])
+
+    def _zone_already_preserved(zone: dict) -> bool:
+        z_sids = set(zone.get("source_unit_ids") or [])
+        if z_sids and (z_sids & existing_preserve_sids):
+            return True
+        z_box = zone.get("bbox")
+        if not (isinstance(z_box, (list, tuple)) and len(z_box) == 4):
+            return False
+        z_box = [float(x) for x in z_box]
+        for _b in existing_preserve_boxes:
+            if _contained_ratio(z_box, _b) >= 0.80 and _contained_ratio(_b, z_box) >= 0.80:
+                return True
+        return False
+
     preserve_index = 1
+    for zidx, zone in enumerate(special_zones or [], start=1):
+        if _zone_already_preserved(zone):
+            for sid in zone.get("source_unit_ids") or []:
+                excluded.add(sid)
+                rendered_ids.add(sid)
+            findings.append({
+                "type": "special_zone_preservation_deduped",
+                "zone_kind": zone.get("kind"),
+                "bbox": zone.get("bbox"),
+                "source_unit_ids": list(zone.get("source_unit_ids") or []),
+                "severity": "info",
+            })
+            continue
+        pu = PreservedUnit(
+            id=f"pres_special_{zidx:04d}",
+            source="special_zone",
+            reason=zone.get("kind") or "protected_visual",
+            bbox=zone.get("bbox"),
+            text=None,
+            preservation_mode="preserve_as_visual_overlay",
+            source_unit_ids=list(zone.get("source_unit_ids") or []),
+            z_policy="preserve_original",
+        )
+        underlays.append(pu)
+        for sid in zone.get("source_unit_ids") or []:
+            excluded.add(sid)
+            rendered_ids.add(sid)
+        findings.append({
+            "type": "special_zone_preserved_as_underlay",
+            "zone_kind": zone.get("kind"),
+            "bbox": zone.get("bbox"),
+            "source_unit_ids": list(zone.get("source_unit_ids") or []),
+            "severity": "info",
+        })
+    preserve_index = len(underlays) + 1
     for p in preservation_plan:
         source_ids = list(p.get("source_unit_ids") or [])
         if _source_related_to_consumed(source_ids, consumed) and not _must_preserve_even_if_consumed(p, page_width_pt, page_height_pt):
@@ -604,7 +997,12 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
     render_policy = dict(DEFAULT_RENDER_POLICY)
     render_policy.update({"reconstruction_mode": reconstruction_mode,
                           "publication_blocked": publication_blocked,
-                          "translation_coverage_ratio": coverage})
+                          "translation_coverage_ratio": coverage,
+                          "source_ownership": source_ownership,
+                          "source_ownership_summary": {
+                              "total": len(source_ownership),
+                          "non_translatable": sum(1 for e in source_ownership.values() if e.get("state") in {"preserved_visual", "preserved_text_exact", "excluded", "background_only", "background_visual"}),
+                          }})
 
     plan = PageRenderPlan(
         page=page, translated_text=translated_text, background=[background],
@@ -614,6 +1012,8 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
         render_policy=render_policy, quality_expectations=dict(DEFAULT_QUALITY_EXPECTATIONS),
         findings=findings,
     )
+
+    _enforce_preserved_visual_render_contract(plan, normalized, source_ownership, findings)
 
     # Freeze the FinalReconstructionContract + RenderOps so backends EXECUTE only
     # (no dispatch/measure/decision in the backend). Failure here never blocks the
@@ -769,6 +1169,10 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
                 mb = solve_multiblock_layout(enh, enabled=True)
                 if mb.status != "ko" and mb.patches_by_block_id:
                     apply_layout_patches_in_place(enh, mb)
+                    # Multiblock runs after the general regression guard.  Guard
+                    # its candidate as well, otherwise the last optimizer can
+                    # move source-anchored lines without any final validation.
+                    sanitize_contract_layouts_in_place(enh, findings=findings, render_policy=render_policy)
                     enh_ops = build_render_ops(enh, plan_dict, mode=reconstruction_mode)
                     if _ops_overlap_cost(enh_ops) < _ops_overlap_cost(baseline_ops) - 1e-6:
                         contract, chosen_ops = enh, enh_ops
@@ -792,6 +1196,35 @@ def compile_page_render_plan(translated_input_data: dict, *, reconstruction_mode
             e.to_dict() for e in build_source_text_lifecycle_ledger(plan.to_dict(), normalized)
         ]
         plan.final_contract = contract.to_dict()
+        try:
+            ownership_audit = audit_source_ownership(plan.to_dict(), normalized)
+            plan.render_policy["source_ownership_audit"] = {
+                "status": ownership_audit.get("status"),
+                "conflict_count": ownership_audit.get("conflict_count"),
+                "hard_blockers": ownership_audit.get("hard_blockers") or [],
+            }
+            if ownership_audit.get("status") != "ok":
+                findings.append({"type": "source_ownership_conflict", "severity": "ko", "detail": ownership_audit})
+        except Exception as exc:  # pragma: no cover
+            findings.append({"type": "source_ownership_audit_failed", "message": str(exc), "severity": "review"})
+
+        # Ownership/Lifecycle v2: verify that preserved_visual ownership really
+        # propagates to the render contract: protected region + preserved layer +
+        # PreservationOp, with no leak into translation units, translated_text,
+        # TextOp or destructive PatchOp.  This is a hard diagnostic gate; it does
+        # not repair layout, it prevents silent contract regression.
+        try:
+            from render_contract_audit import audit_render_contract, compact_render_contract_audit
+            render_contract_audit = audit_render_contract(plan.to_dict(), normalized)
+            plan.render_policy["render_contract_audit"] = compact_render_contract_audit(render_contract_audit)
+            if render_contract_audit.get("status") != "ok":
+                findings.append({
+                    "type": "render_contract_propagation_conflict",
+                    "severity": "ko",
+                    "detail": compact_render_contract_audit(render_contract_audit, max_rows=10),
+                })
+        except Exception as exc:  # pragma: no cover
+            findings.append({"type": "render_contract_audit_failed", "message": str(exc), "severity": "review"})
     except Exception as exc:  # pragma: no cover
         findings.append({"type": "render_ops_build_failed", "message": str(exc)})
 

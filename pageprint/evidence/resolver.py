@@ -72,6 +72,17 @@ def resolve_unit_evidence(unit: dict) -> dict:
             "reason": "fallback_extraction_default",
             "value": text,
         }]
+    elif text and not any(c.get("claim_type") == "natural_text" for c in claims):
+        # Region observations complement extraction evidence; they do not erase
+        # it.  Without this baseline a lone candidate wins by construction,
+        # even after its confidence is discounted.
+        claims.append({
+            "source": extraction.get("source") or "native_pdf",
+            "claim_type": "natural_text",
+            "confidence": extraction.get("confidence") or 0.70,
+            "reason": "text_extraction_baseline",
+            "value": text,
+        })
 
     scored = []
     for claim in claims:
@@ -83,6 +94,8 @@ def resolve_unit_evidence(unit: dict) -> dict:
             score *= 0.55
         if claim_type in {"formula_candidate", "code_candidate"} and _has_strong_natural_text(unit, text, role):
             score *= 0.45
+        if claim_type in {"formula_candidate", "code_candidate"} and unit.get("level") in {"span", "word", "char"}:
+            score *= 0.60
         if claim_type == "natural_text" and _has_strong_natural_text(unit, text, role):
             score = max(score, 0.88)
         if claim_type in {"toc_candidate", "index_candidate", "caption_candidate"} and role:

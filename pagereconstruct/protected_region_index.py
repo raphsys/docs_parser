@@ -10,13 +10,13 @@ from __future__ import annotations
 from .schema import ProtectedRegion
 
 # object_type / reason that mark a hard visual protection
-_PROTECTED_OBJECTS = {"formula", "formula_expression", "equation", "image", "figure",
-                      "code", "code_block", "table_grid", "logo", "watermark", "publisher_mark", "diagram"}
-# Confirmed visual objects (regions). Formula/code "candidate" regions are
-# observations only and must NOT hard-protect (they over-fire on citations and
-# single glyphs); real formulas are protected via unit roles below.
+_PROTECTED_OBJECTS = {"formula_region", "formula", "formula_expression", "equation", "math_expression", "image", "figure",
+                      "code_region", "code", "code_block", "table_grid", "logo", "watermark", "publisher_mark", "diagram", "protected_visual_region", "protected_visual"}
+# Confirmed visual objects (regions). Formula/code regions are hard-protected.
 _CONFIRMED_REGION_OBJECTS = {"image", "figure", "picture", "logo", "watermark",
-                             "table_grid", "diagram", "chart"}
+                             "table_grid", "diagram", "chart", "formula", "formula_region",
+                             "equation", "math_expression", "code", "code_region",
+                             "protected_visual", "protected_visual_region"}
 
 
 def _valid_bbox(b) -> bool:
@@ -124,10 +124,9 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
         # A translated unit must not also be protected (coherence invariant).
         if u.get("unit_id") in translated_source_ids:
             continue
-        # Candidate-region units are special-region-detector OBSERVATIONS (inline
-        # "1 × 1" fragments sitting inside translatable prose); they over-fire and
-        # must not hard-protect. Real formulas protect via block/line roles above.
-        if "candidate" in str(u.get("unit_id") or ""):
+        # Legacy candidate units are ignored unless they now carry a hard
+        # protected_visual policy.  Confirmed formula/code regions must survive.
+        if "candidate" in str(u.get("unit_id") or "") and not ((u.get("policy") or {}).get("protected_visual")):
             continue
         policy = u.get("policy") or {}
         bbox = (u.get("geometry") or {}).get("bbox")
@@ -143,22 +142,24 @@ def build_protected_region_index(*, units: dict, preservation_plan: list, exclus
         # small artifacts, unknown-role text) must NOT hard-protect: those flood
         # false collisions over the translated text and never carry real visuals.
         is_object = ot_l in _PROTECTED_OBJECTS
-        is_visual_role = role in {"formula_expression", "publisher_mark", "watermark"}
+        is_visual_role = role in {"formula_region", "formula_expression", "equation", "math_expression", "code_region", "publisher_mark", "watermark", "protected_visual_region"}
         is_background = rp == "background_only"
         if not (is_object or is_visual_role or is_background):
             continue
         # A formula/code unit inside a merged zone is already protected by the
         # tight zone rectangle; its own (often oversized) bbox would re-introduce
         # the collisions with neighbouring prose. Let the zone own it.
-        is_formula_code = role in {"formula_expression", "code_line", "code_block"} \
-            or ot_l in {"formula", "formula_expression", "equation", "code", "code_block"}
+        is_formula_code = role in {"formula_region", "formula_expression", "equation", "math_expression", "code_region", "code_line", "code_block"} \
+            or ot_l in {"formula_region", "formula", "formula_expression", "equation", "math_expression", "code_region", "code", "code_block"}
         if is_formula_code and _zone_of(bbox, special_zones):
             continue
         add("unit_policy", role or ot or rp, bbox)
     for r in regions or []:
         rtype = str(r.get("region_type") or "").lower()
-        # Candidate / observation-only regions are not hard protections.
-        if "candidate" in rtype or r.get("observation_only") or r.get("policy_pending"):
+        # Only legacy observation-only regions are skipped.  Confirmed hard
+        # formula/code/protected_visual regions are already normalized without
+        # observation_only/policy_pending and must be protected.
+        if ("candidate" in rtype or r.get("observation_only") or r.get("policy_pending")) and not r.get("protected_visual"):
             continue
         ot = str(r.get("object_type") or rtype).lower()
         if any(k in ot for k in _CONFIRMED_REGION_OBJECTS):

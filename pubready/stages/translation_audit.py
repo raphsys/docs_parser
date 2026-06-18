@@ -10,7 +10,7 @@ _PRESERVE_ROLES = {"formula_expression", "code_line", "code_block", "command_nam
 # Tokens à préserver: acronymes TOUT-MAJUSCULE (≥2, ex: SQL, API, HTTP) + nombres.
 # PAS les mots simplement capitalisés en début de phrase (The, When, Data...) ni
 # les noms propres mixtes (Postgres) — sinon faux positifs massifs en traduction.
-_TOKEN_RE = re.compile(r"\b[A-Z]{2,}[0-9]*\b|\b\d+(?:[.,]\d+)?\b")
+_TOKEN_RE = re.compile(r"\b[A-Z]{2,6}[0-9]*\b|\b\d+(?:[.,]\d+)?\b")
 
 
 def _dim_presence(src, tr, role) -> DimensionScore:

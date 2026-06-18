@@ -121,5 +121,24 @@ def build_layout_policy_hint(contract: Any = None, normalized: dict | None = Non
         hint.prefer_width_growth_before_vertical_push = False
         hint.para_gap_pt = 2.0
 
+    # Complementary AI advisor bridge.  It may call pipeline_agents P7/P5/P3
+    # when available; failures are non-fatal and never produce raw geometry.
+    try:
+        from .ai_layout_model_bridge import build_ai_layout_policy
+        pol = build_ai_layout_policy(contract, normalized)
+        if pol:
+            hint.min_gap_pt = max(hint.min_gap_pt, float(getattr(pol, "min_gap_pt", hint.min_gap_pt) or hint.min_gap_pt))
+            hint.para_gap_pt = max(hint.para_gap_pt, float(getattr(pol, "paragraph_gap_pt", hint.para_gap_pt) or hint.para_gap_pt))
+            hint.heading_gap_pt = max(hint.heading_gap_pt, float(getattr(pol, "heading_gap_pt", hint.heading_gap_pt) or hint.heading_gap_pt))
+            hint.max_width_growth_pt = max(hint.max_width_growth_pt, min(260.0, float(getattr(pol, "max_width_growth_pt", hint.max_width_growth_pt) or hint.max_width_growth_pt)))
+            hint.prefer_width_growth_before_vertical_push = bool(getattr(pol, "prefer_horizontal_growth", hint.prefer_width_growth_before_vertical_push))
+            hint.group_atomic_lines = bool(getattr(pol, "merge_atomic_lines", hint.group_atomic_lines))
+            hint.confidence = max(hint.confidence, min(0.95, float(getattr(pol, "confidence", hint.confidence) or hint.confidence)))
+            data = hint.assets or {}
+            data["ai_layout_policy"] = pol.to_dict() if hasattr(pol, "to_dict") else {}
+            hint.assets = data
+    except Exception:
+        pass
+
     hint.confidence = min(0.95, hint.confidence)
     return hint

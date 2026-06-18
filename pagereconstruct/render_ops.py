@@ -109,6 +109,98 @@ def _unit_for_renderer(block) -> dict:
     }
 
 
+def _line_bbox_of_text_op(op: TextOp) -> list[float] | None:
+    lines = getattr(op, "lines", None) or []
+    boxes = []
+    for ln in lines:
+        if all(k in ln for k in ("x", "y_top", "x1", "y_bottom")):
+            try:
+                b = [float(ln["x"]), float(ln["y_top"]), float(ln["x1"]), float(ln["y_bottom"])]
+                if b[2] > b[0] and b[3] > b[1]:
+                    boxes.append(b)
+            except Exception:
+                pass
+    if not boxes:
+        return None
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _x_overlap(a: list[float], b: list[float]) -> float:
+    inter = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    return inter / max(1e-6, min(a[2] - a[0], b[2] - b[0]))
+
+
+def _overlaps(a: list[float], b: list[float]) -> bool:
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) > 0 and max(0.0, min(a[3], b[3]) - max(a[1], b[1])) > 0
+
+
+def _shift_text_op(op: TextOp, dy: float) -> None:
+    if abs(dy) < 1e-6:
+        return
+    for ln in getattr(op, "lines", []) or []:
+        if "y_top" in ln:
+            ln["y_top"] = float(ln["y_top"]) + dy
+        if "y_bottom" in ln:
+            ln["y_bottom"] = float(ln["y_bottom"]) + dy
+
+
+def _resolve_textop_vertical_collisions(ops: list, protected_boxes: list, page_h: float | None, findings: list) -> None:
+    """Last-mile visual safety net for interline writing.
+
+    Layout solvers work on blocks; RenderOps are the actual final geometry.  This
+    pass makes the final text stream monotonic in each column and below hard
+    preserved objects.  It never converts preservation to text and never moves
+    preserved objects.
+    """
+    text_ops = [op for op in ops if isinstance(op, TextOp)]
+    if len(text_ops) < 2 and not protected_boxes:
+        return
+    locked_roles = {"page_number", "page_reference", "toc_page_reference", "toc_section_number"}
+    movable = []
+    for op in text_ops:
+        b = _line_bbox_of_text_op(op)
+        if not b:
+            continue
+        movable.append((op, b))
+    movable.sort(key=lambda x: (x[1][1], x[1][0]))
+    placed: list[list[float]] = []
+    shifted = 0
+    for op, b in movable:
+        role = str(getattr(op, "role", "") or "")
+        if role in locked_roles:
+            placed.append(b)
+            continue
+        dy = 0.0
+        cur = list(b)
+        # Text/text: if same column and the next line starts in the previous
+        # line body, push it below with a small typographic gap.
+        for prev in placed:
+            if _x_overlap(cur, prev) >= 0.18 and cur[1] < prev[3] + 1.25 and cur[3] > prev[1]:
+                # ``dy`` is total displacement from the original box ``b``.
+                # Computing from ``cur`` loses prior shifts in a collision
+                # cascade and can leave the line overlapping the next block.
+                dy = max(dy, prev[3] + 1.25 - b[1])
+                cur = [cur[0], b[1] + dy, cur[2], b[3] + dy]
+        # Text/preservation: never let prose run through a preserved formula or
+        # figure.  Move it below the obstacle only when there is real overlap in
+        # the same horizontal band.
+        for pr in protected_boxes or []:
+            if _x_overlap(cur, pr) >= 0.12 and _overlaps(cur, pr):
+                dy = max(dy, pr[3] + 1.75 - b[1])
+                cur = [b[0], b[1] + dy, b[2], b[3] + dy]
+        if page_h and cur[3] > page_h - 3:
+            # Last resort: keep inside page instead of pushing indefinitely.
+            dy = min(dy, max(0.0, page_h - 3 - b[3]))
+            cur = [b[0], b[1] + dy, b[2], b[3] + dy]
+        if dy > 0.05:
+            _shift_text_op(op, dy)
+            shifted += 1
+            b = cur
+        placed.append(b)
+    if shifted:
+        findings.append({"type": "visual_layout_reflow_v1_textop_collision_shift", "severity": "review", "shifted_textop_count": shifted})
+
+
 def build_render_ops(contract, plan: dict, *, mode: str = "debug") -> list:
     """Compile le FinalReconstructionContract (+ patches du plan) en RenderOps
     ordonnés selon LAYER_ORDER. dispatch + measure se font une seule fois ici.
@@ -124,6 +216,8 @@ def build_render_ops(contract, plan: dict, *, mode: str = "debug") -> list:
     layers = plan.get("layers") or {}
     protected_boxes = [r["bbox"] for r in (plan.get("protected_regions") or [])
                        if isinstance(r.get("bbox"), (list, tuple)) and len(r["bbox"]) == 4]
+    page_size = getattr(getattr(contract, "page_info", None), "page_size", None)
+    page_h = float(page_size[1]) if isinstance(page_size, (list, tuple)) and len(page_size) == 2 and page_size[1] else None
     placed_boxes: list = []
 
     # 1. background — publication: UNIQUEMENT clean_background vérifié (pas de
@@ -167,7 +261,12 @@ def build_render_ops(contract, plan: dict, *, mode: str = "debug") -> list:
     # 4. translated_text — le renderer ne compose plus. Les TextOps sont émis
     #    depuis IntraBlockComposition uniquement.
     from .composition.intrablock_composer import compose_block
-    for block in contract.blocks:
+    try:
+        from .composition.paragraph_flow_grouper import blocks_for_render
+        _render_blocks = blocks_for_render(contract)
+    except Exception:
+        _render_blocks = list(getattr(contract, "blocks", []) or [])
+    for block in _render_blocks:
         if getattr(block, 'must_render', True) is False and not (getattr(block, 'translated_text', '') or getattr(block, 'source_text', '')):
             continue
         comp = compose_block(block)
@@ -192,6 +291,10 @@ def build_render_ops(contract, plan: dict, *, mode: str = "debug") -> list:
                     translation_unit_id=block.translation_unit_id,
                 ))
                 placed_boxes.append(run.bbox)
+
+    # 4b. Last-mile text geometry guard: no text/text interline overlap and no
+    #     text crossing hard preserved visual regions.
+    _resolve_textop_vertical_collisions(ops, protected_boxes, page_h, findings)
 
     # 5. preserved_overlays (au-dessus du texte)
     ops.extend(overlay_ops)
